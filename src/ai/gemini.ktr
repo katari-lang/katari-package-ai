@@ -1,0 +1,276 @@
+// Gemini provider: serves the `ai.infer_step` request over the generativelanguage generateContent
+// API. `use gemini.provider(model = ..., api_key = ...)` at the app root is the whole integration —
+// the request body is built as `json` and the response parsed from `json`, entirely in Katari; the
+// only network call is the prelude's `http.post_json`. Swapping providers means swapping this one
+// `use` line; nothing else in the app or the `ai` layer knows Gemini exists.
+
+import ai
+import ai.types
+
+@"A Gemini connection: the model id, the API key, and an optional system instruction. Provider
+handler state — built once per `use gemini.provider(...)`."
+data connection(model: string, api_key: string of private, system: string)
+
+@"Serve `ai.infer_step` over Gemini for the extent of the continuation:
+`use gemini.provider(model = \"gemini-3.5-flash\", api_key = env.get_secret(key = \"GEMINI_API_KEY\"))`.
+A step's provider failure (malformed JSON, a non-2xx status, a transport failure — `ai.step_error`)
+is raised here, at the provider's use site."
+agent provider[R, effect E](
+  model: string,
+  api_key: string of private,
+  system: string ?= "",
+  continuation: agent (value: null) -> R with {...E, ai.infer_step},
+) -> R with E | io | prelude.throw[ai.step_error] {
+  use handler (var client = connection(model = model, api_key = api_key, system = system)) {
+    request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
+      next gemini_infer_step(client = client, history = history, tool_metas = tool_metas)
+    }
+  }
+  continuation(value = null)
+}
+
+// ── request body (built as json) ─────────────────────────────────────────────
+
+agent gemini_role(role: string) -> string {
+  match (role) {
+    case "model" -> "model"
+    case _ -> "user"
+  }
+}
+
+agent gemini_text_part(text: string) -> json.json {
+  json.json_object(entries = { text = json.json_string(value = text) })
+}
+
+agent gemini_call_part(call: types.tool_call) -> json.json {
+  // Replay the model's functionCall verbatim: name + the original args (already json) + the
+  // thought signature Gemini requires echoed.
+  json.json_object(entries = {
+    functionCall = json.json_object(entries = {
+      name = json.json_string(value = call.name),
+      args = call.args,
+    }),
+    thoughtSignature = json.json_string(value = call.opaque),
+  })
+}
+
+agent gemini_result_part(result: types.tool_result) -> json.json {
+  json.json_object(entries = {
+    functionResponse = json.json_object(entries = {
+      name = json.json_string(value = result.name),
+      response = json.json_object(entries = { result = json.json_string(value = result.text) }),
+    }),
+  })
+}
+
+@"A file's content as an inlineData part — what lets the model actually SEE an image. The base64
+materialises the whole content into the request, so only the freshest history element inlines (see
+gemini_content's @inline@)."
+agent gemini_inline_part(f: file) -> json.json {
+  // `data` is a keyword, so the wire object is assembled with record.set instead of a literal.
+  let base = { mimeType = json.json_string(value = file.content_type(value = f)) }
+  let inline = record.set(target = base, key = "data", value = json.json_string(value = file.read_base64(value = f)))
+  json.json_object(entries = {
+    inlineData = json.json_object(entries = inline),
+  })
+}
+
+@"A file as its `$ref` handle note — the resting representation. The handle is the exact object the
+model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the note IS
+the affordance, not just a description."
+agent gemini_handle_part(f: file) -> json.json {
+  gemini_text_part(text = f"[attached file: ${json.to_text(value = f)}]")
+}
+
+@"Render a turn's / result's files: inlined (content + handle note, so the model both sees the image
+and learns the handle to replay) while fresh, the handle note alone once older — the model re-reads
+an old image on demand with `view_image`. A file with no recorded MIME type cannot inline."
+agent gemini_file_parts(files: array[file], inline: boolean) -> array[json.json] {
+  array.flatten(target = for (let f in files) {
+    if (inline && file.content_type(value = f) != "") {
+      next [gemini_handle_part(f = f), gemini_inline_part(f = f)]
+    } else {
+      next [gemini_handle_part(f = f)]
+    }
+  })
+}
+
+@"One history element as a Gemini content. @inline@ marks the freshest element — the only one whose
+files inline their content (older elements show handles only, keeping the request small; the model
+re-reads any old image with `view_image`)."
+agent gemini_content(msg: types.message, inline: boolean) -> json.json {
+  match (msg) {
+    case types.turn(role => role, text => text, files => files) -> {
+      json.json_object(entries = {
+        role = json.json_string(value = gemini_role(role = role)),
+        parts = json.json_array(items = array.concat(
+          left = [gemini_text_part(text = text)],
+          right = gemini_file_parts(files = files, inline = inline),
+        )),
+      })
+    }
+    case types.call_turn(calls => calls) -> {
+      json.json_object(entries = {
+        role = json.json_string(value = "model"),
+        parts = json.json_array(items = for (let call in calls) { next gemini_call_part(call = call) }),
+      })
+    }
+    case types.result_turn(results => results) -> {
+      let response_parts = for (let result in results) { next gemini_result_part(result = result) }
+      let file_parts = array.flatten(target = for (let result in results) {
+        next gemini_file_parts(files = result.files, inline = inline)
+      })
+      json.json_object(entries = {
+        role = json.json_string(value = "user"),
+        parts = json.json_array(items = array.concat(left = response_parts, right = file_parts)),
+      })
+    }
+  }
+}
+
+// Gemini's functionDeclarations.parameters accepts only an OpenAPI subset and 400s on JSON-Schema
+// keywords (additionalProperties / $schema / ...). Strip them recursively from the derived schema.
+agent gemini_drop_schema_key(key: string) -> boolean {
+  match (key) {
+    case "additionalProperties" -> true
+    case "$schema" -> true
+    case "$id" -> true
+    case "$defs" -> true
+    case "definitions" -> true
+    case _ -> false
+  }
+}
+
+// The recursive group needs an explicit effect row; `pure` is the empty effect — sanitizing the
+// schema tree performs no requests and no io.
+agent gemini_sanitize(node: json.json) -> json.json with pure {
+  match (node) {
+    case json.json_object(entries => entries) -> {
+      let cleaned = for (let key in record.keys(target = entries), var acc: record[json.json] = record.empty()) {
+        if (gemini_drop_schema_key(key = key)) {
+          next with { acc = acc }
+        } else {
+          next with { acc = record.set(target = acc, key = key, value = gemini_sanitize(node = json.field(target = node, key = key))) }
+        }
+      } then (_values) { acc }
+      json.json_object(entries = cleaned)
+    }
+    case json.json_array(items => items) -> {
+      json.json_array(items = for (let item in items) { next gemini_sanitize(node = item) })
+    }
+    case _ -> node
+  }
+}
+
+agent gemini_function_declaration(meta: reflection.agent_metadata) -> json.json {
+  json.json_object(entries = {
+    name = json.json_string(value = meta.name),
+    description = json.json_string(value = meta.description),
+    parameters = gemini_sanitize(node = meta.input),
+  })
+}
+
+agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> string {
+  // Only the FRESHEST history element inlines its files' content (the model just received them);
+  // older elements shrink to handle notes — the model re-reads any of those with `view_image`.
+  let count = array.length(target = history)
+  let older = for (let msg in array.slice(target = history, start = 0, end = count - 1)) {
+    next gemini_content(msg = msg, inline = false)
+  }
+  let freshest = for (let msg in array.slice(target = history, start = count - 1, end = count)) {
+    next gemini_content(msg = msg, inline = true)
+  }
+  let contents = json.json_array(items = array.concat(left = older, right = freshest))
+  let base = { contents = contents }
+  let with_system = if (client.system == "") {
+    base
+  } else {
+    record.set(target = base, key = "systemInstruction", value = json.json_object(entries = {
+      parts = json.json_array(items = [gemini_text_part(text = client.system)]),
+    }))
+  }
+  if (array.length(target = tool_metas) == 0) {
+    json.stringify(value = json.json_object(entries = with_system))
+  } else {
+    let declarations = json.json_array(items = for (let meta in tool_metas) { next gemini_function_declaration(meta = meta) })
+    let tools = json.json_array(items = [json.json_object(entries = { functionDeclarations = declarations })])
+    json.stringify(value = json.json_object(entries = record.set(target = with_system, key = "tools", value = tools)))
+  }
+}
+
+// ── response parsing (read out of json) ──────────────────────────────────────
+
+agent gemini_parts(parsed: json.json) -> array[json.json] {
+  let candidate = json.element(target = json.field(target = parsed, key = "candidates"), index = 0)
+  let content = json.field(target = candidate, key = "content")
+  match (json.field(target = content, key = "parts")) {
+    case json.json_array(items => items) -> items
+    case _ -> []
+  }
+}
+
+agent gemini_is_call(part: json.json) -> boolean {
+  match (json.field(target = part, key = "functionCall")) {
+    case json.json_null() -> false
+    case _ -> true
+  }
+}
+
+agent gemini_tool_call(part: json.json) -> types.tool_call {
+  let call = json.field(target = part, key = "functionCall")
+  types.tool_call(
+    name = json.text(target = json.field(target = call, key = "name")),
+    opaque = json.text(target = json.field(target = part, key = "thoughtSignature")),
+    args = json.field(target = call, key = "args"),
+  )
+}
+
+@"Whether a response part is the model's internal thinking: Gemini interleaves thought summaries
+(marked `thought: true`) with the answer parts — never user-facing text."
+agent gemini_is_thought(part: json.json) -> boolean {
+  match (json.field(target = part, key = "thought")) {
+    case json.json_boolean(value => value) -> value
+    case _ -> false
+  }
+}
+
+agent gemini_parse_step(response: string) -> types.step with prelude.throw[json.parse_error] {
+  let parts = gemini_parts(parsed = json.parse(text = response))
+  let calls = for (let part in parts, var acc: array[types.tool_call] = []) {
+    if (gemini_is_call(part = part)) {
+      next with { acc = array.append(target = acc, value = gemini_tool_call(part = part)) }
+    } else {
+      next with { acc = acc }
+    }
+  } then (_parts) { acc }
+  if (array.length(target = calls) == 0) {
+    // Only the ANSWER parts become the reply: joining every part wholesale leaked the model's thought
+    // summaries (and their mid-word fragments) straight into the Discord reply — observed. A part
+    // with no string `text` (an image part, a bare signature carrier) contributes nothing either.
+    let texts = for (let part in parts, var acc: array[string] = []) {
+      if (gemini_is_thought(part = part)) {
+        next with { acc = acc }
+      } else {
+        match (json.field(target = part, key = "text")) {
+          case json.json_string(value => value) -> {
+            next with { acc = array.append(target = acc, value = value) }
+          }
+          case _ -> {
+            next with { acc = acc }
+          }
+        }
+      }
+    } then (_parts) { acc }
+    types.step_final(text = string.join(parts = texts, separator = ""))
+  } else {
+    types.step_call(calls = calls)
+  }
+}
+
+@"One Gemini model step over the history + tool schemas (built and parsed as json in Katari; only the POST leaves the runtime)."
+agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step {
+  let body = gemini_request_body(client = client, history = history, tool_metas = tool_metas)
+  let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
+  let response = http.post_json(url = url, body = body, headers = record.set(target = record.empty(), key = "x-goog-api-key", value = client.api_key))
+  gemini_parse_step(response = response)
+}

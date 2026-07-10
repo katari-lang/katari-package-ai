@@ -1,0 +1,12 @@
+[package]
+name = "ai"
+version = "0.1.0"
+description = "Provider-agnostic AI tool-calling loop for Katari: one request seam (ai.infer_step) with interchangeable Gemini and OpenAI providers."
+
+[runtime]
+url = "http://localhost:3000"
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "staging"
+packages = []

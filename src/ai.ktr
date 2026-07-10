@@ -1,0 +1,210 @@
+// The AI orchestration layer: the provider-agnostic tool-calling loop. The single seam between the
+// loop and a concrete model API is ONE request — `infer_step` — so a provider is a module that serves
+// it (`use gemini.provider(...)` / `use openai.provider(...)` at the app root) and this module never
+// names a provider. Adding a provider is adding a module; nothing here changes.
+//
+// Everything else is plain Katari over the agnostic vocabulary in `ai.types`: derive each
+// tool's schema with `reflection.get_metadata`, ask the ambient provider for a step, dispatch tool
+// calls concurrently with `parallel for` (each validated against its tool's schema by
+// `reflection.call_agent` — an `as_tool` tool from an MCP server validates against the server's
+// schema the same way), and feed the results back until the model answers.
+//
+// Files flow through the loop as blob handles: a tool result's `file` values are collected off the
+// result's wire form (`collect_result_files`) and ride the `tool_result`, so the provider can inline
+// their content for the model while the result is fresh — and the model can replay any handle it has
+// seen into a later tool call (`view_image` re-reads one on demand).
+
+import ai.types
+
+@"One model step over the conversation + tool schemas — THE provider seam. A provider module serves
+this request for the extent of a continuation (`use gemini.provider(...)`), so the loop stays
+provider-agnostic and providers stay loop-agnostic."
+request infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step
+
+// The error surface of one model step, raised by the serving provider's handler (so it surfaces at
+// the provider's use site — the app root): malformed provider JSON, a non-2xx API status, or a
+// transport failure. (Type synonyms take no docs.)
+type step_error = json.parse_error | http.status_error | http.fetch_error
+
+// What the loop itself can raise: a bad dynamic dispatch (a hallucinated tool call's args failing the
+// tool's schema — usually caught and fed back, see dispatch_one), or a failure decoding the model's
+// raw args (`json.decode[unknown]` — total in practice, but its throw is discharged here).
+type loop_error = reflection.call_error | json.decode_error
+
+@"Infer a single reply with no tools (the common chat case)."
+agent reply(history: array[types.message]) -> string {
+  match (infer_step(history = history, tool_metas = [])) {
+    case types.step_final(text => text) -> text
+    case types.step_call(calls => _) -> "(unexpected tool call without tools)"
+  }
+}
+
+@"Tool: load an image file into your visual context. Pass the file's handle object — a bare
+{\"$ref\": \"<id>\"} suffices (copy the id from the conversation); the image content arrives with
+this tool's result, so you can see it on your next step."
+agent view_image(image: file) -> file {
+  image
+}
+
+@"Run the tool-using model loop, generic over the tools' shared effect @E@: derive each tool's schema
+with `reflection.get_metadata`, then up to @max_steps@ times perform `infer_step` against the ambient
+provider; on a batch of tool calls, dispatch them all CONCURRENTLY with `parallel for` (each resolves
+its tool by name and invokes it by value via `reflection.call_agent`, validating the model's args
+against the tool's schema), then feed every result back as a new turn; on a final answer, return it."
+agent infer_with_tools[effect E](
+  history: array[types.message],
+  tools: array[agent never -> unknown with E],
+  max_steps: integer,
+) -> string {
+  let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
+  for (let _step in array.range(start = 0, end = max_steps), var conversation: array[types.message] = history) {
+    match (infer_step(history = conversation, tool_metas = tool_metas)) {
+      case types.step_final(text => reply_text) -> { break reply_text }
+      case types.step_call(calls => calls) -> {
+        // Dispatch every requested tool in parallel; results come back in request order, each
+        // tagged with its tool name + call id so it round-trips as a function response.
+        let results = parallel for (let call in calls) {
+          next dispatch_one[E](tools = tools, call = call)
+        }
+        // Record BOTH the model's call turn and the results turn so the next step replays the
+        // full call / response exchange.
+        let with_calls = array.append(target = conversation, value = types.call_turn(calls = calls))
+        next with { conversation = array.append(target = with_calls, value = types.result_turn(results = results)) }
+      }
+    }
+  } then (_steps) {
+    // Budget exhausted without the model committing to an answer. Rather than discard everything the
+    // tools gathered (the old "(no final answer within the step budget)" dead end), force ONE last
+    // tool-less step: with no tools the model cannot keep researching and must answer from the
+    // conversation it has built. A closing user turn tells it the budget is spent so it commits.
+    reply(
+      history = array.append(
+        target = conversation,
+        value = types.turn(
+          role = "user",
+          text = "You have used your entire tool-call budget. Do not call any more tools. Answer the original question now, as best you can, using only what you have already gathered.",
+          files = [],
+        ),
+      ),
+    )
+  }
+}
+
+@"The outcome of decoding a model's raw tool args: the decoded value, or the decode error rendered
+readable (fed back to the model as the tool's error result, so it corrects on the next step)."
+data decoded(value: unknown)
+
+@"See @decoded@ — the failure half (a malformed replayed file handle is the observed case)."
+data decode_failed(message: string)
+
+type args_outcome = decoded | decode_failed
+
+@"Decode a model's raw args to a plain value, catching the decode error locally (its effect row is
+concrete here — a catch inside the generically-effectful dispatch would also capture the TOOLS' own
+typed throws, which the checker rightly rejects)."
+agent decode_args(args: json.json) -> args_outcome {
+  use handler {
+    request prelude.throw(error: json.decode_error) -> never {
+      break decode_failed(message = json.to_text(value = error))
+    }
+  }
+  decoded(value = json.decode[unknown](value = args))
+}
+
+@"Find the tool whose metadata name is the model's pick and invoke it by value via
+`reflection.call_agent` (the model's args decode to a plain value, and the delegation boundary
+validates them against the tool's schema — the compiled signature of a Katari agent, or the
+server-declared schema of an MCP tool). A hallucinated name, undecodable args, or a panicking tool
+is fed back as an error result so the model corrects on the next step. The result's `file` values
+are collected off its wire form so the provider can show them to the model (their `$ref` handles are
+already visible in the result text)."
+agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: types.tool_call) -> types.tool_result {
+  // A failing tool must never fail the conversation — that is the loop's whole premise. A panic (a
+  // crashed handler) escaping THIS call, or the model's args failing to decode (a bare `{$ref}`
+  // handle — observed to kill the whole bot before this guard), becomes an error result the model
+  // reads and corrects on its next step, instead of escalating to the app root.
+  use handler {
+    request panic(msg: string) {
+      break types.tool_result(
+        name = call.name,
+        call_id = call.opaque,
+        text = f"(tool failed: ${msg})",
+        files = [],
+      )
+    }
+  }
+  match (decode_args(args = call.args)) {
+    case decode_failed(message => message) -> {
+      types.tool_result(
+        name = call.name,
+        call_id = call.opaque,
+        text = f"(tool error: ${message})",
+        files = [],
+      )
+    }
+    case decoded(value => args_value) -> {
+      for (let tool in tools) {
+        let meta = reflection.get_metadata(value = tool)
+        if (meta.name == call.name) {
+          let encoded = json.encode(value = reflection.call_agent(target = tool, args = args_value))
+          return types.tool_result(
+            name = call.name,
+            call_id = call.opaque,
+            text = json.stringify(value = encoded),
+            files = collect_result_files(node = encoded),
+          )
+        } else {
+          null
+        }
+      }
+      types.tool_result(
+        name = call.name,
+        call_id = call.opaque,
+        text = f"(error: unknown tool \"${call.name}\")",
+        files = [],
+      )
+    }
+  }
+}
+
+@"Collect every `file` value out of a tool result's wire form: in encoded json a file is its `$ref`
+handle object (`json.decode[file]` revives it), so a generated image is found wherever the tool put
+it — a bare return, the MCP bridge's { text, files }, or nested structure."
+agent collect_result_files(node: json.json) -> array[file] with prelude.throw[json.decode_error] {
+  match (node) {
+    case json.json_object(entries => entries) -> {
+      if (is_file_handle(entries = entries)) {
+        [json.decode[file](value = node)]
+      } else {
+        array.flatten(target = for (let key in record.keys(target = entries)) {
+          next collect_result_files(node = json.field(target = node, key = key))
+        })
+      }
+    }
+    case json.json_array(items => items) -> {
+      array.flatten(target = for (let item in items) {
+        next collect_result_files(node = item)
+      })
+    }
+    case _ -> []
+  }
+}
+
+@"Whether an encoded object is a `file`'s handle: it carries `$ref` AND its semantic kind is
+\"file\" — a blob-backed *string* also encodes to a `$ref` handle, and must not revive as a file."
+agent is_file_handle(entries: record[json.json]) -> boolean {
+  match (record.get(target = entries, key = "$ref")) {
+    case null -> false
+    case _ -> {
+      match (record.get(target = entries, key = "semanticKind")) {
+        case null -> false
+        case kind -> {
+          match (kind) {
+            case json.json_string(value => value) -> value == "file"
+            case _ -> false
+          }
+        }
+      }
+    }
+  }
+}
