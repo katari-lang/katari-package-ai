@@ -16,6 +16,9 @@ module, not editing the loop.
   api_key = ...)` serves `ai.infer_step` for the continuation.
 - `ai.openai` — a provider over the OpenAI responses API. `use openai.provider(model = ...,
   api_key = ...)` — swap it for `gemini.provider` (or vice versa) with no other change.
+- `ai.anthropic` — a provider over the Anthropic Messages API. `use anthropic.provider(api_key =
+  ...)` — `model` defaults to `claude-sonnet-5` and `max_tokens` (the per-step output cap the API
+  requires) to 4096; swap it for either other provider with no other change.
 
 Pure Katari — no FFI sidecar. The only network call is the prelude's `http.post_json`; request
 bodies are built and responses parsed as `json` values in Katari.
@@ -25,6 +28,7 @@ bodies are built and responses parsed as `json` values in Katari.
 - A model API key, provided to whichever provider you `use`:
   - Gemini: `GEMINI_API_KEY` → `use gemini.provider(api_key = env.get_secret(key = "GEMINI_API_KEY"))`
   - OpenAI: `OPENAI_API_KEY` → `use openai.provider(api_key = env.get_secret(key = "OPENAI_API_KEY"))`
+  - Anthropic: `ANTHROPIC_API_KEY` → `use anthropic.provider(api_key = env.get_secret(key = "ANTHROPIC_API_KEY"))`
 
 Store it in the runtime, never in a file: `katari env set GEMINI_API_KEY --secret`. The key is a
 `string of private`; it can flow into the provider's auth header but never out to a user boundary.
