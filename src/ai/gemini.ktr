@@ -1,8 +1,10 @@
 // Gemini provider: serves the `ai.infer_step` request over the generativelanguage generateContent
 // API. `use gemini.provider(model = ..., api_key = ...)` at the app root is the whole integration —
-// the request body is built as `json` and the response parsed from `json`, entirely in Katari; the
-// only network call is the prelude's `http.post_json`. Swapping providers means swapping this one
-// `use` line; nothing else in the app or the `ai` layer knows Gemini exists.
+// the request body is built as a value tree and the response parsed from `json`, entirely in Katari;
+// the only network call is the prelude's `http.fetch` with an `http.json` body, so a turn's image
+// `file` inlines (its `data` slot base64s at the send boundary, never on the value plane). Swapping
+// providers means swapping this one `use` line; nothing else in the app or the `ai` layer knows
+// Gemini exists.
 
 import ai
 import ai.types
@@ -63,13 +65,15 @@ agent gemini_result_part(result: types.tool_result) -> json.json {
   })
 }
 
-@"A file's content as an inlineData part — what lets the model actually SEE an image. The base64
-materialises the whole content into the request, so only the freshest history element inlines (see
-gemini_content's @inline@)."
+@"A file's content as an inlineData part — what lets the model actually SEE an image. The `data` slot
+holds the file VALUE (embedded as its handle via `json.encode`); `http.json` reads its bytes and
+base64s them in place only at the send boundary, so the content never rides the value plane. Only the
+freshest history element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
 agent gemini_inline_part(f: file) -> json.json {
-  // `data` is a keyword, so the wire object is assembled with record.set instead of a literal.
+  // `data` is a keyword, so the wire object is assembled with record.set instead of a literal. The file
+  // rides as its handle here; `http.json` base64s it at the send boundary (no `read_base64`).
   let base = { mimeType = json.json_string(value = file.content_type(value = f)) }
-  let inline = record.set(target = base, key = "data", value = json.json_string(value = file.read_base64(value = f)))
+  let inline = record.set(target = base, key = "data", value = json.encode(value = f))
   json.json_object(entries = {
     inlineData = json.json_object(entries = inline),
   })
@@ -170,7 +174,7 @@ agent gemini_function_declaration(meta: reflection.agent_metadata) -> json.json 
   })
 }
 
-agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> string {
+agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> unknown {
   // Only the FRESHEST history element inlines its files' content (the model just received them);
   // older elements shrink to handle notes — the model re-reads any of those with `view_image`.
   let count = array.length(target = history)
@@ -189,13 +193,19 @@ agent gemini_request_body(client: connection, history: array[types.message], too
       parts = json.json_array(items = [gemini_text_part(text = client.system)]),
     }))
   }
-  if (array.length(target = tool_metas) == 0) {
-    json.stringify(value = json.json_object(entries = with_system))
+  let document = if (array.length(target = tool_metas) == 0) {
+    json.json_object(entries = with_system)
   } else {
     let declarations = json.json_array(items = for (let meta in tool_metas) { next gemini_function_declaration(meta = meta) })
     let tools = json.json_array(items = [json.json_object(entries = { functionDeclarations = declarations })])
-    json.stringify(value = json.json_object(entries = record.set(target = with_system, key = "tools", value = tools)))
+    json.json_object(entries = record.set(target = with_system, key = "tools", value = tools))
   }
+  // The request body as a RAW value tree (not stringified JSON): `http.json` walks it at the send
+  // boundary and base64s each `file` leaf — the inlineData `data` slots — in place, so the bytes never
+  // land on the value plane. `decode[unknown]` is the total inverse of the json.json tree the provider
+  // built (valid json + `$ref` file handles), so it never actually rejects; its `decode_error` is the
+  // declared-but-unreached member of `ai.step_error`.
+  json.decode[unknown](value = document)
 }
 
 // ── response parsing (read out of json) ──────────────────────────────────────
@@ -267,10 +277,20 @@ agent gemini_parse_step(response: string) -> types.step with prelude.throw[json.
   }
 }
 
-@"One Gemini model step over the history + tool schemas (built and parsed as json in Katari; only the POST leaves the runtime)."
+@"One Gemini model step over the history + tool schemas (the body built as a value tree and the reply
+parsed as json in Katari; only the POST leaves the runtime, and each inlined image `file` in the body
+base64s at that send boundary via `http.json`)."
 agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step {
   let body = gemini_request_body(client = client, history = history, tool_metas = tool_metas)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
-  let response = http.post_json(url = url, body = body, headers = record.set(target = record.empty(), key = "x-goog-api-key", value = client.api_key))
-  gemini_parse_step(response = response)
+  let headers = record.set(target = record.empty(), key = "x-goog-api-key", value = client.api_key)
+  // `http.json` sends the value tree as application/json (the transport defaults the Content-Type), with
+  // each inlined image `file` read from the blob store and base64'd only here. A non-2xx is raised as
+  // `http.status_error` (the opinionated JSON-API stance `post_json` used to take on this provider's behalf).
+  let response = http.fetch(url = url, method = "POST", headers = headers, body = http.json(value = body))
+  if (response.status >= 200 && response.status < 300) {
+    gemini_parse_step(response = response.body)
+  } else {
+    prelude.throw(error = http.status_error(status = response.status, body = response.body))
+  }
 }

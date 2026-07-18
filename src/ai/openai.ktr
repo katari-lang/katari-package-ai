@@ -50,8 +50,8 @@ agent openai_call_entry(call: types.tool_call) -> json.json {
 }
 
 @"A turn's files as text notes appended to its content. This provider keeps files handle-only (no
-image inlining yet — the Gemini provider is the multimodal one); the handle note still lets the
-model replay a file into a tool call (`view_image` / `send_files`)."
+image inlining — the Gemini and Anthropic providers are the multimodal ones); the handle note still
+lets the model replay a file into a tool call (`view_image` / `send_files`)."
 agent openai_file_notes(files: array[file]) -> string {
   let notes = for (let f in files) { next f"\n[attached file: ${json.to_text(value = f)}]" }
   string.join(parts = notes, separator = "")

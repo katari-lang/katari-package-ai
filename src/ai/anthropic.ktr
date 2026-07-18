@@ -1,8 +1,10 @@
 // Anthropic provider: serves the `ai.infer_step` request over the Messages API. Where OpenAI ships
 // tool arguments as a JSON string, Anthropic keeps them as parsed JSON inside `tool_use` content
 // blocks, keyed by a block id (carried in tool_call.opaque / tool_result.call_id) that the next user
-// turn echoes back as `tool_result` blocks — one message for the whole batch. Same agnostic
-// vocabulary, different shaping — and the same one-line integration:
+// turn echoes back as `tool_result` blocks — one message for the whole batch. A turn's image files
+// inline as `image` content blocks: the request body posts as an `http.json` value tree with
+// `http.fetch`, so each image's `data` slot base64s at the send boundary, never on the value plane.
+// Same agnostic vocabulary, different shaping — and the same one-line integration:
 // `use anthropic.provider(api_key = ...)`.
 
 import ai
@@ -46,12 +48,62 @@ agent anthropic_role(@"The `ai.types` turn role (\"user\" / \"model\")." role: s
   }
 }
 
-@"A turn's files as text notes appended to its content. This provider keeps files handle-only (no
-image inlining yet — the Gemini provider is the multimodal one); the handle note still lets the
-model replay a file into a tool call (`view_image` / `send_files`)."
+@"Every file of a turn as a handle note, joined for the turn's text. The `$ref` handle is the exact
+object the model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the
+note is the replay affordance — kept for an image too, alongside the image block that lets the model
+SEE it (see `anthropic_turn_content`)."
 agent anthropic_file_notes(@"The files attached to a turn." files: array[file]) -> string {
   let notes = for (let attachment in files) { next f"\n[attached file: ${json.to_text(value = attachment)}]" }
   string.join(parts = notes, separator = "")
+}
+
+@"Whether a file inlines as an Anthropic image block: its recorded content type begins \"image/\" (the
+Messages API image block takes only image media types). A file with another or no recorded type stays
+a handle note."
+agent anthropic_is_image(@"The file to test." attachment: file) -> boolean {
+  string.starts_with(value = file.content_type(value = attachment), search = "image/")
+}
+
+@"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`. `type` is a keyword, so the wire
+object is assembled with `record.set` instead of a literal."
+agent anthropic_text_block(@"The block's text." text: string) -> json.json {
+  let base = { text = json.json_string(value = text) }
+  json.json_object(entries = record.set(target = base, key = "type", value = json.json_string(value = "text")))
+}
+
+@"An image content block: a base64 `source` whose `media_type` is the file's recorded type and whose
+`data` slot holds the file VALUE (embedded as its handle via `json.encode`). `http.json` materialises
+that slot — reading the bytes and base64-ing them in place — only at the send boundary, so the image
+content never rides the value plane, the durable call record or the trace. `type` / `data` are
+keywords, so the wire objects are assembled with `record.set`."
+agent anthropic_image_block(@"The image file to inline." attachment: file) -> json.json {
+  let source_base = { media_type = json.json_string(value = file.content_type(value = attachment)) }
+  let source_typed = record.set(target = source_base, key = "type", value = json.json_string(value = "base64"))
+  let source = record.set(target = source_typed, key = "data", value = json.encode(value = attachment))
+  let block_base = { source = json.json_object(entries = source) }
+  json.json_object(entries = record.set(target = block_base, key = "type", value = json.json_string(value = "image")))
+}
+
+@"A turn's content: the plain string (text + every file's handle note) when the turn carries no image,
+or an array of one text block plus one image block per image file when it does. An image file inlines
+so the model can SEE it; a non-image file stays a handle note (the image block takes only images). The
+text block still carries every file's handle note, so the model can replay any of them into a tool."
+agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's files." files: array[file]) -> json.json {
+  let image_blocks = array.flatten(target = for (let attachment in files) {
+    if (anthropic_is_image(attachment = attachment)) {
+      next [anthropic_image_block(attachment = attachment)]
+    } else {
+      next []
+    }
+  })
+  let note_text = f"${text}${anthropic_file_notes(files = files)}"
+  if (array.length(target = image_blocks) == 0) {
+    // No image to inline: the plain string content (text + handle notes), exactly as before.
+    json.json_string(value = note_text)
+  } else {
+    // Images present: a text block (text + every file's handle note) followed by the image blocks.
+    json.json_array(items = array.concat(left = [anthropic_text_block(text = note_text)], right = image_blocks))
+  }
 }
 
 agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call) -> json.json {
@@ -79,7 +131,7 @@ agent anthropic_message(@"One history element." message: types.message) -> json.
     case types.turn(role => role, text => text, files => files) -> {
       json.json_object(entries = {
         role = json.json_string(value = anthropic_role(role = role)),
-        content = json.json_string(value = f"${text}${anthropic_file_notes(files = files)}"),
+        content = anthropic_turn_content(text = text, files = files),
       })
     }
     case types.call_turn(calls => calls) -> {
@@ -111,7 +163,7 @@ agent anthropic_request_body(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
-) -> string {
+) -> unknown {
   let messages = json.json_array(items = for (let message in history) { next anthropic_message(message = message) })
   // Thinking stays OFF, explicitly: newer Claude models run adaptive thinking when the field is
   // omitted, and a thinking block must then be replayed VERBATIM (signature included) on the next
@@ -130,12 +182,18 @@ agent anthropic_request_body(
   } else {
     record.set(target = base, key = "system", value = json.json_string(value = client.system))
   }
-  if (array.length(target = tool_metas) == 0) {
-    json.stringify(value = json.json_object(entries = with_system))
+  let document = if (array.length(target = tool_metas) == 0) {
+    json.json_object(entries = with_system)
   } else {
     let tools = json.json_array(items = for (let meta in tool_metas) { next anthropic_tool(meta = meta) })
-    json.stringify(value = json.json_object(entries = record.set(target = with_system, key = "tools", value = tools)))
+    json.json_object(entries = record.set(target = with_system, key = "tools", value = tools))
   }
+  // The request body as a RAW value tree (not stringified JSON): `http.json` walks it at the send
+  // boundary and base64s each `file` leaf — the image `data` slots — in place, so the bytes never land
+  // on the value plane. `decode[unknown]` is the total inverse of the json.json tree the provider built
+  // (valid json + `$ref` file handles), so it never actually rejects; its `decode_error` is the
+  // declared-but-unreached member of `ai.step_error`.
+  json.decode[unknown](value = document)
 }
 
 // ── response parsing ─────────────────────────────────────────────────────────
@@ -190,7 +248,9 @@ agent anthropic_parse_step(@"The raw response body." response: string) -> types.
   }
 }
 
-@"One Anthropic model step over the history + tool schemas (built and parsed as json in Katari; only the POST leaves the runtime)."
+@"One Anthropic model step over the history + tool schemas (the body built as a value tree and the
+reply parsed as json in Katari; only the POST leaves the runtime, and each image `file` in the body
+base64s at that send boundary via `http.json`)."
 agent anthropic_infer_step(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
@@ -202,6 +262,18 @@ agent anthropic_infer_step(
     key = "anthropic-version",
     value = "2023-06-01",
   )
-  let response = http.post_json(url = "https://api.anthropic.com/v1/messages", body = body, headers = headers)
-  anthropic_parse_step(response = response)
+  // `http.json` sends the value tree as application/json (the transport defaults the Content-Type), with
+  // each image `file` leaf read from the blob store and base64'd only here. A non-2xx is raised as
+  // `http.status_error` (the opinionated JSON-API stance `post_json` used to take on this provider's behalf).
+  let response = http.fetch(
+    url = "https://api.anthropic.com/v1/messages",
+    method = "POST",
+    headers = headers,
+    body = http.json(value = body),
+  )
+  if (response.status >= 200 && response.status < 300) {
+    anthropic_parse_step(response = response.body)
+  } else {
+    prelude.throw(error = http.status_error(status = response.status, body = response.body))
+  }
 }

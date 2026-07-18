@@ -22,9 +22,12 @@ provider-agnostic and providers stay loop-agnostic."
 request infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step
 
 // The error surface of one model step, raised by the serving provider's handler (so it surfaces at
-// the provider's use site — the app root): malformed provider JSON, a non-2xx API status, or a
-// transport failure. (Type synonyms take no docs.)
-type step_error = json.parse_error | http.status_error | http.fetch_error
+// the provider's use site — the app root): the request body's value-tree conversion
+// (`json.decode_error` — total in practice for a tree the provider itself built, so this member is a
+// declared-but-unreached formality of the `http.json` body path), malformed provider JSON
+// (`json.parse_error`), a non-2xx API status (`http.status_error`), or a transport failure
+// (`http.fetch_error`). (Type synonyms take no docs.)
+type step_error = json.parse_error | json.decode_error | http.status_error | http.fetch_error
 
 // What the loop itself can raise: a bad dynamic dispatch (a hallucinated tool call's args failing the
 // tool's schema — usually caught and fed back, see dispatch_one), or a failure decoding the model's
