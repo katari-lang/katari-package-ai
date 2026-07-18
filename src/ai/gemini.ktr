@@ -31,7 +31,7 @@ agent provider[R, effect E](
   continuation(value = null)
 }
 
-// ── request body (built as json) ─────────────────────────────────────────────
+// ── request body (built directly as a raw value tree) ─────────────────────────
 
 agent gemini_role(role: string) -> string {
   match (role) {
@@ -40,56 +40,54 @@ agent gemini_role(role: string) -> string {
   }
 }
 
-agent gemini_text_part(text: string) -> json.json {
-  json.json_object(entries = { text = json.json_string(value = text) })
+agent gemini_text_part(text: string) -> unknown {
+  { text = text }
 }
 
-agent gemini_call_part(call: types.tool_call) -> json.json {
-  // Replay the model's functionCall verbatim: name + the original args (already json) + the
-  // thought signature Gemini requires echoed.
-  json.json_object(entries = {
-    functionCall = json.json_object(entries = {
-      name = json.json_string(value = call.name),
-      args = call.args,
-    }),
-    thoughtSignature = json.json_string(value = call.opaque),
-  })
+agent gemini_call_part(call: types.tool_call) -> unknown {
+  // Replay the model's functionCall verbatim: name + the original args (a literal json document
+  // flattened straight into the value tree) + the thought signature Gemini requires echoed.
+  {
+    functionCall = {
+      name = call.name,
+      args = ai.json_to_value(node = call.args),
+    },
+    thoughtSignature = call.opaque,
+  }
 }
 
-agent gemini_result_part(result: types.tool_result) -> json.json {
-  json.json_object(entries = {
-    functionResponse = json.json_object(entries = {
-      name = json.json_string(value = result.name),
-      response = json.json_object(entries = { result = json.json_string(value = result.text) }),
-    }),
-  })
+agent gemini_result_part(result: types.tool_result) -> unknown {
+  {
+    functionResponse = {
+      name = result.name,
+      response = { result = result.text },
+    },
+  }
 }
 
 @"A file's content as an inlineData part — what lets the model actually SEE an image. The `data` slot
-holds the file VALUE (embedded as its handle via `json.encode`); `http.json` reads its bytes and
-base64s them in place only at the send boundary, so the content never rides the value plane. Only the
-freshest history element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
-agent gemini_inline_part(f: file) -> json.json {
-  // `data` is a keyword, so the wire object is assembled with record.set instead of a literal. The file
-  // rides as its handle here; `http.json` base64s it at the send boundary (no `read_base64`).
-  let base = { mimeType = json.json_string(value = file.content_type(value = f)) }
-  let inline = record.set(target = base, key = "data", value = json.encode(value = f))
-  json.json_object(entries = {
-    inlineData = json.json_object(entries = inline),
-  })
+holds the file VALUE placed DIRECTLY into the tree; `http.json` reads its bytes and base64s them in
+place only at the send boundary, so the content never rides the value plane. Only the freshest history
+element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
+agent gemini_inline_part(f: file) -> unknown {
+  // `data` is a keyword, so the slot is assembled with record.set instead of a literal. The file rides
+  // as its handle here; `http.json` base64s it at the send boundary (no `read_base64`).
+  let base = { mimeType = file.content_type(value = f) }
+  let inline = record.set(target = base, key = "data", value = f)
+  { inlineData = inline }
 }
 
 @"A file as its `$ref` handle note — the resting representation. The handle is the exact object the
 model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the note IS
 the affordance, not just a description."
-agent gemini_handle_part(f: file) -> json.json {
+agent gemini_handle_part(f: file) -> unknown {
   gemini_text_part(text = f"[attached file: ${json.to_text(value = f)}]")
 }
 
 @"Render a turn's / result's files: inlined (content + handle note, so the model both sees the image
 and learns the handle to replay) while fresh, the handle note alone once older — the model re-reads
 an old image on demand with `view_image`. A file with no recorded MIME type cannot inline."
-agent gemini_file_parts(files: array[file], inline: boolean) -> array[json.json] {
+agent gemini_file_parts(files: array[file], inline: boolean) -> array[unknown] {
   array.flatten(target = for (let f in files) {
     if (inline && file.content_type(value = f) != "") {
       next [gemini_handle_part(f = f), gemini_inline_part(f = f)]
@@ -102,32 +100,32 @@ agent gemini_file_parts(files: array[file], inline: boolean) -> array[json.json]
 @"One history element as a Gemini content. @inline@ marks the freshest element — the only one whose
 files inline their content (older elements show handles only, keeping the request small; the model
 re-reads any old image with `view_image`)."
-agent gemini_content(msg: types.message, inline: boolean) -> json.json {
+agent gemini_content(msg: types.message, inline: boolean) -> unknown {
   match (msg) {
     case types.turn(role => role, text => text, files => files) -> {
-      json.json_object(entries = {
-        role = json.json_string(value = gemini_role(role = role)),
-        parts = json.json_array(items = array.concat(
+      {
+        role = gemini_role(role = role),
+        parts = array.concat(
           left = [gemini_text_part(text = text)],
           right = gemini_file_parts(files = files, inline = inline),
-        )),
-      })
+        ),
+      }
     }
     case types.call_turn(calls => calls) -> {
-      json.json_object(entries = {
-        role = json.json_string(value = "model"),
-        parts = json.json_array(items = for (let call in calls) { next gemini_call_part(call = call) }),
-      })
+      {
+        role = "model",
+        parts = for (let call in calls) { next gemini_call_part(call = call) },
+      }
     }
     case types.result_turn(results => results) -> {
       let response_parts = for (let result in results) { next gemini_result_part(result = result) }
       let file_parts = array.flatten(target = for (let result in results) {
         next gemini_file_parts(files = result.files, inline = inline)
       })
-      json.json_object(entries = {
-        role = json.json_string(value = "user"),
-        parts = json.json_array(items = array.concat(left = response_parts, right = file_parts)),
-      })
+      {
+        role = "user",
+        parts = array.concat(left = response_parts, right = file_parts),
+      }
     }
   }
 }
@@ -166,12 +164,14 @@ agent gemini_sanitize(node: json.json) -> json.json with pure {
   }
 }
 
-agent gemini_function_declaration(meta: reflection.agent_metadata) -> json.json {
-  json.json_object(entries = {
-    name = json.json_string(value = meta.name),
-    description = json.json_string(value = meta.description),
-    parameters = gemini_sanitize(node = meta.input),
-  })
+agent gemini_function_declaration(meta: reflection.agent_metadata) -> unknown {
+  // `gemini_sanitize` strips the JSON-Schema keywords Gemini rejects, still as a `json` document; the
+  // survivor is then flattened LITERALLY into the value tree so any remaining `$`-key stays a key.
+  {
+    name = meta.name,
+    description = meta.description,
+    parameters = ai.json_to_value(node = gemini_sanitize(node = meta.input)),
+  }
 }
 
 agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> unknown {
@@ -184,28 +184,27 @@ agent gemini_request_body(client: connection, history: array[types.message], too
   let freshest = for (let msg in array.slice(target = history, start = count - 1, end = count)) {
     next gemini_content(msg = msg, inline = true)
   }
-  let contents = json.json_array(items = array.concat(left = older, right = freshest))
-  let base = { contents = contents }
+  let contents = array.concat(left = older, right = freshest)
+  let base: record[unknown] = { contents = contents }
   let with_system = if (client.system == "") {
     base
   } else {
-    record.set(target = base, key = "systemInstruction", value = json.json_object(entries = {
-      parts = json.json_array(items = [gemini_text_part(text = client.system)]),
-    }))
+    record.set(target = base, key = "systemInstruction", value = {
+      parts = [gemini_text_part(text = client.system)],
+    })
   }
-  let document = if (array.length(target = tool_metas) == 0) {
-    json.json_object(entries = with_system)
+  // The request body as a RAW value tree, built DIRECTLY (no `json.json` round-trip): `http.json` walks
+  // it at the send boundary and base64s each `file` leaf — the inlineData `data` slots placed directly
+  // above — in place, so the bytes never land on the value plane. Building `unknown` directly (rather
+  // than a `json.json` tree flattened by `decode[unknown]`) keeps a tool schema's literal `$`-keys
+  // intact — a wire-reading decode would mistake them for file handles.
+  if (array.length(target = tool_metas) == 0) {
+    with_system
   } else {
-    let declarations = json.json_array(items = for (let meta in tool_metas) { next gemini_function_declaration(meta = meta) })
-    let tools = json.json_array(items = [json.json_object(entries = { functionDeclarations = declarations })])
-    json.json_object(entries = record.set(target = with_system, key = "tools", value = tools))
+    let declarations = for (let meta in tool_metas) { next gemini_function_declaration(meta = meta) }
+    let tools = [{ functionDeclarations = declarations }]
+    record.set(target = with_system, key = "tools", value = tools)
   }
-  // The request body as a RAW value tree (not stringified JSON): `http.json` walks it at the send
-  // boundary and base64s each `file` leaf — the inlineData `data` slots — in place, so the bytes never
-  // land on the value plane. `decode[unknown]` is the total inverse of the json.json tree the provider
-  // built (valid json + `$ref` file handles), so it never actually rejects; its `decode_error` is the
-  // declared-but-unreached member of `ai.step_error`.
-  json.decode[unknown](value = document)
 }
 
 // ── response parsing (read out of json) ──────────────────────────────────────

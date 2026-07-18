@@ -64,31 +64,31 @@ agent anthropic_is_image(@"The file to test." attachment: file) -> boolean {
   string.starts_with(value = file.content_type(value = attachment), search = "image/")
 }
 
-@"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`. `type` is a keyword, so the wire
-object is assembled with `record.set` instead of a literal."
-agent anthropic_text_block(@"The block's text." text: string) -> json.json {
-  let base = { text = json.json_string(value = text) }
-  json.json_object(entries = record.set(target = base, key = "type", value = json.json_string(value = "text")))
+@"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`, built as a raw value tree. `type`
+is a keyword, so the object is assembled with `record.set` instead of a literal."
+agent anthropic_text_block(@"The block's text." text: string) -> unknown {
+  let base = { text = text }
+  record.set(target = base, key = "type", value = "text")
 }
 
 @"An image content block: a base64 `source` whose `media_type` is the file's recorded type and whose
-`data` slot holds the file VALUE (embedded as its handle via `json.encode`). `http.json` materialises
-that slot — reading the bytes and base64-ing them in place — only at the send boundary, so the image
-content never rides the value plane, the durable call record or the trace. `type` / `data` are
-keywords, so the wire objects are assembled with `record.set`."
-agent anthropic_image_block(@"The image file to inline." attachment: file) -> json.json {
-  let source_base = { media_type = json.json_string(value = file.content_type(value = attachment)) }
-  let source_typed = record.set(target = source_base, key = "type", value = json.json_string(value = "base64"))
-  let source = record.set(target = source_typed, key = "data", value = json.encode(value = attachment))
-  let block_base = { source = json.json_object(entries = source) }
-  json.json_object(entries = record.set(target = block_base, key = "type", value = json.json_string(value = "image")))
+`data` slot holds the file VALUE placed DIRECTLY into the tree. `http.json` materialises that slot —
+reading the bytes and base64-ing them in place — only at the send boundary, so the image content never
+rides the value plane, the durable call record or the trace. `type` / `data` are keywords, so those
+slots are assembled with `record.set`."
+agent anthropic_image_block(@"The image file to inline." attachment: file) -> unknown {
+  let source_base = { media_type = file.content_type(value = attachment) }
+  let source_typed = record.set(target = source_base, key = "type", value = "base64")
+  let source = record.set(target = source_typed, key = "data", value = attachment)
+  let block_base: record[unknown] = { source = source }
+  record.set(target = block_base, key = "type", value = "image")
 }
 
 @"A turn's content: the plain string (text + every file's handle note) when the turn carries no image,
 or an array of one text block plus one image block per image file when it does. An image file inlines
 so the model can SEE it; a non-image file stays a handle note (the image block takes only images). The
 text block still carries every file's handle note, so the model can replay any of them into a tool."
-agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's files." files: array[file]) -> json.json {
+agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's files." files: array[file]) -> unknown {
   let image_blocks = array.flatten(target = for (let attachment in files) {
     if (anthropic_is_image(attachment = attachment)) {
       next [anthropic_image_block(attachment = attachment)]
@@ -99,64 +99,67 @@ agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's file
   let note_text = f"${text}${anthropic_file_notes(files = files)}"
   if (array.length(target = image_blocks) == 0) {
     // No image to inline: the plain string content (text + handle notes), exactly as before.
-    json.json_string(value = note_text)
+    note_text
   } else {
     // Images present: a text block (text + every file's handle note) followed by the image blocks.
-    json.json_array(items = array.concat(left = [anthropic_text_block(text = note_text)], right = image_blocks))
+    array.concat(left = [anthropic_text_block(text = note_text)], right = image_blocks)
   }
 }
 
-agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call) -> json.json {
-  // Replay the model's tool_use verbatim: its block id + name + the original input (already json).
-  // `type` is a keyword, so the wire object is assembled with record.set instead of a literal.
+agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call) -> unknown {
+  // Replay the model's tool_use verbatim: its block id + name + the original input. The input is a
+  // literal json document (the model's parsed args) flattened straight into the value tree, so its
+  // literal keys survive; `type` is a keyword, assembled with record.set instead of a literal.
   let base = {
-    id = json.json_string(value = call.opaque),
-    name = json.json_string(value = call.name),
-    input = call.args,
+    id = call.opaque,
+    name = call.name,
+    input = ai.json_to_value(node = call.args),
   }
-  json.json_object(entries = record.set(target = base, key = "type", value = json.json_string(value = "tool_use")))
+  record.set(target = base, key = "type", value = "tool_use")
 }
 
-agent anthropic_result_block(@"One tool's output, keyed back to its call." result: types.tool_result) -> json.json {
-  // `type` is a keyword, so the wire object is assembled with record.set instead of a literal.
+agent anthropic_result_block(@"One tool's output, keyed back to its call." result: types.tool_result) -> unknown {
+  // `type` is a keyword, so the object is assembled with record.set instead of a literal.
   let base = {
-    tool_use_id = json.json_string(value = result.call_id),
-    content = json.json_string(value = result.text),
+    tool_use_id = result.call_id,
+    content = result.text,
   }
-  json.json_object(entries = record.set(target = base, key = "type", value = json.json_string(value = "tool_result")))
+  record.set(target = base, key = "type", value = "tool_result")
 }
 
-agent anthropic_message(@"One history element." message: types.message) -> json.json {
+agent anthropic_message(@"One history element." message: types.message) -> unknown {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {
-      json.json_object(entries = {
-        role = json.json_string(value = anthropic_role(role = role)),
+      {
+        role = anthropic_role(role = role),
         content = anthropic_turn_content(text = text, files = files),
-      })
+      }
     }
     case types.call_turn(calls => calls) -> {
-      json.json_object(entries = {
-        role = json.json_string(value = "assistant"),
-        content = json.json_array(items = for (let call in calls) { next anthropic_call_block(call = call) }),
-      })
+      {
+        role = "assistant",
+        content = for (let call in calls) { next anthropic_call_block(call = call) },
+      }
     }
     case types.result_turn(results => results) -> {
       // The whole batch's results ride ONE user message: the API pairs every tool_use id of the
       // assistant turn against the tool_result blocks of the single next user message.
-      json.json_object(entries = {
-        role = json.json_string(value = "user"),
-        content = json.json_array(items = for (let result in results) { next anthropic_result_block(result = result) }),
-      })
+      {
+        role = "user",
+        content = for (let result in results) { next anthropic_result_block(result = result) },
+      }
     }
   }
 }
 
-agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metadata) -> json.json {
-  json.json_object(entries = {
-    name = json.json_string(value = meta.name),
-    description = json.json_string(value = meta.description),
-    input_schema = meta.input,
-  })
+agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metadata) -> unknown {
+  // The derived input schema is a literal json document (`$ref` / `$defs` / `$schema` keys and all)
+  // spliced verbatim into the value tree; a wire-reading decode would corrupt those keys.
+  {
+    name = meta.name,
+    description = meta.description,
+    input_schema = ai.json_to_value(node = meta.input),
+  }
 }
 
 agent anthropic_request_body(
@@ -164,36 +167,35 @@ agent anthropic_request_body(
   @"The conversation so far." history: array[types.message],
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
 ) -> unknown {
-  let messages = json.json_array(items = for (let message in history) { next anthropic_message(message = message) })
+  let messages = for (let message in history) { next anthropic_message(message = message) }
   // Thinking stays OFF, explicitly: newer Claude models run adaptive thinking when the field is
   // omitted, and a thinking block must then be replayed VERBATIM (signature included) on the next
   // call turn — the agnostic vocabulary has no slot for one (Gemini's per-call thoughtSignature fits
   // tool_call.opaque; a standalone content block does not), and dropping it fails the follow-up
   // request.
-  let thinking = json.json_object(entries = record.set(target = record.empty(), key = "type", value = json.json_string(value = "disabled")))
-  let base = {
-    model = json.json_string(value = client.model),
-    max_tokens = json.json_integer(value = client.max_tokens),
+  let thinking = record.set(target = record.empty(), key = "type", value = "disabled")
+  let base: record[unknown] = {
+    model = client.model,
+    max_tokens = client.max_tokens,
     messages = messages,
     thinking = thinking,
   }
   let with_system = if (client.system == "") {
     base
   } else {
-    record.set(target = base, key = "system", value = json.json_string(value = client.system))
+    record.set(target = base, key = "system", value = client.system)
   }
-  let document = if (array.length(target = tool_metas) == 0) {
-    json.json_object(entries = with_system)
+  // The request body as a RAW value tree, built DIRECTLY (no `json.json` round-trip): `http.json` walks
+  // it at the send boundary and base64s each `file` leaf — the image `data` slots placed directly above
+  // — in place, so the bytes never land on the value plane. Building `unknown` directly (rather than a
+  // `json.json` tree flattened by `decode[unknown]`) keeps a tool schema's literal `$ref` / `$defs`
+  // keys intact — a wire-reading decode would mistake them for file handles.
+  if (array.length(target = tool_metas) == 0) {
+    with_system
   } else {
-    let tools = json.json_array(items = for (let meta in tool_metas) { next anthropic_tool(meta = meta) })
-    json.json_object(entries = record.set(target = with_system, key = "tools", value = tools))
+    let tools = for (let meta in tool_metas) { next anthropic_tool(meta = meta) }
+    record.set(target = with_system, key = "tools", value = tools)
   }
-  // The request body as a RAW value tree (not stringified JSON): `http.json` walks it at the send
-  // boundary and base64s each `file` leaf — the image `data` slots — in place, so the bytes never land
-  // on the value plane. `decode[unknown]` is the total inverse of the json.json tree the provider built
-  // (valid json + `$ref` file handles), so it never actually rejects; its `decode_error` is the
-  // declared-but-unreached member of `ai.step_error`.
-  json.decode[unknown](value = document)
 }
 
 // ── response parsing ─────────────────────────────────────────────────────────
