@@ -11,9 +11,10 @@ data turn(role: string, text: string, files: array[file])
 @"One tool the model wants to invoke this step — @name@ is its function name (the dispatch key and
 the model-facing call/response record), @opaque@ is any provider token that must be replayed
 verbatim on the call turn (Gemini's thought signature, OpenAI's call id), @args@ is the model's
-argument object as parsed json (replayed verbatim; `json.decode[unknown]` turns it into the plain
-value `reflection.call_agent` dispatches with)."
-data tool_call(name: string, opaque: string, args: json.json)
+argument object as a parsed value (replayed verbatim into the call turn, and dispatched straight
+through `reflection.call_agent`, whose delegation boundary revives any `$ref` the model replayed
+into the `file` its target expects)."
+data tool_call(name: string, opaque: string, args: unknown)
 
 @"A tool's output for the model, keyed by the tool @name@ / @call_id@ so it round-trips as a function
 response. @files@ are the `file` values found in the result (a screenshot an MCP tool returned, an

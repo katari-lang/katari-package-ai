@@ -37,121 +37,124 @@ agent openai_role(role: string) -> string {
   }
 }
 
-agent openai_call_entry(call: types.tool_call, map: ai.name_map) -> json.json {
+agent openai_call_entry(call: types.tool_call, map: ai.name_map) -> unknown {
   // The replayed call ships the WIRE name — the API validates a history tool_call name the same as the
   // request's tool declarations (the qualified name's dot is rejected); the opaque call id stays as-is.
-  // `type` is a keyword, so the wire object is assembled with record.set instead of a literal.
-  let base = {
-    id = json.json_string(value = call.opaque),
-    function = json.json_object(entries = {
-      name = json.json_string(value = ai.wire_name_of(map = map, real = call.name)),
-      arguments = json.json_string(value = json.stringify(value = call.args)),
-    }),
+  // OpenAI carries the arguments as a JSON *string*, so the model's args document is stringified back.
+  {
+    id = call.opaque,
+    "type" = "function",
+    function = {
+      name = ai.wire_name_of(map = map, real = call.name),
+      arguments = json.stringify(value = call.args),
+    },
   }
-  json.json_object(entries = record.set(target = base, key = "type", value = json.json_string(value = "function")))
 }
 
 @"A turn's files as text notes appended to its content. This provider keeps files handle-only (no
 image inlining — the Gemini and Anthropic providers are the multimodal ones); the handle note still
 lets the model replay a file into a tool call (`view_image` / `send_files`)."
 agent openai_file_notes(files: array[file]) -> string {
-  let notes = for (let f in files) { next f"\n[attached file: ${json.to_text(value = f)}]" }
+  let notes = for (let f in files) { next f"\n[attached file: ${json.stringify(value = f)}]" }
   string.join(parts = notes, separator = "")
 }
 
-agent openai_messages_of(msg: types.message, map: ai.name_map) -> array[json.json] {
+agent openai_messages_of(msg: types.message, map: ai.name_map) -> array[unknown] {
   match (msg) {
     case types.turn(role => role, text => text, files => files) -> {
-      [json.json_object(entries = {
-        role = json.json_string(value = openai_role(role = role)),
-        content = json.json_string(value = f"${text}${openai_file_notes(files = files)}"),
-      })]
+      [{
+        role = openai_role(role = role),
+        content = f"${text}${openai_file_notes(files = files)}",
+      }]
     }
     case types.call_turn(calls => calls) -> {
-      [json.json_object(entries = {
-        role = json.json_string(value = "assistant"),
-        tool_calls = json.json_array(items = for (let call in calls) { next openai_call_entry(call = call, map = map) }),
-      })]
+      [{
+        role = "assistant",
+        tool_calls = for (let call in calls) { next openai_call_entry(call = call, map = map) },
+      }]
     }
     case types.result_turn(results => results) -> {
       for (let result in results) {
-        next json.json_object(entries = {
-          role = json.json_string(value = "tool"),
-          tool_call_id = json.json_string(value = result.call_id),
-          content = json.json_string(value = result.text),
-        })
+        next {
+          role = "tool",
+          tool_call_id = result.call_id,
+          content = result.text,
+        }
       }
     }
   }
 }
 
-agent openai_messages(client: connection, history: array[types.message], map: ai.name_map) -> array[json.json] {
-  let base = for (let msg in history, var acc: array[json.json] = []) {
+agent openai_messages(client: connection, history: array[types.message], map: ai.name_map) -> array[unknown] {
+  let base = for (let msg in history, var acc: array[unknown] = []) {
     next with { acc = array.concat(left = acc, right = openai_messages_of(msg = msg, map = map)) }
   } then (_messages) { acc }
   if (client.system == "") {
     base
   } else {
-    let system_message = json.json_object(entries = {
-      role = json.json_string(value = "system"),
-      content = json.json_string(value = client.system),
-    })
+    let system_message = {
+      role = "system",
+      content = client.system,
+    }
     array.concat(left = [system_message], right = base)
   }
 }
 
-agent openai_function_tool(meta: reflection.agent_metadata, map: ai.name_map) -> json.json {
+agent openai_function_tool(meta: reflection.agent_metadata, map: ai.name_map) -> unknown {
   // The tool is declared under its WIRE name (the qualified name's dot is rejected); the loop maps the
-  // model's pick back to the real name when it dispatches. `type` is a keyword, so the wire object is
-  // assembled with record.set instead of a literal.
-  let base = {
-    function = json.json_object(entries = {
-      name = json.json_string(value = ai.wire_name_of(map = map, real = meta.name)),
-      description = json.json_string(value = meta.description),
+  // model's pick back to the real name when it dispatches. `meta.input` is already a document value, so
+  // its JSON-Schema keys drop straight into the tree.
+  {
+    "type" = "function",
+    function = {
+      name = ai.wire_name_of(map = map, real = meta.name),
+      description = meta.description,
       parameters = meta.input,
-    }),
+    },
   }
-  json.json_object(entries = record.set(target = base, key = "type", value = json.json_string(value = "function")))
 }
 
-agent openai_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata], map: ai.name_map) -> string {
-  let messages = json.json_array(items = openai_messages(client = client, history = history, map = map))
+// The request body as a raw value tree — `post_json` serialises it (there are no `file` leaves here;
+// OpenAI stays handle-only).
+agent openai_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata], map: ai.name_map) -> unknown {
+  let messages = openai_messages(client = client, history = history, map = map)
   if (array.length(target = tool_metas) == 0) {
-    json.stringify(value = json.json_object(entries = {
-      model = json.json_string(value = client.model),
+    {
+      model = client.model,
       messages = messages,
-    }))
+    }
   } else {
-    let tools = json.json_array(items = for (let meta in tool_metas) { next openai_function_tool(meta = meta, map = map) })
-    json.stringify(value = json.json_object(entries = {
-      model = json.json_string(value = client.model),
+    let tools = for (let meta in tool_metas) { next openai_function_tool(meta = meta, map = map) }
+    {
+      model = client.model,
       messages = messages,
       tools = tools,
-    }))
+    }
   }
 }
 
 // ── response parsing ─────────────────────────────────────────────────────────
 
-agent openai_message(parsed: json.json) -> json.json {
+agent openai_message(parsed: unknown) -> unknown {
   json.field(target = json.element(target = json.field(target = parsed, key = "choices"), index = 0), key = "message")
 }
 
-agent openai_tool_call_of(tc: json.json, map: ai.name_map) -> types.tool_call with prelude.throw[json.parse_error] {
+agent openai_tool_call_of(tc: unknown, map: ai.name_map) -> types.tool_call with prelude.throw[json.parse_error] {
   let function = json.field(target = tc, key = "function")
   types.tool_call(
     // Reverse the wire name back to the real qualified name: the loop dispatches by matching this
     // against tool metadata, so it must be the real name, not the shortened one the model saw.
     name = ai.real_name_of(map = map, wire = json.text(target = json.field(target = function, key = "name"))),
     opaque = json.text(target = json.field(target = tc, key = "id")),
+    // OpenAI ships the arguments as a JSON *string*; parse it back to the plain args document.
     args = json.parse(text = json.text(target = json.field(target = function, key = "arguments"))),
   )
 }
 
-agent openai_parse_step(response: string, map: ai.name_map) -> types.step with prelude.throw[json.parse_error] {
-  let message = openai_message(parsed = json.parse(text = response))
+agent openai_parse_step(response: unknown, map: ai.name_map) -> types.step with prelude.throw[json.parse_error] {
+  let message = openai_message(parsed = response)
   match (json.field(target = message, key = "tool_calls")) {
-    case json.json_array(items => tcs) -> {
+    case array(tcs) -> {
       let calls = for (let tc in tcs) { next openai_tool_call_of(tc = tc, map = map) }
       if (array.length(target = calls) == 0) {
         types.step_final(text = json.text(target = json.field(target = message, key = "content")))
@@ -163,12 +166,17 @@ agent openai_parse_step(response: string, map: ai.name_map) -> types.step with p
   }
 }
 
-@"One OpenAI model step over the history + tool schemas (built and parsed as json in Katari; only the POST leaves the runtime)."
+@"One OpenAI model step over the history + tool schemas (the body built as a value tree and the reply
+parsed by `post_json`, in Katari; only the POST leaves the runtime)."
 agent openai_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step {
   // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
   let map = ai.build_name_map(tool_metas = tool_metas)
   let body = openai_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
-  let response = http.post_json(url = "https://api.openai.com/v1/chat/completions", body = body, headers = record.set(target = record.empty(), key = "Authorization", value = "Bearer " ++ client.api_key))
+  let response = http.post_json(
+    url = "https://api.openai.com/v1/chat/completions",
+    body = body,
+    headers = { "Authorization" = "Bearer " ++ client.api_key },
+  )
   openai_parse_step(response = response, map = map)
 }

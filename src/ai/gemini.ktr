@@ -45,12 +45,12 @@ agent gemini_text_part(text: string) -> unknown {
 }
 
 agent gemini_call_part(call: types.tool_call) -> unknown {
-  // Replay the model's functionCall verbatim: name + the original args (a literal json document
-  // flattened straight into the value tree) + the thought signature Gemini requires echoed.
+  // Replay the model's functionCall verbatim: name + the original args (the model's args document
+  // dropped straight into the value tree) + the thought signature Gemini requires echoed.
   {
     functionCall = {
       name = call.name,
-      args = ai.json_to_value(node = call.args),
+      args = call.args,
     },
     thoughtSignature = call.opaque,
   }
@@ -70,18 +70,21 @@ holds the file VALUE placed DIRECTLY into the tree; `http.json` reads its bytes 
 place only at the send boundary, so the content never rides the value plane. Only the freshest history
 element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
 agent gemini_inline_part(f: file) -> unknown {
-  // `data` is a keyword, so the slot is assembled with record.set instead of a literal. The file rides
-  // as its handle here; `http.json` base64s it at the send boundary (no `read_base64`).
-  let base = { mimeType = file.content_type(value = f) }
-  let inline = record.set(target = base, key = "data", value = f)
-  { inlineData = inline }
+  // The file rides as its handle in the `data` slot; `http.json` base64s it at the send boundary (no
+  // `read_base64`).
+  {
+    inlineData = {
+      mimeType = file.content_type(value = f),
+      "data" = f,
+    },
+  }
 }
 
 @"A file as its `$ref` handle note — the resting representation. The handle is the exact object the
 model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the note IS
 the affordance, not just a description."
 agent gemini_handle_part(f: file) -> unknown {
-  gemini_text_part(text = f"[attached file: ${json.to_text(value = f)}]")
+  gemini_text_part(text = f"[attached file: ${json.stringify(value = f)}]")
 }
 
 @"Render a turn's / result's files: inlined (content + handle note, so the model both sees the image
@@ -145,32 +148,31 @@ agent gemini_drop_schema_key(key: string) -> boolean {
 
 // The recursive group needs an explicit effect row; `pure` is the empty effect — sanitizing the
 // schema tree performs no requests and no io.
-agent gemini_sanitize(node: json.json) -> json.json with pure {
+agent gemini_sanitize(node: unknown) -> unknown with pure {
   match (node) {
-    case json.json_object(entries => entries) -> {
-      let cleaned = for (let key in record.keys(target = entries), var acc: record[json.json] = record.empty()) {
+    case record(entries) -> {
+      for (let key in record.keys(target = entries), var acc: record[unknown] = record.empty()) {
         if (gemini_drop_schema_key(key = key)) {
           next with { acc = acc }
         } else {
-          next with { acc = record.set(target = acc, key = key, value = gemini_sanitize(node = json.field(target = node, key = key))) }
+          next with { acc = record.set(target = acc, key = key, value = gemini_sanitize(node = record.get(target = entries, key = key))) }
         }
       } then (_values) { acc }
-      json.json_object(entries = cleaned)
     }
-    case json.json_array(items => items) -> {
-      json.json_array(items = for (let item in items) { next gemini_sanitize(node = item) })
+    case array(items) -> {
+      for (let item in items) { next gemini_sanitize(node = item) }
     }
     case _ -> node
   }
 }
 
 agent gemini_function_declaration(meta: reflection.agent_metadata) -> unknown {
-  // `gemini_sanitize` strips the JSON-Schema keywords Gemini rejects, still as a `json` document; the
-  // survivor is then flattened LITERALLY into the value tree so any remaining `$`-key stays a key.
+  // `gemini_sanitize` strips the JSON-Schema keywords Gemini rejects; the survivor is a document value
+  // dropped straight into the tree, so any remaining `$`-key stays a key.
   {
     name = meta.name,
     description = meta.description,
-    parameters = ai.json_to_value(node = gemini_sanitize(node = meta.input)),
+    parameters = gemini_sanitize(node = meta.input),
   }
 }
 
@@ -193,11 +195,10 @@ agent gemini_request_body(client: connection, history: array[types.message], too
       parts = [gemini_text_part(text = client.system)],
     })
   }
-  // The request body as a RAW value tree, built DIRECTLY (no `json.json` round-trip): `http.json` walks
-  // it at the send boundary and base64s each `file` leaf — the inlineData `data` slots placed directly
-  // above — in place, so the bytes never land on the value plane. Building `unknown` directly (rather
-  // than a `json.json` tree flattened by `decode[unknown]`) keeps a tool schema's literal `$`-keys
-  // intact — a wire-reading decode would mistake them for file handles.
+  // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
+  // slot contract base64s each `file` leaf — the inlineData `data` slots placed directly above — in
+  // place at the send boundary, so the bytes never land on the value plane. A tool schema's literal
+  // `$`-keys ride verbatim because they come from `meta.input`, already a document value spliced in as-is.
   if (array.length(target = tool_metas) == 0) {
     with_system
   } else {
@@ -209,23 +210,23 @@ agent gemini_request_body(client: connection, history: array[types.message], too
 
 // ── response parsing (read out of json) ──────────────────────────────────────
 
-agent gemini_parts(parsed: json.json) -> array[json.json] {
+agent gemini_parts(parsed: unknown) -> array[unknown] {
   let candidate = json.element(target = json.field(target = parsed, key = "candidates"), index = 0)
   let content = json.field(target = candidate, key = "content")
   match (json.field(target = content, key = "parts")) {
-    case json.json_array(items => items) -> items
+    case array(items) -> items
     case _ -> []
   }
 }
 
-agent gemini_is_call(part: json.json) -> boolean {
+agent gemini_is_call(part: unknown) -> boolean {
   match (json.field(target = part, key = "functionCall")) {
-    case json.json_null() -> false
+    case null -> false
     case _ -> true
   }
 }
 
-agent gemini_tool_call(part: json.json) -> types.tool_call {
+agent gemini_tool_call(part: unknown) -> types.tool_call {
   let call = json.field(target = part, key = "functionCall")
   types.tool_call(
     name = json.text(target = json.field(target = call, key = "name")),
@@ -236,15 +237,15 @@ agent gemini_tool_call(part: json.json) -> types.tool_call {
 
 @"Whether a response part is the model's internal thinking: Gemini interleaves thought summaries
 (marked `thought: true`) with the answer parts — never user-facing text."
-agent gemini_is_thought(part: json.json) -> boolean {
+agent gemini_is_thought(part: unknown) -> boolean {
   match (json.field(target = part, key = "thought")) {
-    case json.json_boolean(value => value) -> value
+    case boolean(value) -> value
     case _ -> false
   }
 }
 
-agent gemini_parse_step(response: string) -> types.step with prelude.throw[json.parse_error] {
-  let parts = gemini_parts(parsed = json.parse(text = response))
+agent gemini_parse_step(parsed: unknown) -> types.step {
+  let parts = gemini_parts(parsed = parsed)
   let calls = for (let part in parts, var acc: array[types.tool_call] = []) {
     if (gemini_is_call(part = part)) {
       next with { acc = array.append(target = acc, value = gemini_tool_call(part = part)) }
@@ -261,7 +262,7 @@ agent gemini_parse_step(response: string) -> types.step with prelude.throw[json.
         next with { acc = acc }
       } else {
         match (json.field(target = part, key = "text")) {
-          case json.json_string(value => value) -> {
+          case string(value) -> {
             next with { acc = array.append(target = acc, value = value) }
           }
           case _ -> {
@@ -277,19 +278,18 @@ agent gemini_parse_step(response: string) -> types.step with prelude.throw[json.
 }
 
 @"One Gemini model step over the history + tool schemas (the body built as a value tree and the reply
-parsed as json in Katari; only the POST leaves the runtime, and each inlined image `file` in the body
-base64s at that send boundary via `http.json`)."
+parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined image `file` in the
+body base64s at that send boundary via the `http.json` slot contract)."
 agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step {
   let body = gemini_request_body(client = client, history = history, tool_metas = tool_metas)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
-  let headers = record.set(target = record.empty(), key = "x-goog-api-key", value = client.api_key)
-  // `http.json` sends the value tree as application/json (the transport defaults the Content-Type), with
-  // each inlined image `file` read from the blob store and base64'd only here. A non-2xx is raised as
-  // `http.status_error` (the opinionated JSON-API stance `post_json` used to take on this provider's behalf).
-  let response = http.fetch(url = url, method = "POST", headers = headers, body = http.json(value = body))
-  if (response.status >= 200 && response.status < 300) {
-    gemini_parse_step(response = response.body)
-  } else {
-    prelude.throw(error = http.status_error(status = response.status, body = response.body))
-  }
+  // `post_json` serialises the value tree as application/json (each inlined image `file` leaf read from
+  // the blob store and base64'd only at the send boundary), checks the status (a non-2xx is
+  // `http.status_error`), and parses the reply back to a document value.
+  let response = http.post_json(
+    url = url,
+    body = body,
+    headers = { "x-goog-api-key" = client.api_key },
+  )
+  gemini_parse_step(parsed = response)
 }

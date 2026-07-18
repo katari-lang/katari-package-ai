@@ -53,7 +53,7 @@ object the model replays into a tool call (`view_image` to re-see it, `send_file
 note is the replay affordance — kept for an image too, alongside the image block that lets the model
 SEE it (see `anthropic_turn_content`)."
 agent anthropic_file_notes(@"The files attached to a turn." files: array[file]) -> string {
-  let notes = for (let attachment in files) { next f"\n[attached file: ${json.to_text(value = attachment)}]" }
+  let notes = for (let attachment in files) { next f"\n[attached file: ${json.stringify(value = attachment)}]" }
   string.join(parts = notes, separator = "")
 }
 
@@ -64,24 +64,24 @@ agent anthropic_is_image(@"The file to test." attachment: file) -> boolean {
   string.starts_with(value = file.content_type(value = attachment), search = "image/")
 }
 
-@"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`, built as a raw value tree. `type`
-is a keyword, so the object is assembled with `record.set` instead of a literal."
+@"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`, built as a raw value tree."
 agent anthropic_text_block(@"The block's text." text: string) -> unknown {
-  let base = { text = text }
-  record.set(target = base, key = "type", value = "text")
+  { "type" = "text", text = text }
 }
 
 @"An image content block: a base64 `source` whose `media_type` is the file's recorded type and whose
 `data` slot holds the file VALUE placed DIRECTLY into the tree. `http.json` materialises that slot —
 reading the bytes and base64-ing them in place — only at the send boundary, so the image content never
-rides the value plane, the durable call record or the trace. `type` / `data` are keywords, so those
-slots are assembled with `record.set`."
+rides the value plane, the durable call record or the trace."
 agent anthropic_image_block(@"The image file to inline." attachment: file) -> unknown {
-  let source_base = { media_type = file.content_type(value = attachment) }
-  let source_typed = record.set(target = source_base, key = "type", value = "base64")
-  let source = record.set(target = source_typed, key = "data", value = attachment)
-  let block_base: record[unknown] = { source = source }
-  record.set(target = block_base, key = "type", value = "image")
+  {
+    "type" = "image",
+    source = {
+      "type" = "base64",
+      media_type = file.content_type(value = attachment),
+      "data" = attachment,
+    },
+  }
 }
 
 @"A turn's content: the plain string (text + every file's handle note) when the turn carries no image,
@@ -110,23 +110,21 @@ agent anthropic_call_block(@"One tool call of the model's batch." call: types.to
   // Replay the model's tool_use verbatim: its block id + name + the original input. The name rides as
   // the WIRE name — the API validates the replayed history's tool_use name the same as the request's
   // tool declarations, so the qualified name would 400 here too (the opaque block id stays as-is). The
-  // input is a literal json document (the model's parsed args) flattened straight into the value tree,
-  // so its literal keys survive; `type` is a keyword, assembled with record.set instead of a literal.
-  let base = {
+  // input is the model's args document dropped straight into the value tree, so its keys survive as-is.
+  {
+    "type" = "tool_use",
     id = call.opaque,
     name = ai.wire_name_of(map = map, real = call.name),
-    input = ai.json_to_value(node = call.args),
+    input = call.args,
   }
-  record.set(target = base, key = "type", value = "tool_use")
 }
 
 agent anthropic_result_block(@"One tool's output, keyed back to its call." result: types.tool_result) -> unknown {
-  // `type` is a keyword, so the object is assembled with record.set instead of a literal.
-  let base = {
+  {
+    "type" = "tool_result",
     tool_use_id = result.call_id,
     content = result.text,
   }
-  record.set(target = base, key = "type", value = "tool_result")
 }
 
 agent anthropic_message(@"One history element." message: types.message, @"The step's wire-name map." map: ai.name_map) -> unknown {
@@ -156,13 +154,12 @@ agent anthropic_message(@"One history element." message: types.message, @"The st
 
 agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metadata, @"The step's wire-name map." map: ai.name_map) -> unknown {
   // The tool is declared under its WIRE name (the qualified name 400s the Messages API); the loop maps
-  // the model's pick back to the real name when it dispatches. The derived input schema is a literal
-  // json document (`$ref` / `$defs` / `$schema` keys and all) spliced verbatim into the value tree; a
-  // wire-reading decode would corrupt those keys.
+  // the model's pick back to the real name when it dispatches. `meta.input` is already a document value
+  // (`$ref` / `$defs` / `$schema` keys and all), so it drops straight into the value tree verbatim.
   {
     name = ai.wire_name_of(map = map, real = meta.name),
     description = meta.description,
-    input_schema = ai.json_to_value(node = meta.input),
+    input_schema = meta.input,
   }
 }
 
@@ -178,7 +175,7 @@ agent anthropic_request_body(
   // call turn — the agnostic vocabulary has no slot for one (Gemini's per-call thoughtSignature fits
   // tool_call.opaque; a standalone content block does not), and dropping it fails the follow-up
   // request.
-  let thinking = record.set(target = record.empty(), key = "type", value = "disabled")
+  let thinking = { "type" = "disabled" }
   let base: record[unknown] = {
     model = client.model,
     max_tokens = client.max_tokens,
@@ -190,11 +187,10 @@ agent anthropic_request_body(
   } else {
     record.set(target = base, key = "system", value = client.system)
   }
-  // The request body as a RAW value tree, built DIRECTLY (no `json.json` round-trip): `http.json` walks
-  // it at the send boundary and base64s each `file` leaf — the image `data` slots placed directly above
-  // — in place, so the bytes never land on the value plane. Building `unknown` directly (rather than a
-  // `json.json` tree flattened by `decode[unknown]`) keeps a tool schema's literal `$ref` / `$defs`
-  // keys intact — a wire-reading decode would mistake them for file handles.
+  // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
+  // slot contract base64s each `file` leaf — the image `data` slots placed directly above — in place at
+  // the send boundary, so the bytes never land on the value plane. A tool schema's literal `$ref` /
+  // `$defs` keys ride verbatim because `meta.input` is already a document value spliced in as-is.
   if (array.length(target = tool_metas) == 0) {
     with_system
   } else {
@@ -205,21 +201,21 @@ agent anthropic_request_body(
 
 // ── response parsing ─────────────────────────────────────────────────────────
 
-agent anthropic_blocks(@"The parsed response document." parsed: json.json) -> array[json.json] {
+agent anthropic_blocks(@"The parsed response document." parsed: unknown) -> array[unknown] {
   match (json.field(target = parsed, key = "content")) {
-    case json.json_array(items => items) -> items
+    case array(items) -> items
     case _ -> []
   }
 }
 
-agent anthropic_block_kind(@"One response content block." block: json.json) -> string {
+agent anthropic_block_kind(@"One response content block." block: unknown) -> string {
   match (json.field(target = block, key = "type")) {
-    case json.json_string(value => value) -> value
+    case string(value) -> value
     case _ -> ""
   }
 }
 
-agent anthropic_tool_call(@"A `tool_use` response block." block: json.json, @"The step's wire-name map." map: ai.name_map) -> types.tool_call {
+agent anthropic_tool_call(@"A `tool_use` response block." block: unknown, @"The step's wire-name map." map: ai.name_map) -> types.tool_call {
   types.tool_call(
     // Reverse the wire name back to the real qualified name: the loop dispatches by matching this
     // against tool metadata, so it must be the real name, not the shortened one the model saw.
@@ -229,8 +225,8 @@ agent anthropic_tool_call(@"A `tool_use` response block." block: json.json, @"Th
   )
 }
 
-agent anthropic_parse_step(@"The raw response body." response: string, @"The step's wire-name map." map: ai.name_map) -> types.step with prelude.throw[json.parse_error] {
-  let blocks = anthropic_blocks(parsed = json.parse(text = response))
+agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"The step's wire-name map." map: ai.name_map) -> types.step {
+  let blocks = anthropic_blocks(parsed = parsed)
   let calls = for (let block in blocks, var acc: array[types.tool_call] = []) {
     if (anthropic_block_kind(block = block) == "tool_use") {
       next with { acc = array.append(target = acc, value = anthropic_tool_call(block = block, map = map)) }
@@ -258,8 +254,8 @@ agent anthropic_parse_step(@"The raw response body." response: string, @"The ste
 }
 
 @"One Anthropic model step over the history + tool schemas (the body built as a value tree and the
-reply parsed as json in Katari; only the POST leaves the runtime, and each image `file` in the body
-base64s at that send boundary via `http.json`)."
+reply parsed by `post_json` in Katari; only the POST leaves the runtime, and each image `file` in the
+body base64s at that send boundary via the `http.json` slot contract)."
 agent anthropic_infer_step(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
@@ -269,23 +265,16 @@ agent anthropic_infer_step(
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
   let map = ai.build_name_map(tool_metas = tool_metas)
   let body = anthropic_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
-  let headers = record.set(
-    target = record.set(target = record.empty(), key = "x-api-key", value = client.api_key),
-    key = "anthropic-version",
-    value = "2023-06-01",
-  )
-  // `http.json` sends the value tree as application/json (the transport defaults the Content-Type), with
-  // each image `file` leaf read from the blob store and base64'd only here. A non-2xx is raised as
-  // `http.status_error` (the opinionated JSON-API stance `post_json` used to take on this provider's behalf).
-  let response = http.fetch(
+  // `post_json` serialises the value tree as application/json (each image `file` leaf read from the blob
+  // store and base64'd only at the send boundary), checks the status (a non-2xx is `http.status_error`),
+  // and parses the reply back to a document value.
+  let response = http.post_json(
     url = "https://api.anthropic.com/v1/messages",
-    method = "POST",
-    headers = headers,
-    body = http.json(value = body),
+    body = body,
+    headers = {
+      "x-api-key" = client.api_key,
+      "anthropic-version" = "2023-06-01",
+    },
   )
-  if (response.status >= 200 && response.status < 300) {
-    anthropic_parse_step(response = response.body, map = map)
-  } else {
-    prelude.throw(error = http.status_error(status = response.status, body = response.body))
-  }
+  anthropic_parse_step(parsed = response, map = map)
 }

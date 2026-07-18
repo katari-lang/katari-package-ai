@@ -24,14 +24,15 @@ request infer_step(history: array[types.message], tool_metas: array[reflection.a
 // The error surface of one model step, raised by the serving provider's handler (so it surfaces at
 // the provider's use site — the app root): malformed provider JSON (`json.parse_error`), a non-2xx API
 // status (`http.status_error`), or a transport failure (`http.fetch_error`). A provider builds its
-// request body as a raw value tree directly (no `json.decode` round-trip), so no decode step can fail
-// here. (Type synonyms take no docs.)
+// request body as a raw value tree and posts it with `http.post_json`, which parses the reply — so the
+// only JSON failure a step can raise is that parse. (Type synonyms take no docs.)
 type step_error = json.parse_error | http.status_error | http.fetch_error
 
-// What the loop itself can raise: a bad dynamic dispatch (a hallucinated tool call's args failing the
-// tool's schema — usually caught and fed back, see dispatch_one), or a failure decoding the model's
-// raw args (`json.decode[unknown]` — total in practice, but its throw is discharged here).
-type loop_error = reflection.call_error | json.decode_error
+// What the loop itself can raise: a bad dynamic dispatch — a hallucinated tool call whose args fail
+// the tool's schema at the delegation boundary (`reflection.call_error`). The model's args ride as a
+// plain value and dispatch straight through `reflection.call_agent`, which revives any replayed `$ref`
+// into the `file` its target expects, so there is no separate decode step to fail here.
+type loop_error = reflection.call_error
 
 @"Infer a single reply with no tools (the common chat case)."
 agent reply(history: array[types.message]) -> string {
@@ -92,39 +93,18 @@ agent infer_with_tools[effect E](
   }
 }
 
-@"The outcome of decoding a model's raw tool args: the decoded value, or the decode error rendered
-readable (fed back to the model as the tool's error result, so it corrects on the next step)."
-data decoded(value: unknown)
-
-@"See @decoded@ — the failure half (a malformed replayed file handle is the observed case)."
-data decode_failed(message: string)
-
-type args_outcome = decoded | decode_failed
-
-@"Decode a model's raw args to a plain value, catching the decode error locally (its effect row is
-concrete here — a catch inside the generically-effectful dispatch would also capture the TOOLS' own
-typed throws, which the checker rightly rejects)."
-agent decode_args(args: json.json) -> args_outcome {
-  use handler {
-    request prelude.throw(error: json.decode_error) -> never {
-      break decode_failed(message = json.to_text(value = error))
-    }
-  }
-  decoded(value = json.decode[unknown](value = args))
-}
-
 @"Find the tool whose metadata name is the model's pick and invoke it by value via
-`reflection.call_agent` (the model's args decode to a plain value, and the delegation boundary
+`reflection.call_agent` (the model's args ride as a plain value, and the delegation boundary
 validates them against the tool's schema — the compiled signature of a Katari agent, or the
-server-declared schema of an MCP tool). A hallucinated name, undecodable args, or a panicking tool
-is fed back as an error result so the model corrects on the next step. The result's `file` values
-are collected off its wire form so the provider can show them to the model (their `$ref` handles are
-already visible in the result text)."
+server-declared schema of an MCP tool — reviving any replayed `$ref` into the `file` its target
+expects). A hallucinated name or a panicking tool is fed back as an error result so the model corrects
+on the next step; genuinely malformed args are a `reflection.call_error` that escalates to the app
+root (`loop_error`). The result's `file` values are collected off the result tree so the provider can
+show them to the model (their `$ref` handles are already visible in the result text)."
 agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: types.tool_call) -> types.tool_result {
   // A failing tool must never fail the conversation — that is the loop's whole premise. A panic (a
-  // crashed handler) escaping THIS call, or the model's args failing to decode (a bare `{$ref}`
-  // handle — observed to kill the whole bot before this guard), becomes an error result the model
-  // reads and corrects on its next step, instead of escalating to the app root.
+  // crashed handler) escaping THIS call becomes an error result the model reads and corrects on its
+  // next step, instead of escalating to the app root.
   use handler {
     request panic(msg: string) {
       break types.tool_result(
@@ -135,107 +115,49 @@ agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: 
       )
     }
   }
-  match (decode_args(args = call.args)) {
-    case decode_failed(message => message) -> {
-      types.tool_result(
+  for (let tool in tools) {
+    let meta = reflection.get_metadata(value = tool)
+    if (meta.name == call.name) {
+      // The args are already a plain value; `call_agent` revives any replayed `$ref` into a `file` at
+      // the boundary. `stringify` renders the result's wire form (files show as `$ref` handles) for the
+      // model, while the actual `file` values are collected off the result tree for inlining.
+      let result = reflection.call_agent(target = tool, args = call.args)
+      return types.tool_result(
         name = call.name,
         call_id = call.opaque,
-        text = f"(tool error: ${message})",
-        files = [],
+        text = json.stringify(value = result),
+        files = collect_result_files(node = result),
       )
-    }
-    case decoded(value => args_value) -> {
-      for (let tool in tools) {
-        let meta = reflection.get_metadata(value = tool)
-        if (meta.name == call.name) {
-          let encoded = json.encode(value = reflection.call_agent(target = tool, args = args_value))
-          return types.tool_result(
-            name = call.name,
-            call_id = call.opaque,
-            text = json.stringify(value = encoded),
-            files = collect_result_files(node = encoded),
-          )
-        } else {
-          null
-        }
-      }
-      types.tool_result(
-        name = call.name,
-        call_id = call.opaque,
-        text = f"(error: unknown tool \"${call.name}\")",
-        files = [],
-      )
+    } else {
+      null
     }
   }
+  types.tool_result(
+    name = call.name,
+    call_id = call.opaque,
+    text = f"(error: unknown tool \"${call.name}\")",
+    files = [],
+  )
 }
 
-@"Collect every `file` value out of a tool result's wire form: in encoded json a file is its `$ref`
-handle object (`json.decode[file]` revives it), so a generated image is found wherever the tool put
-it — a bare return, the MCP bridge's { text, files }, or nested structure."
-agent collect_result_files(node: json.json) -> array[file] with prelude.throw[json.decode_error] {
+@"Collect every `file` value out of a tool result's value tree: `reflection.call_agent` returns the
+tool's result as a plain value, so a `file` the tool produced (a generated image, an MCP tool's
+screenshot) is an actual `file` leaf — found wherever it sits (a bare return, the MCP bridge's
+{ text, files } record, or nested structure)."
+agent collect_result_files(node: unknown) -> array[file] with pure {
   match (node) {
-    case json.json_object(entries => entries) -> {
-      if (is_file_handle(entries = entries)) {
-        [json.decode[file](value = node)]
-      } else {
-        array.flatten(target = for (let key in record.keys(target = entries)) {
-          next collect_result_files(node = json.field(target = node, key = key))
-        })
-      }
+    case file(found) -> [found]
+    case record(entries) -> {
+      array.flatten(target = for (let value in record.values(target = entries)) {
+        next collect_result_files(node = value)
+      })
     }
-    case json.json_array(items => items) -> {
+    case array(items) -> {
       array.flatten(target = for (let item in items) {
         next collect_result_files(node = item)
       })
     }
     case _ -> []
-  }
-}
-
-@"Whether an encoded object is a `file`'s handle: it carries `$ref` AND its semantic kind is
-\"file\" — a blob-backed *string* also encodes to a `$ref` handle, and must not revive as a file."
-agent is_file_handle(entries: record[json.json]) -> boolean {
-  match (record.get(target = entries, key = "$ref")) {
-    case null -> false
-    case _ -> {
-      match (record.get(target = entries, key = "semanticKind")) {
-        case null -> false
-        case kind -> {
-          match (kind) {
-            case json.json_string(value => value) -> value == "file"
-            case _ -> false
-          }
-        }
-      }
-    }
-  }
-}
-
-@"Flatten a LITERAL `json` document into the plain value it denotes: a `json_object` becomes a record
-with the SAME keys, a `json_array` an array, each scalar itself — no key is ever reinterpreted. This
-is the sound way to splice a parsed-json subtree (a tool's JSON Schema from `get_metadata`, a model's
-replayed tool_call args) into an `http.json` value-tree body, where a `file` rides as an actual file
-value: `json.decode[unknown]` would instead read the subtree through the value-wire codec, mistaking a
-schema's literal `$ref` / `$defs` / `$constructor` key for a file handle or discriminator and
-corrupting it. (This differs from the loop's `decode_args`, which DELIBERATELY takes the wire reading:
-a model's `$ref` argument SHOULD revive as a file to pass to a tool — here we echo the document back
-verbatim instead.) On the wire the record's `$`-keys are re-escaped and the `http.json` materialiser
-un-escapes them, so the server receives the original keys."
-agent json_to_value(node: json.json) -> unknown with pure {
-  match (node) {
-    case json.json_null() -> null
-    case json.json_boolean(value => value) -> value
-    case json.json_integer(value => value) -> value
-    case json.json_number(value => value) -> value
-    case json.json_string(value => value) -> value
-    case json.json_array(items => items) -> {
-      for (let item in items) { next json_to_value(node = item) }
-    }
-    case json.json_object(entries => entries) -> {
-      for (let key in record.keys(target = entries), var acc: record[unknown] = record.empty()) {
-        next with { acc = record.set(target = acc, key = key, value = json_to_value(node = json.field(target = node, key = key))) }
-      } then (_keys) { acc }
-    }
   }
 }
 
