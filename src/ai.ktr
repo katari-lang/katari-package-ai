@@ -30,8 +30,8 @@ type step_error = json.parse_error | http.status_error | http.fetch_error
 
 // What the loop itself can raise: a bad dynamic dispatch — a hallucinated tool call whose args fail
 // the tool's schema at the delegation boundary (`reflection.call_error`). The model's args ride as a
-// plain value and dispatch straight through `reflection.call_agent`, which revives any replayed `$ref`
-// into the `file` its target expects, so there is no separate decode step to fail here.
+// plain value and dispatch straight through `reflection.call_agent`, whose boundary unconditionally
+// turns any replayed `$katari_ref` into the `file` it denotes, so there is no separate step to fail here.
 type loop_error = reflection.call_error
 
 @"Infer a single reply with no tools (the common chat case)."
@@ -43,7 +43,7 @@ agent reply(history: array[types.message]) -> string {
 }
 
 @"Tool: load an image file into your visual context. Pass the file's handle object — a bare
-{\"$ref\": \"<id>\"} suffices (copy the id from the conversation); the image content arrives with
+{\"$katari_ref\": \"<id>\"} suffices (copy the id from the conversation); the image content arrives with
 this tool's result, so you can see it on your next step."
 agent view_image(image: file) -> file {
   image
@@ -96,11 +96,12 @@ agent infer_with_tools[effect E](
 @"Find the tool whose metadata name is the model's pick and invoke it by value via
 `reflection.call_agent` (the model's args ride as a plain value, and the delegation boundary
 validates them against the tool's schema — the compiled signature of a Katari agent, or the
-server-declared schema of an MCP tool — reviving any replayed `$ref` into the `file` its target
-expects). A hallucinated name or a panicking tool is fed back as an error result so the model corrects
-on the next step; genuinely malformed args are a `reflection.call_error` that escalates to the app
-root (`loop_error`). The result's `file` values are collected off the result tree so the provider can
-show them to the model (their `$ref` handles are already visible in the result text)."
+server-declared schema of an MCP tool — while the boundary's unconditional wire→value conversion turns
+any replayed `$katari_ref` into the `file` it denotes). A hallucinated name or a panicking tool is fed
+back as an error result so the model corrects on the next step; genuinely malformed args are a
+`reflection.call_error` that escalates to the app root (`loop_error`). The result's `file` values are
+collected off the result tree so the provider can show them to the model (their `$katari_ref` handles
+are already visible in the result text)."
 agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: types.tool_call) -> types.tool_result {
   // A failing tool must never fail the conversation — that is the loop's whole premise. A panic (a
   // crashed handler) escaping THIS call becomes an error result the model reads and corrects on its
@@ -118,9 +119,9 @@ agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: 
   for (let tool in tools) {
     let meta = reflection.get_metadata(value = tool)
     if (meta.name == call.name) {
-      // The args are already a plain value; `call_agent` revives any replayed `$ref` into a `file` at
-      // the boundary. `stringify` renders the result's wire form (files show as `$ref` handles) for the
-      // model, while the actual `file` values are collected off the result tree for inlining.
+      // The args are already a plain value; the boundary unconditionally turns any replayed `$katari_ref`
+      // into a `file`. `stringify` renders the result's wire form (files show as `$katari_ref` handles) for
+      // the model, while the actual `file` values are collected off the result tree for inlining.
       let result = reflection.call_agent(target = tool, args = call.args)
       return types.tool_result(
         name = call.name,

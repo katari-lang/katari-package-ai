@@ -80,7 +80,7 @@ agent gemini_inline_part(f: file) -> unknown {
   }
 }
 
-@"A file as its `$ref` handle note — the resting representation. The handle is the exact object the
+@"A file as its `$katari_ref` handle note — the resting representation. The handle is the exact object the
 model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the note IS
 the affordance, not just a description."
 agent gemini_handle_part(f: file) -> unknown {

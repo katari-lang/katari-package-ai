@@ -48,7 +48,7 @@ agent anthropic_role(@"The `ai.types` turn role (\"user\" / \"model\")." role: s
   }
 }
 
-@"Every file of a turn as a handle note, joined for the turn's text. The `$ref` handle is the exact
+@"Every file of a turn as a handle note, joined for the turn's text. The `$katari_ref` handle is the exact
 object the model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the
 note is the replay affordance — kept for an image too, alongside the image block that lets the model
 SEE it (see `anthropic_turn_content`)."

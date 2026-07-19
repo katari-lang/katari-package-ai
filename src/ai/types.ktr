@@ -12,13 +12,13 @@ data turn(role: string, text: string, files: array[file])
 the model-facing call/response record), @opaque@ is any provider token that must be replayed
 verbatim on the call turn (Gemini's thought signature, OpenAI's call id), @args@ is the model's
 argument object as a parsed value (replayed verbatim into the call turn, and dispatched straight
-through `reflection.call_agent`, whose delegation boundary revives any `$ref` the model replayed
-into the `file` its target expects)."
+through `reflection.call_agent`, whose delegation boundary unconditionally turns any `$katari_ref` the
+model replayed into the `file` it denotes)."
 data tool_call(name: string, opaque: string, args: unknown)
 
 @"A tool's output for the model, keyed by the tool @name@ / @call_id@ so it round-trips as a function
 response. @files@ are the `file` values found in the result (a screenshot an MCP tool returned, an
-edited image): @text@ already shows their `$ref` handles (the result's wire form), and the provider
+edited image): @text@ already shows their `$katari_ref` handles (the result's wire form), and the provider
 additionally inlines their content for the model while the result is fresh."
 data tool_result(name: string, call_id: string, text: string, files: array[file])
 
