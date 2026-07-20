@@ -39,5 +39,14 @@ data step_final(text: string)
 @"One inference step's decision: invoke a batch of tools (dispatched in parallel, results fed back together)."
 data step_call(calls: array[tool_call])
 
-// What a provider returns for one model step.
+// One inference step's decision. (Type synonyms take no docs.)
 type step = step_final | step_call
+
+@"One step's token accounting, as the provider's API reported it. @input_tokens@ counts the whole
+context the step consumed (every provider re-reads the full history each step), so the FRESHEST
+step's figure IS the session's current context occupancy — figures across steps do not add.
+@output_tokens@ counts what the model generated on the step."
+data usage(input_tokens: integer, output_tokens: integer)
+
+@"What a provider returns for one model step: the decision plus its token accounting."
+data step_result(step: step, usage: usage)

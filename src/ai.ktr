@@ -18,8 +18,9 @@ import ai.types
 
 @"One model step over the conversation + tool schemas — THE provider seam. A provider module serves
 this request for the extent of a continuation (`use gemini.provider(...)`), so the loop stays
-provider-agnostic and providers stay loop-agnostic."
-request infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step
+provider-agnostic and providers stay loop-agnostic. The result carries the step's decision AND its
+token accounting (`types.step_result`), so any loop over this seam can meter its context for free."
+request infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result
 
 // The error surface of one model step, raised by the serving provider's handler (so it surfaces at
 // the provider's use site — the app root): malformed provider JSON (`json.parse_error`), a non-2xx API
@@ -36,7 +37,8 @@ type loop_error = reflection.call_error
 
 @"Infer a single reply with no tools (the common chat case)."
 agent reply(history: array[types.message]) -> string {
-  match (infer_step(history = history, tool_metas = [])) {
+  let result = infer_step(history = history, tool_metas = [])
+  match (result.step) {
     case types.step_final(text => text) -> text
     case types.step_call(calls => _) -> "(unexpected tool call without tools)"
   }
@@ -61,7 +63,8 @@ agent infer_with_tools[effect E](
 ) -> string {
   let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
   for (let _step in array.range(start = 0, end = max_steps), var conversation: array[types.message] = history) {
-    match (infer_step(history = conversation, tool_metas = tool_metas)) {
+    let result = infer_step(history = conversation, tool_metas = tool_metas)
+    match (result.step) {
       case types.step_final(text => reply_text) -> { break reply_text }
       case types.step_call(calls => calls) -> {
         // Dispatch every requested tool in parallel; results come back in request order, each
@@ -160,6 +163,217 @@ agent collect_result_files(node: unknown) -> array[file] with pure {
     }
     case _ -> []
   }
+}
+
+// ── served sessions: the serve skeleton, with token accounting and compaction ─
+//
+// Every chat bot hand-rolled the same skeleton: declare a request, keep the conversation in a
+// handler var, run the tool loop once per message, append the reply. `serve_session` is that
+// skeleton as a scoped provider — `use serve_session(...)` installs the handler, the continuation
+// bridges its transport into `session_message` and (typically) never returns, a watch loop — plus
+// the piece none of the hand-rolled ones had: the seam's `usage` metered into a context-occupancy
+// figure, and a compaction pass when it outgrows a threshold. The policy is data (`compaction`),
+// the one numeric comparison lives in `classify_budget`, and everything downstream dispatches on
+// its sum. Transport specifics (a channel id, a thread ts) stay in the app's bridge agent: fold
+// them into @content@ on the way in, route the returned reply on the way out.
+
+@"How a session compacts its context once it outgrows the threshold. @threshold_tokens@ compares
+against the freshest step's measured occupancy (`usage.input_tokens + output_tokens`); @prompt@
+frames the summarization step; @keep_recent@ is how many trailing history elements survive
+verbatim — extended forward to a clean `turn` boundary, so a call turn is never severed from the
+results that answer it."
+data compaction(threshold_tokens: integer, prompt: string, keep_recent: integer)
+
+@"The verdict on a measured context occupancy: still under the threshold, with the room left."
+data within_budget(@"Tokens still free under the threshold." remaining: integer)
+
+@"The verdict on a measured context occupancy: over the threshold — time to compact."
+data over_budget(@"The measured occupancy that tripped the threshold." used: integer)
+
+// The budget verdict. (Type synonyms take no docs.)
+type budget = within_budget | over_budget
+
+@"Classify a measured context occupancy against the policy threshold — the compaction machinery's
+one numeric comparison; everything downstream dispatches on the returned sum."
+agent classify_budget(used: integer, policy: compaction) -> budget {
+  if (used < policy.threshold_tokens) {
+    within_budget(remaining = policy.threshold_tokens - used)
+  } else {
+    over_budget(used = used)
+  }
+}
+
+@"The integer at a provider's usage field, or 0 when the field is absent — a provider that omits a
+count still yields a usable measurement. Providers read their wire usage through this."
+agent token_count(node: unknown) -> integer {
+  match (node) {
+    case integer(value) -> value
+    case _ -> 0
+  }
+}
+
+@"The first index at or after @start@ whose element is a plain `turn` — the clean cut for `compact`:
+a `call_turn` must never be severed from the `result_turn` that answers it (a provider replays them
+as a matched pair), so the kept tail always starts on a turn. No turn after @start@ means nothing
+safely survives, and the whole history summarizes."
+agent turn_boundary(history: array[types.message], start: integer) -> integer {
+  for (let entry in array.slice(target = history, start = start, end = array.length(target = history)), var offset: integer = 0) {
+    match (entry) {
+      case types.turn(role => _, text => _, files => _) -> { break start + offset }
+      case types.call_turn(calls => _) -> { next with { offset = offset + 1 } }
+      case types.result_turn(results => _) -> { next with { offset = offset + 1 } }
+    }
+  } then (_entries) { array.length(target = history) }
+}
+
+@"A history element as summarizer-input text: turns as role-prefixed lines, tool traffic as compact
+notes — enough for the summary to preserve what happened, nothing wire-shaped."
+agent render_message(entry: types.message) -> string {
+  match (entry) {
+    case types.turn(role => role, text => text, files => files) -> {
+      let notes = for (let attachment in files) { next f" [file ${json.stringify(value = attachment)}]" }
+      let joined_notes = string.join(parts = notes, separator = "")
+      f"${role}: ${text}${joined_notes}"
+    }
+    case types.call_turn(calls => calls) -> {
+      let names = for (let call in calls) { next call.name }
+      let joined_names = string.join(parts = names, separator = ", ")
+      f"model: (called ${joined_names})"
+    }
+    case types.result_turn(results => results) -> {
+      let texts = for (let result in results) { next f"${result.name} -> ${result.text}" }
+      let joined_texts = string.join(parts = texts, separator = "\n")
+      f"tools: ${joined_texts}"
+    }
+  }
+}
+
+@"Compress a conversation to fit its budget again: everything before the kept tail (the last
+@policy.keep_recent@ elements, extended to a clean turn boundary) is summarized by one tool-less
+model step under @policy.prompt@, and the summary replaces it as a single opening turn. A history
+that is all tail comes back unchanged. Exported on its own so a hand-rolled loop can compact too —
+`serve_session` is this plus the metering that decides when."
+agent compact(history: array[types.message], policy: compaction) -> array[types.message] {
+  let count = array.length(target = history)
+  let wanted = if (count < policy.keep_recent) { 0 } else { count - policy.keep_recent }
+  let cut = turn_boundary(history = history, start = wanted)
+  if (cut == 0) {
+    history
+  } else {
+    let head = array.slice(target = history, start = 0, end = cut)
+    let tail = array.slice(target = history, start = cut, end = count)
+    let rendered = for (let entry in head) { next render_message(entry = entry) }
+    let joined = string.join(parts = rendered, separator = "\n")
+    let summary = reply(history = [types.turn(
+      role = "user",
+      text = f"${policy.prompt}\n\n${joined}",
+      files = [],
+    )])
+    array.concat(
+      left = [types.turn(role = "user", text = f"[Summary of the earlier conversation]\n${summary}", files = [])],
+      right = tail,
+    )
+  }
+}
+
+@"Raised once per incoming message of a served session; `serve_session`'s handler answers it with
+the model's reply. The app's transport bridge performs it — fold any routing detail (a channel id, a
+thread ts) into @content@ on the way in, route the returned reply on the way out."
+request session_message(@"The incoming message, routing details folded in." content: string, @"The message's attachments." files: array[file]) -> string
+
+@"A served session's durable state: the running conversation and the freshest measured context
+occupancy — 0 until a step has run, and again right after a compaction until the next step
+re-measures."
+data session_state(conversation: array[types.message], used_tokens: integer)
+
+@"One served turn's outcome: the reply, the advanced conversation, and the freshest measurement."
+data session_turn(reply: string, conversation: array[types.message], used_tokens: integer)
+
+@"The per-message tool loop of a served session — `infer_with_tools` threading the seam's usage
+through: up to @max_steps@ steps, tool batches dispatched in parallel, the model's reply appended as
+a model turn, and the LAST step's `input + output` carried out as the context measurement (each
+step's input covers the whole context, so only the freshest figure is the occupancy — steps do not
+add)."
+agent session_turn_loop[effect E](
+  conversation: array[types.message],
+  tools: array[agent never -> unknown with E],
+  max_steps: integer,
+) -> session_turn {
+  let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
+  for (let _step in array.range(start = 0, end = max_steps), var state: session_turn = session_turn(reply = "", conversation = conversation, used_tokens = 0)) {
+    let result = infer_step(history = state.conversation, tool_metas = tool_metas)
+    let measured = result.usage.input_tokens + result.usage.output_tokens
+    match (result.step) {
+      case types.step_final(text => reply_text) -> {
+        break session_turn(
+          reply = reply_text,
+          conversation = array.append(target = state.conversation, value = types.turn(role = "model", text = reply_text, files = [])),
+          used_tokens = measured,
+        )
+      }
+      case types.step_call(calls => calls) -> {
+        let results = parallel for (let call in calls) {
+          next dispatch_one[E](tools = tools, call = call)
+        }
+        let with_calls = array.append(target = state.conversation, value = types.call_turn(calls = calls))
+        next with { state = session_turn(reply = "", conversation = array.append(target = with_calls, value = types.result_turn(results = results)), used_tokens = measured) }
+      }
+    }
+  } then (_steps) {
+    // Budget exhausted: the same forced tool-less close as `infer_with_tools`.
+    let closing = array.append(
+      target = state.conversation,
+      value = types.turn(
+        role = "user",
+        text = "You have used your entire tool-call budget. Do not call any more tools. Answer the original question now, as best you can, using only what you have already gathered.",
+        files = [],
+      ),
+    )
+    let answer = reply(history = closing)
+    session_turn(
+      reply = answer,
+      conversation = array.append(target = closing, value = types.turn(role = "model", text = answer, files = [])),
+      used_tokens = state.used_tokens,
+    )
+  }
+}
+
+@"Serve a chat session for the extent of @continuation@ — the hand-rolled serve skeleton as one
+provider, with token metering and automatic compaction. The handler's var carries the conversation
+across messages (durable by construction: it survives a runtime restart like any run state); each
+`session_message` runs one tool loop and answers with the reply. After each turn the freshest
+measured occupancy is classified against @threshold_tokens@: over it, the conversation compacts
+(`compact`) under @compact_prompt@, keeping the last @keep_recent@ elements verbatim. The ambient
+provider (`use gemini.provider(...)` …) and any @E@ handlers are installed by the caller, exactly as
+for `infer_with_tools`; the continuation bridges its transport into `session_message` and typically
+never returns (a `watch_messages` loop)."
+agent serve_session[R, effect E](
+  @"The conversation the model starts from (system framing, prior turns)." context: array[types.message],
+  @"The tools of every turn's loop." tools: array[agent never -> unknown with E],
+  @"The per-message step budget." max_steps: integer,
+  @"The context-occupancy threshold (tokens) that triggers compaction." threshold_tokens: integer ?= 100000,
+  @"The summarization instruction compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
+  @"How many trailing history elements survive compaction verbatim." keep_recent: integer ?= 8,
+  @"The session body: bridges a transport into `session_message`." continuation: agent (value: null) -> R with {...E, session_message},
+) -> R {
+  let policy = compaction(threshold_tokens = threshold_tokens, prompt = compact_prompt, keep_recent = keep_recent)
+  use handler (var state: session_state = session_state(conversation = context, used_tokens = 0)) {
+    request session_message(content: string, files: array[file]) {
+      let asked = array.append(target = state.conversation, value = types.turn(role = "user", text = content, files = files))
+      let outcome = session_turn_loop[E](conversation = asked, tools = tools, max_steps = max_steps)
+      match (classify_budget(used = outcome.used_tokens, policy = policy)) {
+        case within_budget(remaining => _) -> {
+          next outcome.reply with { state = session_state(conversation = outcome.conversation, used_tokens = outcome.used_tokens) }
+        }
+        case over_budget(used => _) -> {
+          // The compacted context's occupancy is unknown until the next step measures it; 0 says
+          // "not yet measured", never an estimate.
+          next outcome.reply with { state = session_state(conversation = compact(history = outcome.conversation, policy = policy), used_tokens = 0) }
+        }
+      }
+    }
+  }
+  continuation(value = null)
 }
 
 // ── region-integrated loop: dynamic monitors over a nursery ───────────────────
@@ -288,7 +502,8 @@ agent region_turn_loop[effect E](
     value = reflection.get_metadata(value = cancel_monitor),
   )
   for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry)) {
-    match (infer_step(history = session.conversation, tool_metas = tool_metas)) {
+    let result = infer_step(history = session.conversation, tool_metas = tool_metas)
+    match (result.step) {
       case types.step_final(text => reply_text) -> { break region_turn_result(reply = reply_text, session = session) }
       case types.step_call(calls => calls) -> {
         // Route the batch SEQUENTIALLY: starting / stopping a monitor threads the durable registry, so —

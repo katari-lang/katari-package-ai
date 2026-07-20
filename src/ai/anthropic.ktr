@@ -267,6 +267,19 @@ agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"T
   }
 }
 
+@"The step's token accounting off the response's `usage`. The context a step read splits across
+`input_tokens` and the cache counters (`cache_read_input_tokens` / `cache_creation_input_tokens`),
+so the occupancy is their sum; an absent field reads as 0."
+agent anthropic_usage(@"The parsed response document." parsed: unknown) -> types.usage {
+  let counts = json.field(target = parsed, key = "usage")
+  types.usage(
+    input_tokens = ai.token_count(node = json.field(target = counts, key = "input_tokens"))
+      + ai.token_count(node = json.field(target = counts, key = "cache_read_input_tokens"))
+      + ai.token_count(node = json.field(target = counts, key = "cache_creation_input_tokens")),
+    output_tokens = ai.token_count(node = json.field(target = counts, key = "output_tokens")),
+  )
+}
+
 @"One Anthropic model step over the history + tool schemas (the body built as a value tree and the
 reply parsed by `post_json` in Katari; only the POST leaves the runtime, and each image `file` in the
 body base64s at that send boundary via the `http.json` slot contract)."
@@ -274,7 +287,7 @@ agent anthropic_infer_step(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
-) -> types.step {
+) -> types.step_result {
   // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
   let map = ai.build_name_map(tool_metas = tool_metas)
@@ -290,5 +303,5 @@ agent anthropic_infer_step(
       "anthropic-version" = "2023-06-01",
     },
   )
-  anthropic_parse_step(parsed = response, map = map)
+  types.step_result(step = anthropic_parse_step(parsed = response, map = map), usage = anthropic_usage(parsed = response))
 }

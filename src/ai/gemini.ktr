@@ -291,10 +291,22 @@ agent gemini_parse_step(parsed: unknown) -> types.step {
   }
 }
 
+@"The step's token accounting off Gemini's `usageMetadata`: the prompt count is the whole context
+the step read, and thought tokens count as output alongside the answer's (an absent field reads as
+0, so a response without the block still yields a usable measurement)."
+agent gemini_usage(parsed: unknown) -> types.usage {
+  let counts = json.field(target = parsed, key = "usageMetadata")
+  types.usage(
+    input_tokens = ai.token_count(node = json.field(target = counts, key = "promptTokenCount")),
+    output_tokens = ai.token_count(node = json.field(target = counts, key = "candidatesTokenCount"))
+      + ai.token_count(node = json.field(target = counts, key = "thoughtsTokenCount")),
+  )
+}
+
 @"One Gemini model step over the history + tool schemas (the body built as a value tree and the reply
 parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined image `file` in the
 body base64s at that send boundary via the `http.json` slot contract)."
-agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step {
+agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result {
   let body = gemini_request_body(client = client, history = history, tool_metas = tool_metas)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
   // `post_json` serialises the value tree as application/json (each inlined image `file` leaf read from
@@ -305,5 +317,5 @@ agent gemini_infer_step(client: connection, history: array[types.message], tool_
     body = body,
     headers = { "x-goog-api-key" = client.api_key },
   )
-  gemini_parse_step(parsed = response)
+  types.step_result(step = gemini_parse_step(parsed = response), usage = gemini_usage(parsed = response))
 }

@@ -166,9 +166,19 @@ agent openai_parse_step(response: unknown, map: ai.name_map) -> types.step with 
   }
 }
 
+@"The step's token accounting off the response's `usage`: prompt tokens are the whole context the
+step read, completion tokens what the model generated (an absent field reads as 0)."
+agent openai_usage(parsed: unknown) -> types.usage {
+  let counts = json.field(target = parsed, key = "usage")
+  types.usage(
+    input_tokens = ai.token_count(node = json.field(target = counts, key = "prompt_tokens")),
+    output_tokens = ai.token_count(node = json.field(target = counts, key = "completion_tokens")),
+  )
+}
+
 @"One OpenAI model step over the history + tool schemas (the body built as a value tree and the reply
 parsed by `post_json`, in Katari; only the POST leaves the runtime)."
-agent openai_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step {
+agent openai_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result {
   // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
   let map = ai.build_name_map(tool_metas = tool_metas)
@@ -178,5 +188,5 @@ agent openai_infer_step(client: connection, history: array[types.message], tool_
     body = body,
     headers = { "Authorization" = "Bearer " ++ client.api_key },
   )
-  openai_parse_step(response = response, map = map)
+  types.step_result(step = openai_parse_step(response = response, map = map), usage = openai_usage(parsed = response))
 }
