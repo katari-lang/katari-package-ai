@@ -65,6 +65,20 @@ agent gemini_result_part(result: types.tool_result) -> unknown {
   }
 }
 
+@"The file's recorded content type, or \"\" when the handle is gone (freed, or never named a live blob).
+A gone file cannot inline — its handle note still rides — so `gone` folds to the same \"cannot inline\"
+signal as an unrecorded type, and never fails a whole step over one stale attachment."
+agent gemini_content_type(f: file) -> string {
+  // `files.content_type` throws `files.gone` for a stale handle (freed, or an id that never named a
+  // live blob). Catch exactly that and recover with "" (cannot inline), so one stale attachment never
+  // fails a whole step. The `files` module qualifier is nameable in type position — the `file`
+  // builtin-type keyword no longer shadows it.
+  use handler {
+    request prelude.throw(error: files.gone) -> never { break "" }
+  }
+  files.content_type(value = f)
+}
+
 @"A file's content as an inlineData part — what lets the model actually SEE an image. The `data` slot
 holds the file VALUE placed DIRECTLY into the tree; `http.json` reads its bytes and base64s them in
 place only at the send boundary, so the content never rides the value plane. Only the freshest history
@@ -74,7 +88,7 @@ agent gemini_inline_part(f: file) -> unknown {
   // `read_base64`).
   {
     inlineData = {
-      mimeType = file.content_type(value = f),
+      mimeType = gemini_content_type(f = f),
       "data" = f,
     },
   }
@@ -92,7 +106,7 @@ and learns the handle to replay) while fresh, the handle note alone once older �
 an old image on demand with `view_image`. A file with no recorded MIME type cannot inline."
 agent gemini_file_parts(files: array[file], inline: boolean) -> array[unknown] {
   array.flatten(target = for (let f in files) {
-    if (inline && file.content_type(value = f) != "") {
+    if (inline && gemini_content_type(f = f) != "") {
       next [gemini_handle_part(f = f), gemini_inline_part(f = f)]
     } else {
       next [gemini_handle_part(f = f)]

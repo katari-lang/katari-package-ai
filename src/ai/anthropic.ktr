@@ -57,11 +57,25 @@ agent anthropic_file_notes(@"The files attached to a turn." files: array[file]) 
   string.join(parts = notes, separator = "")
 }
 
+@"The file's recorded content type, or \"\" when the handle is gone (freed, or never named a live blob).
+A gone file cannot inline — its handle note still rides — so `gone` folds to the same \"not an image\"
+signal as an unrecorded type, and never fails a whole step over one stale attachment."
+agent anthropic_content_type(@"The file to read." attachment: file) -> string {
+  // `files.content_type` throws `files.gone` for a stale handle (freed, or an id that never named a
+  // live blob). Catch exactly that and recover with "" (not an image), so one stale attachment never
+  // fails a whole step. The `files` module qualifier is nameable in type position — the `file`
+  // builtin-type keyword no longer shadows it.
+  use handler {
+    request prelude.throw(error: files.gone) -> never { break "" }
+  }
+  files.content_type(value = attachment)
+}
+
 @"Whether a file inlines as an Anthropic image block: its recorded content type begins \"image/\" (the
 Messages API image block takes only image media types). A file with another or no recorded type stays
 a handle note."
 agent anthropic_is_image(@"The file to test." attachment: file) -> boolean {
-  string.starts_with(value = file.content_type(value = attachment), search = "image/")
+  string.starts_with(value = anthropic_content_type(attachment = attachment), search = "image/")
 }
 
 @"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`, built as a raw value tree."
@@ -78,7 +92,7 @@ agent anthropic_image_block(@"The image file to inline." attachment: file) -> un
     "type" = "image",
     source = {
       "type" = "base64",
-      media_type = file.content_type(value = attachment),
+      media_type = anthropic_content_type(attachment = attachment),
       "data" = attachment,
     },
   }

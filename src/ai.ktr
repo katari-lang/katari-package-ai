@@ -162,6 +162,217 @@ agent collect_result_files(node: unknown) -> array[file] with pure {
   }
 }
 
+// ── region-integrated loop: dynamic monitors over a nursery ───────────────────
+//
+// `infer_with_tools` is fork-JOIN only: every tool call is awaited before the loop moves on, so an
+// agent cannot "start something and forget it". `infer_with_region` adds exactly that, over a `region`
+// nursery (structured concurrency): the model may START a background monitor (a fiber that runs on its
+// own and notifies the model later) and STOP it, without ever leaving the loop. A monitor speaks to the
+// model through ONE channel — the `observation` request — so the nursery's effect ceiling is a single
+// fixed row (`{...E, observation} | io`), and one `region.watch` covering it covers every monitor.
+//
+// Structured concurrency forces the shape. `region.provide` CANCELS every still-running fiber when its
+// continuation returns, so for a monitor to outlive the reply that started it the loop MUST NOT return —
+// it runs for the session's lifetime. Hence `infer_with_region` returns `never`, and the model's replies
+// leave through the `observation` channel (each reply is the answer handed back to the fiber that
+// reported), not through a return value. `infer_with_tools` (the fork-join loop) stays for the plain
+// request/response case; this is its long-lived sibling.
+
+// The per-nursery scope marker for this module's region — region.ktr's "declare one marker per nursery"
+// rule. A nullary phantom: `region.provide` mints it for the loop's continuation and discharges it from
+// its own result, so no monitor fiber can outlive `infer_with_region`.
+@"The `infer_with_region` nursery scope: a nullary phantom marker carried by every monitor fiber, minted and discharged by the loop's `region.provide` so no fiber outlives the loop."
+effect ai_turn
+
+@"THE monitor→model channel: a background monitor reports @content@ (plus any @files@ attached to it)
+from @source@ and receives the model's answer back. It is the only effect a monitor raises besides
+`io`, which pins the nursery's ceiling to one row so a single `region.watch` covers every monitor. A
+`source` fiber or a started monitor performs it; the loop's own handler answers it by running a model
+turn over the injected report. @files@ ride the injection turn's `files` slot — the same text + files
+split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
+request observation(@"Which monitor is reporting (e.g. \"slack\")." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> string
+
+@"The loop's durable state, threaded across every observation: the running @conversation@ and the
+@registry@ of started monitors (a stable id → the fiber handle `region.cancel` needs). The id is what
+the model holds and passes back to stop a monitor."
+data region_session(conversation: array[types.message], registry: record[region.fiber[ai_turn, never]])
+
+@"One model turn's outcome: the @reply@ handed back to the reporting fiber, plus the advanced @session@
+the loop persists for the next observation."
+data region_turn_result(reply: string, session: region_session)
+
+@"One routed tool call: the model-facing @result@ plus the possibly-grown monitor @registry@ (a started
+monitor adds its id → fiber; a stop or a synchronous tool leaves it be)."
+data region_step_result(result: types.tool_result, registry: record[region.fiber[ai_turn, never]])
+
+@"One routed batch: the registry after the whole batch plus the results in call order — one var so the
+batch fold threads both at once."
+data region_batch(registry: record[region.fiber[ai_turn, never]], results: array[types.tool_result])
+
+@"Tool: STOP a background monitor you started earlier. Pass the monitor id you were given when it
+started. The region loop INTERCEPTS this call (only the loop holds the nursery `region.cancel` needs),
+so this body is the schema seam and never runs; it returns a note so a stray direct call stays total."
+agent cancel_monitor(@"The id you were given when the monitor started." monitor_id: string) -> string {
+  f"(cancel_monitor is serviced by the region loop; id ${monitor_id})"
+}
+
+@"Route one tool call inside the region loop: STOP a monitor (`cancel_monitor` — cancel the fiber the
+model's id names), START a monitor (a name in @monitors@ — `region.fork` it detached and hand the model
+its id), or run a SYNCHRONOUS tool (anything else — `dispatch_one`, exactly as `infer_with_tools`).
+Returns the model-facing result with the possibly-grown registry."
+agent route_region_call[effect E](
+  @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
+  @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with E],
+  @"The startable monitors (forked detached)." monitors: array[agent (input: null) -> never with {...E, observation} | io],
+  @"The started-monitor registry (id → fiber)." registry: record[region.fiber[ai_turn, never]],
+  @"The model's tool call." call: types.tool_call,
+) -> region_step_result {
+  if (call.name == reflection.get_metadata(value = cancel_monitor).name) {
+    // Stop: look the id up and tear its fiber down. An unknown id is fed back as an error result so the
+    // model corrects; `region.cancel` is idempotent, so the entry stays (ids never collide, see below).
+    let requested_id = json.text(target = json.field(target = call.args, key = "monitor_id"))
+    match (record.get(target = registry, key = requested_id)) {
+      case null -> region_step_result(
+        result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(no such monitor: ${requested_id})", files = []),
+        registry = registry,
+      )
+      case handle -> {
+        region.cancel(nursery = nursery, handle = handle)
+        region_step_result(
+          result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor stopped: ${requested_id})", files = []),
+          registry = registry,
+        )
+      }
+    }
+  } else {
+    // Start the monitor whose name the model picked, else fall through to a synchronous tool.
+    // `region.fork` returns AT ONCE with the fiber handle; the fiber runs on and notifies through
+    // `observation`. The id is derived from the registry size and entries are never removed, so ids
+    // grow monotonically and never collide.
+    for (let monitor in monitors, var registry_acc: record[region.fiber[ai_turn, never]] = registry) {
+      if (reflection.get_metadata(value = monitor).name == call.name) {
+        let id = f"monitor-${string.to_string(value = record.size(target = registry_acc) + 1)}"
+        let handle = region.fork(nursery = nursery, task = monitor, argument = null)
+        break region_step_result(
+          result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor started with id ${id}; it will notify you as observations)", files = []),
+          registry = record.set(target = registry_acc, key = id, value = handle),
+        )
+      } else {
+        next with { registry_acc = registry_acc }
+      }
+    } then (_monitors) {
+      region_step_result(result = dispatch_one[E](tools = tools, call = call), registry = registry_acc)
+    }
+  }
+}
+
+@"One model turn-loop over @conversation@ WITH region powers — the region-aware twin of the
+`infer_with_tools` loop. Up to @max_steps@ times: ask the provider for a step; on a tool batch, route
+every call (`route_region_call`: a synchronous tool feeds its result back, a monitor tool forks a
+detached fiber whose id feeds back, `cancel_monitor` stops one), record the call + result turns, and
+continue; on a final answer, stop. Budget spent, force one tool-less close (as `infer_with_tools`).
+Returns the reply plus the advanced session (conversation + monitor registry)."
+agent region_turn_loop[effect E](
+  @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
+  @"The conversation to advance (the observation already injected)." conversation: array[types.message],
+  @"The synchronous tools." tools: array[agent never -> unknown with E],
+  @"The startable monitors." monitors: array[agent (input: null) -> never with {...E, observation} | io],
+  @"The started-monitor registry." registry: record[region.fiber[ai_turn, never]],
+  @"The per-turn step budget." max_steps: integer,
+) -> region_turn_result {
+  let sync_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
+  let monitor_metas = for (let monitor in monitors) { next reflection.get_metadata(value = monitor) }
+  // The model sees every synchronous tool, every startable monitor, and `cancel_monitor`.
+  let tool_metas = array.append(
+    target = array.concat(left = sync_metas, right = monitor_metas),
+    value = reflection.get_metadata(value = cancel_monitor),
+  )
+  for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry)) {
+    match (infer_step(history = session.conversation, tool_metas = tool_metas)) {
+      case types.step_final(text => reply_text) -> { break region_turn_result(reply = reply_text, session = session) }
+      case types.step_call(calls => calls) -> {
+        // Route the batch SEQUENTIALLY: starting / stopping a monitor threads the durable registry, so —
+        // unlike `infer_with_tools`' parallel batch — the calls run in order (synchronous tools included).
+        let batch = for (let call in calls, var acc: region_batch = region_batch(registry = session.registry, results = [])) {
+          let step = route_region_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = acc.registry, call = call)
+          next with { acc = region_batch(registry = step.registry, results = array.append(target = acc.results, value = step.result)) }
+        } then (_calls) { acc }
+        let with_calls = array.append(target = session.conversation, value = types.call_turn(calls = calls))
+        let with_results = array.append(target = with_calls, value = types.result_turn(results = batch.results))
+        next with { session = region_session(conversation = with_results, registry = batch.registry) }
+      }
+    }
+  } then (_steps) {
+    // Budget exhausted: force ONE tool-less step so the model commits to an answer instead of losing
+    // everything the tools gathered (the same close as `infer_with_tools`).
+    let closing = array.append(
+      target = session.conversation,
+      value = types.turn(
+        role = "user",
+        text = "You have used your entire tool-call budget. Do not call any more tools. Answer now using only what you have already gathered.",
+        files = [],
+      ),
+    )
+    region_turn_result(reply = reply(history = closing), session = region_session(conversation = closing, registry = session.registry))
+  }
+}
+
+@"Run the tool-using model loop over a `region` nursery, so the model can START background monitors and
+STOP them — the long-lived sibling of `infer_with_tools`. @tools@ are synchronous (called and awaited,
+exactly as `infer_with_tools`); @monitors@ are startable background fibers the model launches as tools
+(each forks detached and notifies the model through `observation`) and stops with `cancel_monitor`;
+@sources@ are always-on input fibers forked at startup (e.g. a chat watcher that turns each user message
+into an `observation`) and are NOT shown as tools. @context@ seeds the conversation the model always
+sees, and @region_instructions@ (overridable) teaches the model the start / stop protocol, since a model
+is trained on tool calls but not on this fork / cancel discipline.
+
+Returns `never`: structured concurrency cancels every fiber when the nursery closes, so to keep monitors
+alive the loop never returns — the model's replies leave through the `observation` channel (each is the
+answer handed to the fiber that reported), and the loop runs until the run is cancelled. The provider
+(`use gemini.provider(...)` …) and any @E@ handlers are installed by the caller, exactly as for
+`infer_with_tools`."
+agent infer_with_region[effect E](
+  @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
+  @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with E],
+  @"Startable monitors: forked detached when the model calls one, they notify through `observation`." monitors: array[agent (input: null) -> never with {...E, observation} | io],
+  @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
+  @"The per-observation step budget." max_steps: integer,
+  @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop.",
+) -> never {
+  let nursery: region.nursery[ai_turn, {...E, observation} | io] = use region.provide[ai_turn, {...E, observation} | io]
+  // The durable state (conversation + monitor registry) lives in the handler that answers every
+  // observation, so every model turn — from a source or from a started monitor — shares one thread.
+  use handler (var session: region_session = region_session(
+    conversation = array.concat(
+      left = [types.turn(role = "user", text = region_instructions, files = [])],
+      right = context,
+    ),
+    registry = record.empty(),
+  )) {
+    request observation(source: string, content: string, files: array[file]) -> string {
+      // The report's files ride the injection turn's `files` slot, exactly as an ordinary user turn's
+      // attachments — so the provider's existing inline policy (`gemini_file_parts` /
+      // `anthropic_turn_content`) shows the model any attached image with no observation-specific path.
+      let injected = array.append(
+        target = session.conversation,
+        value = types.turn(role = "user", text = f"Notification from ${source}:\n${content}", files = files),
+      )
+      let outcome = region_turn_loop[E](
+        nursery = nursery,
+        conversation = injected,
+        tools = tools,
+        monitors = monitors,
+        registry = session.registry,
+        max_steps = max_steps,
+      )
+      next outcome.reply with { session = outcome.session }
+    }
+  }
+  // Start the always-on inputs, then pump every fiber's observations up to the handler above forever.
+  let _sources = for (let source in sources) { next region.fork(nursery = nursery, task = source, argument = null) }
+  region.watch(nursery = nursery)
+}
+
 // ── wire tool names ───────────────────────────────────────────────────────────
 //
 // Katari enforces namespaces, so a tool's derived name is ALWAYS qualified (`katari_verify.count_letters`).
