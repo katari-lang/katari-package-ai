@@ -18,11 +18,14 @@ agent provider[R, effect E](
   model: string,
   api_key: string of private,
   system: string ?= "",
-  continuation: agent (value: null) -> R with {...E, ai.infer_step},
+  continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[ai.step_error] {
   use handler (var client = connection(model = model, api_key = api_key, system = system)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       next openai_infer_step(client = client, history = history, tool_metas = tool_metas)
+    }
+    request ai.infer_object(history: array[types.message], schema: unknown) {
+      next openai_infer_object(client = client, history = history, schema = schema)
     }
   }
   continuation(value = null)
@@ -189,4 +192,28 @@ agent openai_infer_step(client: connection, history: array[types.message], tool_
     headers = { "Authorization" = "Bearer " ++ client.api_key },
   )
   types.step_result(step = openai_parse_step(response = response, map = map), usage = openai_usage(parsed = response))
+}
+
+@"One OpenAI structured-output step: the tool-less message list plus `response_format` pinning the
+reply to JSON conforming to @schema@. The name map is empty — a replayed call turn in @history@
+rides under its real name via the fallback, fine for the rare structured step over a tool
+transcript. The reply content parses back to the decoded object; a non-JSON reply throws
+`json.parse_error` (∈ `ai.step_error`)."
+agent openai_infer_object(client: connection, history: array[types.message], schema: unknown) -> types.object_result {
+  let map = ai.build_name_map(tool_metas = [])
+  let body = {
+    model = client.model,
+    messages = openai_messages(client = client, history = history, map = map),
+    response_format = {
+      "type" = "json_schema",
+      json_schema = { name = "result", schema = schema },
+    },
+  }
+  let response = http.post_json(
+    url = "https://api.openai.com/v1/chat/completions",
+    body = body,
+    headers = { "Authorization" = "Bearer " ++ client.api_key },
+  )
+  let text = json.text(target = json.field(target = openai_message(parsed = response), key = "content"))
+  types.object_result(value = json.parse(text = text), usage = openai_usage(parsed = response))
 }

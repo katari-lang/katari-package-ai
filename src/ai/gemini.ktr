@@ -21,11 +21,14 @@ agent provider[R, effect E](
   model: string,
   api_key: string of private,
   system: string ?= "",
-  continuation: agent (value: null) -> R with {...E, ai.infer_step},
+  continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[ai.step_error] {
   use handler (var client = connection(model = model, api_key = api_key, system = system)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       next gemini_infer_step(client = client, history = history, tool_metas = tool_metas)
+    }
+    request ai.infer_object(history: array[types.message], schema: unknown) {
+      next gemini_infer_object(client = client, history = history, schema = schema)
     }
   }
   continuation(value = null)
@@ -190,7 +193,10 @@ agent gemini_function_declaration(meta: reflection.agent_metadata) -> unknown {
   }
 }
 
-agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> unknown {
+@"The tool-independent request base: contents (freshest element inlining its files) plus the system
+instruction. Kept a `record` so each caller extends it — `gemini_request_body` with tools,
+`gemini_infer_object` with the structured-output generationConfig."
+agent gemini_base_body(client: connection, history: array[types.message]) -> record[unknown] {
   // Only the FRESHEST history element inlines its files' content (the model just received them);
   // older elements shrink to handle notes — the model re-reads any of those with `view_image`.
   let count = array.length(target = history)
@@ -202,13 +208,17 @@ agent gemini_request_body(client: connection, history: array[types.message], too
   }
   let contents = array.concat(left = older, right = freshest)
   let base: record[unknown] = { contents = contents }
-  let with_system = if (client.system == "") {
+  if (client.system == "") {
     base
   } else {
     record.set(target = base, key = "systemInstruction", value = {
       parts = [gemini_text_part(text = client.system)],
     })
   }
+}
+
+agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> unknown {
+  let with_system = gemini_base_body(client = client, history = history)
   // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
   // slot contract base64s each `file` leaf — the inlineData `data` slots placed directly above — in
   // place at the send boundary, so the bytes never land on the value plane. A tool schema's literal
@@ -318,4 +328,28 @@ agent gemini_infer_step(client: connection, history: array[types.message], tool_
     headers = { "x-goog-api-key" = client.api_key },
   )
   types.step_result(step = gemini_parse_step(parsed = response), usage = gemini_usage(parsed = response))
+}
+
+@"One Gemini structured-output step: the tool-less request base plus a `generationConfig` pinning the
+reply to JSON conforming to @schema@ — sanitized exactly like a tool schema (`responseSchema` speaks
+the same OpenAPI subset the function declarations do). The reply text parses back to the decoded
+object; a non-JSON or empty reply throws `json.parse_error` (∈ `ai.step_error`)."
+agent gemini_infer_object(client: connection, history: array[types.message], schema: unknown) -> types.object_result {
+  let body = record.set(target = gemini_base_body(client = client, history = history), key = "generationConfig", value = {
+    responseMimeType = "application/json",
+    responseSchema = gemini_sanitize(node = schema),
+  })
+  let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
+  let response = http.post_json(
+    url = url,
+    body = body,
+    headers = { "x-goog-api-key" = client.api_key },
+  )
+  // With no tools declared a functionCall part cannot occur, so the parse is always `step_final`;
+  // the guard keeps the match total without inventing a value.
+  let text = match (gemini_parse_step(parsed = response)) {
+    case types.step_final(text => text) -> text
+    case types.step_call(calls => _) -> prelude.throw(error = json.parse_error(message = "gemini: a tool call in a structured-output reply"))
+  }
+  types.object_result(value = json.parse(text = text), usage = gemini_usage(parsed = response))
 }

@@ -35,6 +35,12 @@ type step_error = json.parse_error | http.status_error | http.fetch_error
 // turns any replayed `$katari_ref` into the `file` it denotes, so there is no separate step to fail here.
 type loop_error = reflection.call_error
 
+@"One structured-output step over the conversation — the seam's second request, served by the same
+provider handler as `infer_step`. @schema@ is the JSON Schema the reply must conform to (each
+provider maps it onto its native constrained decoding); the result carries the decoded object and
+the step's usage. Prefer `infer_structured[T]`, which reifies T's schema and validates the reply."
+request infer_object(history: array[types.message], schema: unknown) -> types.object_result
+
 @"Infer a single reply with no tools (the common chat case)."
 agent reply(history: array[types.message]) -> string {
   let result = infer_step(history = history, tool_metas = [])
@@ -42,6 +48,18 @@ agent reply(history: array[types.message]) -> string {
     case types.step_final(text => text) -> text
     case types.step_call(calls => _) -> "(unexpected tool call without tools)"
   }
+}
+
+@"Infer a single reply as a typed value — structured output with the type as the contract:
+`reflection.schema_of[T]` reifies T's schema, the ambient provider decodes against it natively
+(Gemini's responseSchema, OpenAI's response_format, Anthropic a forced tool), and the decoded object
+validates as T (`json.validate` — a nonconforming reply throws `json.validation_error`). Instantiate
+T explicitly; it appears only in the result, so it is never inferable. An object type
+(`type shape = { ... }`) makes the friendliest model-facing schema — a data type asks the model to
+produce its `$katari_constructor` wrapper too."
+agent infer_structured[T](history: array[types.message]) -> T {
+  let result = infer_object(history = history, schema = reflection.schema_of[T]())
+  json.validate[T](value = result.value)
 }
 
 @"Tool: load an image file into your visual context. Pass the file's handle object — a bare

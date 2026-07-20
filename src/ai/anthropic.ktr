@@ -28,11 +28,14 @@ agent provider[R, effect E](
   @"The API key, sent as the `x-api-key` header." api_key: string of private,
   @"An optional system prompt, sent as the top-level `system` field." system: string ?= "",
   @"The output-token cap of one step; the Messages API requires one on every request." max_tokens: integer ?= 4096,
-  @"The computation to run with `ai.infer_step` served." continuation: agent (value: null) -> R with {...E, ai.infer_step},
+  @"The computation to run with `ai.infer_step` / `ai.infer_object` served." continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[ai.step_error] {
   use handler (var client = connection(model = model, api_key = api_key, system = system, max_tokens = max_tokens)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       next anthropic_infer_step(client = client, history = history, tool_metas = tool_metas)
+    }
+    request ai.infer_object(history: array[types.message], schema: unknown) {
+      next anthropic_infer_object(client = client, history = history, schema = schema)
     }
   }
   continuation(value = null)
@@ -304,4 +307,56 @@ agent anthropic_infer_step(
     },
   )
   types.step_result(step = anthropic_parse_step(parsed = response, map = map), usage = anthropic_usage(parsed = response))
+}
+
+@"One Anthropic structured-output step, as a FORCED tool call: @schema@ rides as the input schema of
+one synthetic tool and `tool_choice` pins the model to it, so the decoded object arrives already
+parsed as the tool_use block's `input` — no special API surface, every Claude model. The name map is
+empty — a replayed call turn in @history@ rides under its real name via the fallback, fine for the
+rare structured step over a tool transcript. A reply with no tool_use block (a refusal) throws
+`json.parse_error` (∈ `ai.step_error`)."
+agent anthropic_infer_object(
+  @"The provider connection." client: connection,
+  @"The conversation so far." history: array[types.message],
+  @"The JSON Schema the reply must conform to." schema: unknown,
+) -> types.object_result {
+  let map = ai.build_name_map(tool_metas = [])
+  let messages = for (let message in history) { next anthropic_message(message = message, map = map) }
+  let base: record[unknown] = {
+    model = client.model,
+    max_tokens = client.max_tokens,
+    messages = messages,
+    thinking = { "type" = "disabled" },
+    tools = [{
+      name = "record_result",
+      description = "Record the final result in the required shape.",
+      input_schema = schema,
+    }],
+    tool_choice = { "type" = "tool", name = "record_result" },
+  }
+  let body = if (client.system == "") {
+    base
+  } else {
+    record.set(target = base, key = "system", value = client.system)
+  }
+  let response = http.post_json(
+    url = "https://api.anthropic.com/v1/messages",
+    body = body,
+    headers = {
+      "x-api-key" = client.api_key,
+      "anthropic-version" = "2023-06-01",
+    },
+  )
+  // The forced tool's input IS the decoded object — the same early-return scan as `dispatch_one`.
+  for (let block in anthropic_blocks(parsed = response)) {
+    if (anthropic_block_kind(block = block) == "tool_use") {
+      return types.object_result(
+        value = json.field(target = block, key = "input"),
+        usage = anthropic_usage(parsed = response),
+      )
+    } else {
+      null
+    }
+  }
+  prelude.throw(error = json.parse_error(message = "anthropic: no tool_use block in the structured-output reply"))
 }

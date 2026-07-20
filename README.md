@@ -12,8 +12,10 @@ module, not editing the loop.
   inlines an image for the model to look at); `use ai.serve_session(...)` — the chat-bot serve
   skeleton as one provider (a durable conversation answering `ai.session_message`, with token
   metering off the seam's `usage` and automatic compaction past a threshold; the summary prompt,
-  the threshold and the kept tail are overridable scalars); and `ai.compact(history, policy)` on its
-  own for a hand-rolled loop.
+  the threshold and the kept tail are overridable scalars); `ai.compact(history, policy)` on its
+  own for a hand-rolled loop; and `ai.infer_structured[T](history)` — structured output with the
+  type as the contract (`reflection.schema_of[T]` reifies the schema, the provider decodes against
+  it natively, `json.validate[T]` guarantees the returned value IS a T).
 - `ai.types` — the provider-agnostic vocabulary: `turn`, `tool_call`, `tool_result`, `step`, and the
   step's token accounting (`usage`, carried by `step_result` — what `ai.infer_step` returns). Apps
   and providers speak only this; no wire-format detail leaks in.

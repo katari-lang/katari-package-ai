@@ -50,3 +50,7 @@ data usage(input_tokens: integer, output_tokens: integer)
 
 @"What a provider returns for one model step: the decision plus its token accounting."
 data step_result(step: step, usage: usage)
+
+@"What a provider returns for one structured-output step: the decoded object (the wire's best effort
+at the requested schema — `ai.infer_structured` validates it as T) plus the step's token accounting."
+data object_result(value: unknown, usage: usage)
