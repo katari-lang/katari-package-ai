@@ -424,6 +424,15 @@ turn over the injected report. @files@ ride the injection turn's `files` slot �
 split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
 request observation(@"Which monitor is reporting (e.g. \"slack\")." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> string
 
+@"What the model supplies when it STARTS a monitor: a free-text @topic@ naming exactly what to watch (empty
+falls back to the monitor's default target), and an optional cron @schedule@ (a 5- or 6-field expression,
+e.g. \"0 9 * * 1\" for every Monday at 09:00; empty means the monitor's own default cadence). `region.fork`
+applies a task to `{ input: <argument> }` — one value — so the model's two flat fields ride as ONE
+`instruction`, the argument the loop forks each monitor with. A monitor stays authored as
+`agent (topic, schedule)` — the friendly flat schema the model sees — and the loop adapts that shape to the
+fork's `agent (input: instruction)` shape with a one-line closure."
+data instruction(@"Free-text description of exactly what to watch; empty falls back to the monitor's default target." topic: string, @"A cron expression (e.g. \"0 9 * * 1\"); empty falls back to the monitor's default cadence." schedule: string)
+
 @"The loop's durable state, threaded across every observation: the running @conversation@, the
 @registry@ of started monitors (a stable id → the fiber handle `region.cancel` needs), and the freshest
 measured context occupancy @used_tokens@ (0 until a step has run, and again right after a compaction
@@ -456,7 +465,7 @@ Returns the model-facing result with the possibly-grown registry."
 agent route_region_call[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
   @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with E],
-  @"The startable monitors (forked detached)." monitors: array[agent (input: null) -> never with {...E, observation} | io],
+  @"The startable monitors (forked detached), each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry (id → fiber)." registry: record[region.fiber[ai_turn, never]],
   @"The model's tool call." call: types.tool_call,
 ) -> region_step_result {
@@ -485,7 +494,16 @@ agent route_region_call[effect E](
     for (let monitor in monitors, var registry_acc: record[region.fiber[ai_turn, never]] = registry) {
       if (reflection.get_metadata(value = monitor).name == call.name) {
         let id = f"monitor-${string.to_string(value = record.size(target = registry_acc) + 1)}"
-        let handle = region.fork(nursery = nursery, task = monitor, argument = null)
+        // The model's args are the monitor's flat `{ topic, schedule }`; a field the model omitted degrades
+        // to the empty string (the monitor reads that as "use my default"), so a bare start still works.
+        let topic = json.text(target = json.field(target = call.args, key = "topic"))
+        let schedule = json.text(target = json.field(target = call.args, key = "schedule"))
+        // `region.fork` applies its task to `{ input: <argument> }` — one value — so wrap the two fields as
+        // one `instruction` and adapt the monitor's `(topic, schedule)` shape to the fork's `(input:)` shape.
+        agent start(input: instruction) -> never {
+          monitor(topic = input.topic, schedule = input.schedule)
+        }
+        let handle = region.fork(nursery = nursery, task = start, argument = instruction(topic = topic, schedule = schedule))
         break region_step_result(
           result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor started with id ${id}; it will notify you as observations)", files = []),
           registry = record.set(target = registry_acc, key = id, value = handle),
@@ -509,7 +527,7 @@ agent region_turn_loop[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
   @"The conversation to advance (the observation already injected)." conversation: array[types.message],
   @"The synchronous tools." tools: array[agent never -> unknown with E],
-  @"The startable monitors." monitors: array[agent (input: null) -> never with {...E, observation} | io],
+  @"The startable monitors, each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry." registry: record[region.fiber[ai_turn, never]],
   @"The per-turn step budget." max_steps: integer,
 ) -> region_turn_result {
@@ -593,10 +611,10 @@ summarized back down (`compact`, the same policy as `serve_session`)."
 agent infer_with_region[effect E](
   @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
   @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with E],
-  @"Startable monitors: forked detached when the model calls one, they notify through `observation`." monitors: array[agent (input: null) -> never with {...E, observation} | io],
+  @"Startable monitors, each authored `agent (topic, schedule)`: forked detached when the model calls one (with the model's topic + schedule), they notify through `observation`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
   @"The per-observation step budget." max_steps: integer,
-  @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop.",
+  @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop.",
   @"The context-occupancy threshold (tokens) that triggers a compaction of the running conversation." threshold_tokens: integer ?= 100000,
   @"The summarization instruction a compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
   @"How many trailing history elements survive a compaction verbatim." keep_recent: integer ?= 8,
