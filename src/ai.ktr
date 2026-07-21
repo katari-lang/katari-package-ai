@@ -424,10 +424,11 @@ turn over the injected report. @files@ ride the injection turn's `files` slot �
 split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
 request observation(@"Which monitor is reporting (e.g. \"slack\")." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> string
 
-@"The loop's durable state, threaded across every observation: the running @conversation@ and the
-@registry@ of started monitors (a stable id → the fiber handle `region.cancel` needs). The id is what
-the model holds and passes back to stop a monitor."
-data region_session(conversation: array[types.message], registry: record[region.fiber[ai_turn, never]])
+@"The loop's durable state, threaded across every observation: the running @conversation@, the
+@registry@ of started monitors (a stable id → the fiber handle `region.cancel` needs), and the freshest
+measured context occupancy @used_tokens@ (0 until a step has run, and again right after a compaction
+until the next step re-measures). The id is what the model holds and passes back to stop a monitor."
+data region_session(conversation: array[types.message], registry: record[region.fiber[ai_turn, never]], used_tokens: integer)
 
 @"One model turn's outcome: the @reply@ handed back to the reporting fiber, plus the advanced @session@
 the loop persists for the next observation."
@@ -519,10 +520,23 @@ agent region_turn_loop[effect E](
     target = array.concat(left = sync_metas, right = monitor_metas),
     value = reflection.get_metadata(value = cancel_monitor),
   )
-  for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry)) {
+  for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry, used_tokens = 0)) {
     let result = infer_step(history = session.conversation, tool_metas = tool_metas)
+    // Each step's input covers the whole context, so the FRESHEST figure IS the occupancy (steps do not add).
+    let measured = result.usage.input_tokens + result.usage.output_tokens
     match (result.step) {
-      case types.step_final(text => reply_text) -> { break region_turn_result(reply = reply_text, session = session) }
+      case types.step_final(text => reply_text) -> {
+        // Record the model's reply as a model turn — exactly as `session_turn_loop` does — so the running
+        // conversation is a faithful transcript the next observation (and `compact`) can read back.
+        break region_turn_result(
+          reply = reply_text,
+          session = region_session(
+            conversation = array.append(target = session.conversation, value = types.turn(role = "model", text = reply_text, files = [])),
+            registry = session.registry,
+            used_tokens = measured,
+          ),
+        )
+      }
       case types.step_call(calls => calls) -> {
         // Route the batch SEQUENTIALLY: starting / stopping a monitor threads the durable registry, so —
         // unlike `infer_with_tools`' parallel batch — the calls run in order (synchronous tools included).
@@ -532,7 +546,7 @@ agent region_turn_loop[effect E](
         } then (_calls) { acc }
         let with_calls = array.append(target = session.conversation, value = types.call_turn(calls = calls))
         let with_results = array.append(target = with_calls, value = types.result_turn(results = batch.results))
-        next with { session = region_session(conversation = with_results, registry = batch.registry) }
+        next with { session = region_session(conversation = with_results, registry = batch.registry, used_tokens = measured) }
       }
     }
   } then (_steps) {
@@ -546,7 +560,15 @@ agent region_turn_loop[effect E](
         files = [],
       ),
     )
-    region_turn_result(reply = reply(history = closing), session = region_session(conversation = closing, registry = session.registry))
+    let answer = reply(history = closing)
+    region_turn_result(
+      reply = answer,
+      session = region_session(
+        conversation = array.append(target = closing, value = types.turn(role = "model", text = answer, files = [])),
+        registry = session.registry,
+        used_tokens = session.used_tokens,
+      ),
+    )
   }
 }
 
@@ -563,7 +585,11 @@ Returns `never`: structured concurrency cancels every fiber when the nursery clo
 alive the loop never returns — the model's replies leave through the `observation` channel (each is the
 answer handed to the fiber that reported), and the loop runs until the run is cancelled. The provider
 (`use gemini.provider(...)` …) and any @E@ handlers are installed by the caller, exactly as for
-`infer_with_tools`."
+`infer_with_tools`.
+
+COMPACTION: unlike the plain loop, the conversation never resets across observations, so after each turn
+the freshest measured occupancy is classified against @threshold_tokens@ and, over it, the conversation is
+summarized back down (`compact`, the same policy as `serve_session`)."
 agent infer_with_region[effect E](
   @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
   @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with E],
@@ -571,16 +597,23 @@ agent infer_with_region[effect E](
   @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
   @"The per-observation step budget." max_steps: integer,
   @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop.",
+  @"The context-occupancy threshold (tokens) that triggers a compaction of the running conversation." threshold_tokens: integer ?= 100000,
+  @"The summarization instruction a compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
+  @"How many trailing history elements survive a compaction verbatim." keep_recent: integer ?= 8,
 ) -> never {
+  // A region session never returns, so its conversation would grow without bound; the same compaction
+  // policy `serve_session` uses folds it back under the threshold after any over-budget turn.
+  let policy = compaction(threshold_tokens = threshold_tokens, prompt = compact_prompt, keep_recent = keep_recent)
   let nursery: region.nursery[ai_turn, {...E, observation} | io] = use region.provide[ai_turn, {...E, observation} | io]
-  // The durable state (conversation + monitor registry) lives in the handler that answers every
-  // observation, so every model turn — from a source or from a started monitor — shares one thread.
+  // The durable state (conversation + monitor registry + freshest occupancy) lives in the handler that
+  // answers every observation, so every model turn — from a source or from a started monitor — shares one thread.
   use handler (var session: region_session = region_session(
     conversation = array.concat(
       left = [types.turn(role = "user", text = region_instructions, files = [])],
       right = context,
     ),
     registry = record.empty(),
+    used_tokens = 0,
   )) {
     request observation(source: string, content: string, files: array[file]) -> string {
       // The report's files ride the injection turn's `files` slot, exactly as an ordinary user turn's
@@ -598,7 +631,17 @@ agent infer_with_region[effect E](
         registry = session.registry,
         max_steps = max_steps,
       )
-      next outcome.reply with { session = outcome.session }
+      // Classify the freshest measured occupancy against the policy, exactly as `serve_session` does: an
+      // over-budget turn summarizes everything before the kept tail. (0 says "not yet measured" after a
+      // compaction — the next step re-measures.)
+      match (classify_budget(used = outcome.session.used_tokens, policy = policy)) {
+        case within_budget(remaining => _) -> {
+          next outcome.reply with { session = outcome.session }
+        }
+        case over_budget(used => _) -> {
+          next outcome.reply with { session = region_session(conversation = compact(history = outcome.session.conversation, policy = policy), registry = outcome.session.registry, used_tokens = 0) }
+        }
+      }
     }
   }
   // Start the always-on inputs, then pump every fiber's observations up to the handler above forever.
