@@ -126,7 +126,10 @@ are already visible in the result text)."
 agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: types.tool_call) -> types.tool_result {
   // A failing tool must never fail the conversation — that is the loop's whole premise. A panic (a
   // crashed handler) escaping THIS call becomes an error result the model reads and corrects on its
-  // next step, instead of escalating to the app root.
+  // next step, instead of escalating to the app root. Only a `panic` folds back here, not a typed
+  // `throw`: a `throw` handler's overwrite semantics require the tools' abstract effect generic `E` to
+  // EXCLUDE `throw`, which a generic-over-tools loop cannot promise, so a tool's own `throw[my_error]`
+  // (and the dispatch's `throw[call_error]` = `loop_error`) still escalate to the app root as before.
   use handler {
     request panic(msg: string) {
       break types.tool_result(
@@ -498,9 +501,26 @@ agent route_region_call[effect E](
         // to the empty string (the monitor reads that as "use my default"), so a bare start still works.
         let topic = json.text(target = json.field(target = call.args, key = "topic"))
         let schedule = json.text(target = json.field(target = call.args, key = "schedule"))
+        // The monitor's name, captured now so the fork adapter's failure notice can name which monitor died.
+        let monitor_name = reflection.get_metadata(value = monitor).name
         // `region.fork` applies its task to `{ input: <argument> }` — one value — so wrap the two fields as
         // one `instruction` and adapt the monitor's `(topic, schedule)` shape to the fork's `(input:)` shape.
+        // A monitor fiber that CRASHES (a panic) otherwise tears down silently — the model started a watcher
+        // and would never learn it died (worse, the panic wells up through `region.watch` and takes the whole
+        // loop with it). Catch it inside the fiber, tell the model through the SAME `observation` channel every
+        // monitor reports on (so it can restart the watcher if it still wants it), then idle forever: a monitor
+        // is `never`, so after notifying there is nothing to return to, and the model reclaims the dead fiber
+        // with `cancel_monitor`. (A typed `throw` cannot be folded back the same way — a `throw` handler's
+        // overwrite semantics require the fiber's abstract effect generic to exclude `throw`, which it cannot,
+        // so a monitor's typed error still escalates through `region.watch` as before; only `panic` is ambient
+        // enough to catch here. See dispatch_one for the same asymmetry on the synchronous tool path.)
         agent start(input: instruction) -> never {
+          use handler {
+            request panic(msg: string) {
+              observation(source = "monitor", content = f"(monitor ${monitor_name} failed: ${msg}. It has stopped; start it again if still needed.)", files = [])
+              forever { time.sleep(milliseconds = 3600000.0) }
+            }
+          }
           monitor(topic = input.topic, schedule = input.schedule)
         }
         let handle = region.fork(nursery = nursery, task = start, argument = instruction(topic = topic, schedule = schedule))
@@ -614,7 +634,7 @@ agent infer_with_region[effect E](
   @"Startable monitors, each authored `agent (topic, schedule)`: forked detached when the model calls one (with the model's topic + schedule), they notify through `observation`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
   @"The per-observation step budget." max_steps: integer,
-  @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop.",
+  @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop. If a monitor fails it stops and sends you a 'Notification from monitor' saying so; start it again if you still need that watch.",
   @"The context-occupancy threshold (tokens) that triggers a compaction of the running conversation." threshold_tokens: integer ?= 100000,
   @"The summarization instruction a compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
   @"How many trailing history elements survive a compaction verbatim." keep_recent: integer ?= 8,
