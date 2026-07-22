@@ -95,6 +95,7 @@ agent anthropic_step_attempt(client: connection, history: array[types.message], 
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -113,6 +114,7 @@ agent anthropic_object_attempt(client: connection, history: array[types.message]
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }

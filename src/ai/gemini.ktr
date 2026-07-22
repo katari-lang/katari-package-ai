@@ -11,7 +11,7 @@ import ai.types
 
 @"A Gemini connection: the model id, the API key, an optional system instruction, and the transient-retry
 budget (@retry_attempts@ / @retry_base_ms@). Provider handler state — built once per `use gemini.provider(...)`."
-data connection(model: string, source: credentials.source, system: string, retry_attempts: integer, retry_base_ms: number)
+data connection(model: string, source: credentials.source, system: string, retry_attempts: integer, retry_base_ms: number, max_output_tokens: integer | null, thinking_budget: integer | null)
 
 @"Serve `ai.infer_step` over Gemini for the extent of the continuation:
 `use gemini.provider(model = \"gemini-3.5-flash\", source = credentials.env(key = \"GEMINI_API_KEY\"))`.
@@ -27,9 +27,11 @@ agent provider[R, effect E](
   system: string ?= "",
   retry_attempts: integer ?= 6,
   retry_base_ms: number ?= 2000.0,
+  @"generationConfig.maxOutputTokens — the per-step output cap; `null` (the default) sends none." max_output_tokens: integer | null ?= null,
+  @"generationConfig.thinkingConfig.thinkingBudget — bounds the thought tokens a thinking model may burn before the answer; `null` (the default) sends none." thinking_budget: integer | null ?= null,
   continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler (var client = connection(model = model, source = source, system = system, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
+  use handler (var client = connection(model = model, source = source, system = system, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms, max_output_tokens = max_output_tokens, thinking_budget = thinking_budget)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       // Retry a transient step with exponential backoff; a fatal error (a non-retryable status, malformed
       // JSON) or an exhausted budget propagates to the use site. The attempt handler (`gemini_step_attempt`)
@@ -89,6 +91,7 @@ agent gemini_step_attempt(client: connection, history: array[types.message], too
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -107,6 +110,7 @@ agent gemini_object_attempt(client: connection, history: array[types.message], s
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -288,12 +292,33 @@ agent gemini_base_body(client: connection, history: array[types.message]) -> rec
   }
   let contents = array.concat(left = older, right = freshest)
   let base: record[unknown] = { contents = contents }
-  if (client.system == "") {
+  let with_system = if (client.system == "") {
     base
   } else {
     record.set(target = base, key = "systemInstruction", value = {
       parts = [gemini_text_part(text = client.system)],
     })
+  }
+  gemini_with_generation_config(client = client, body = with_system)
+}
+
+@"Attach the OPTIONAL generation knobs to a request body: `maxOutputTokens` (the per-step output cap)
+and `thinkingConfig.thinkingBudget` (bounds the thought tokens before the answer — an unbounded
+thinking model on a heavy task can burn the whole output budget on thought and truncate to an empty
+answer). A `null` knob sends nothing, so the default wire behaviour is unchanged."
+agent gemini_with_generation_config(client: connection, body: record[unknown]) -> record[unknown] {
+  let with_max = match (client.max_output_tokens) {
+    case null -> record.empty()
+    case cap -> record.set(target = record.empty(), key = "maxOutputTokens", value = cap)
+  }
+  let config = match (client.thinking_budget) {
+    case null -> with_max
+    case budget -> record.set(target = with_max, key = "thinkingConfig", value = { thinkingBudget = budget })
+  }
+  if (record.size(target = config) == 0) {
+    body
+  } else {
+    record.set(target = body, key = "generationConfig", value = config)
   }
 }
 
@@ -348,6 +373,11 @@ agent gemini_is_thought(part: unknown) -> boolean {
   }
 }
 
+@"The first candidate's finish reason, read totally (\"\" when absent)."
+agent gemini_finish_reason(parsed: unknown) -> string {
+  json.text(target = json.field(target = json.element(target = json.field(target = parsed, key = "candidates"), index = 0), key = "finishReason"))
+}
+
 agent gemini_parse_step(parsed: unknown) -> types.step {
   let parts = gemini_parts(parsed = parsed)
   let calls = for (let part in parts, var acc: array[types.tool_call] = []) {
@@ -375,7 +405,18 @@ agent gemini_parse_step(parsed: unknown) -> types.step {
         }
       }
     } then (_parts) { acc }
-    types.step_final(text = string.join(parts = texts, separator = ""))
+    let joined = string.join(parts = texts, separator = "")
+    let finish = gemini_finish_reason(parsed = parsed)
+    // An EMPTY final with an abnormal finish is not an answer — the thought parts (stripped above)
+    // or a truncation ate it. Surface the typed `ai.empty_reply` so the app sees a real failure
+    // instead of a silent empty string. A NORMAL stop with empty text stays a legitimate quiet
+    // reply (`step_final("")`) — the region loop's monitors answer exactly that when there is
+    // nothing to report.
+    if (joined == "" && finish != "STOP" && finish != "") {
+      prelude.throw(error = ai.empty_reply(finish_reason = finish))
+    } else {
+      types.step_final(text = joined)
+    }
   } else {
     types.step_call(calls = calls)
   }
@@ -415,10 +456,19 @@ reply to JSON conforming to @schema@ — sanitized exactly like a tool schema (`
 the same OpenAPI subset the function declarations do). The reply text parses back to the decoded
 object; a non-JSON or empty reply throws `json.parse_error` (∈ `ai.step_error`)."
 agent gemini_infer_object(client: connection, history: array[types.message], schema: unknown) -> types.object_result {
-  let body = record.set(target = gemini_base_body(client = client, history = history), key = "generationConfig", value = {
-    responseMimeType = "application/json",
-    responseSchema = gemini_sanitize(node = schema),
-  })
+  // The structured-output fields JOIN the base's generationConfig (the optional knobs) rather than
+  // replacing it — a plain `record.set` here would silently drop max_output_tokens / thinking_budget.
+  let base = gemini_base_body(client = client, history = history)
+  let base_config = match (record.get(target = base, key = "generationConfig")) {
+    case null -> record.empty()
+    case existing -> json.entries(target = existing)
+  }
+  let structured_config = record.set(
+    target = record.set(target = base_config, key = "responseMimeType", value = "application/json"),
+    key = "responseSchema",
+    value = gemini_sanitize(node = schema),
+  )
+  let body = record.set(target = base, key = "generationConfig", value = structured_config)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
   let response = http.post_json(
     url = url,

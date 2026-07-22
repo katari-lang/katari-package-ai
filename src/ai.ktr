@@ -34,7 +34,7 @@ request infer_step(history: array[types.message], tool_metas: array[reflection.a
 // loop's perform site, not the provider's deep use site. A provider builds its request body as a raw value
 // tree and posts it with `http.post_json`, which parses the reply — so the only JSON failure a step can
 // carry is that parse. (Type synonyms take no docs.)
-type step_error = json.parse_error | http.status_error | http.fetch_error
+type step_error = json.parse_error | http.status_error | http.fetch_error | empty_reply
 
 @"One model step's OUTCOME success: the provider produced a step (`types.step_result` for `infer_step`,
 `types.object_result` for `infer_object`). Generic over the payload so both seam requests share one sum shape."
@@ -99,6 +99,13 @@ agent infer_structured[T](history: array[types.message]) -> T {
 // itself lives in each handler body — a callback-wrapped `retry(task)` would commonise the whole thing,
 // which is not the point (the decision is the shared part, not the control flow).
 
+@"The provider's API finished a step WITHOUT an answer: no tool call and no reply text, with a
+finish reason other than a normal stop (an output-token truncation that ate the whole answer, a
+safety block). Deliberately distinct from a NORMAL empty reply (finish reason STOP), which stays a
+legitimate quiet `step_final(\"\")` — the region loop's monitors depend on it. Not transient: the
+same context replays into the same truncation, so it surfaces to the app instead of burning retries."
+data empty_reply(@"The provider-reported finish reason (e.g. \"MAX_TOKENS\")." finish_reason: string)
+
 @"Whether a step error is TRANSIENT — worth a backoff and a retry — as opposed to fatal. A transport
 failure (`http.fetch_error`: DNS, a refused connection, a timeout, a mid-flight restart) is always
 transient; a status error is transient for 408 (request timeout), 429 (rate limit) and any 5xx
@@ -109,6 +116,7 @@ agent is_transient(error: step_error) -> boolean {
     case http.fetch_error(message => _) -> true
     case http.status_error(status => status, body => _) -> status == 408 || status == 429 || status >= 500
     case json.parse_error(message => _) -> false
+    case empty_reply(finish_reason => _) -> false
   }
 }
 
