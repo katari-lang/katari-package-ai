@@ -183,6 +183,19 @@ agent infer_with_tools[effect E](
   session_turn_loop[E](conversation = history, tools = tools, max_steps = max_steps).reply
 }
 
+@"The one-shot renudge a loop plays when the model's final step came back EMPTY: an empty string is
+a lost answer in an interactive exchange (a thinking model can finish a heavy turn with only thought
+parts and no text), so the loop asks ONCE for a plain-text answer before accepting the silence. The
+region loop's wording also names the legitimate way out — a monitor with truly nothing to report
+answers empty again, and the second empty is accepted."
+agent empty_reply_nudge() -> types.message {
+  types.turn(
+    role = "user",
+    text = "(Your previous reply was empty. If you have an answer, state it now in plain text. If you truly have nothing to say or report, reply with an empty message once more.)",
+    files = [],
+  )
+}
+
 @"The forced tool-less close every loop plays when its step budget runs out: a user turn telling the
 model the budget is spent, so ONE last step commits to an answer from what the tools already gathered
 instead of discarding it."
@@ -424,14 +437,15 @@ data session_turn(reply: string, conversation: array[types.message], used_tokens
 through: up to @max_steps@ steps, tool batches dispatched in parallel, the model's reply appended as
 a model turn, and the LAST step's `input + output` carried out as the context measurement (each
 step's input covers the whole context, so only the freshest figure is the occupancy — steps do not
-add)."
+add). An EMPTY final is renudged once for a plain-text answer — a one-shot exchange has no quiet
+channel, so an empty here is a lost answer, not a signal."
 agent session_turn_loop[effect E](
   conversation: array[types.message],
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
 ) -> session_turn {
   let tool_metas = ensure_unique_names(metas = for (let tool in tools) { next reflection.get_metadata(value = tool) })
-  for (let _step in array.range(start = 0, end = max_steps), var state: session_turn = session_turn(reply = "", conversation = conversation, used_tokens = 0)) {
+  let outcome = for (let _step in array.range(start = 0, end = max_steps), var state: session_turn = session_turn(reply = "", conversation = conversation, used_tokens = 0)) {
     match (infer_step(history = state.conversation, tool_metas = tool_metas)) {
       // A served session is one-shot per message, so a provider failure re-raises at the perform site
       // for the app's transport bridge (the `session_message` caller) to handle.
@@ -465,6 +479,20 @@ agent session_turn_loop[effect E](
       conversation = array.append(target = closing, value = types.turn(role = "model", text = answer, files = [])),
       used_tokens = state.used_tokens,
     )
+  }
+  // An EMPTY final is a lost answer in a one-shot exchange (no quiet channel exists here): renudge
+  // ONCE with an explicit ask, and accept whatever the extra step says — a second empty comes back
+  // as-is (honestly) rather than looping.
+  if (outcome.reply == "") {
+    let nudged = array.append(target = outcome.conversation, value = empty_reply_nudge())
+    let answer = reply(history = nudged)
+    session_turn(
+      reply = answer,
+      conversation = array.append(target = nudged, value = types.turn(role = "model", text = answer, files = [])),
+      used_tokens = outcome.used_tokens,
+    )
+  } else {
+    outcome
   }
 }
 
@@ -734,7 +762,9 @@ detached fiber whose id feeds back, `cancel_monitor` stops one, `list_monitors` 
 call + result turns, and continue; on a final answer, stop. A provider FAILURE does not unwind the loop —
 it is ABSORBED (`abandoned_turn`): the turn is dropped, a notice delivered, and the loop awaits the next
 observation. Budget spent, force one tool-less close (as `infer_with_tools`, absorbing a failure there
-too). Returns the reply plus the advanced session (conversation + monitor registry)."
+too). A turn that ran tools and still ended EMPTY is renudged once for a plain-text answer (an
+immediate empty stays the monitors' legitimate quiet reply). Returns the reply plus the advanced
+session (conversation + monitor registry)."
 agent region_turn_loop[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
   @"The conversation to advance (the observation already injected)." conversation: array[types.message],
@@ -752,7 +782,7 @@ agent region_turn_loop[effect E](
     left = array.concat(left = sync_metas, right = monitor_metas),
     right = control_metas,
   ))
-  for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry, used_tokens = 0)) {
+  let outcome = for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry, used_tokens = 0)) {
     match (infer_step(history = session.conversation, tool_metas = tool_metas)) {
       // ABSORB a provider failure: abandon just this turn (notice out, marker in) and wait for the next
       // observation — the long-lived loop must survive a step failure, not unwind on it.
@@ -813,6 +843,37 @@ agent region_turn_loop[effect E](
         )
       }
     }
+  }
+  // A turn that WORKED and still ended EMPTY is a lost answer, not the monitors' deliberate quiet: a
+  // thinking model can burn a heavy turn on thought parts and finish with no text. "Worked" is read
+  // off the transcript — a straight answer appends exactly ONE model turn, so any further growth
+  // means a tool batch ran. Renudge ONCE (absorbing a provider failure exactly as the loop does) and
+  // accept a second empty as genuine quiet; an IMMEDIATE empty (no tools) passes through untouched,
+  // because that is the quiet reply the monitor protocol depends on. `abandoned_turn` never trips
+  // this — its notice reply is non-empty.
+  if (outcome.reply == "" && array.length(target = outcome.session.conversation) > array.length(target = conversation) + 1) {
+    let nudged = array.append(target = outcome.session.conversation, value = empty_reply_nudge())
+    match (infer_step(history = nudged, tool_metas = [])) {
+      case inference_failed(error => error) -> {
+        abandoned_turn(conversation = nudged, registry = outcome.session.registry, used_tokens = outcome.session.used_tokens, error = error)
+      }
+      case inferred(result => result) -> {
+        let answer = match (result.step) {
+          case types.step_final(text => text) -> text
+          case types.step_call(calls => _) -> "(unexpected tool call without tools)"
+        }
+        region_turn_result(
+          reply = answer,
+          session = region_session(
+            conversation = array.append(target = nudged, value = types.turn(role = "model", text = answer, files = [])),
+            registry = outcome.session.registry,
+            used_tokens = result.usage.input_tokens + result.usage.output_tokens,
+          ),
+        )
+      }
+    }
+  } else {
+    outcome
   }
 }
 
