@@ -1,5 +1,5 @@
 // Gemini provider: serves the `ai.infer_step` request over the generativelanguage generateContent
-// API. `use gemini.provider(model = ..., api_key = ...)` at the app root is the whole integration —
+// API. `use gemini.provider(model = ..., source = ...)` at the app root is the whole integration —
 // the request body is built as a value tree and the response parsed from `json`, entirely in Katari;
 // the only network call is the prelude's `http.fetch` with an `http.json` body, so a turn's image
 // `file` inlines (its `data` slot base64s at the send boundary, never on the value plane). Swapping
@@ -11,10 +11,10 @@ import ai.types
 
 @"A Gemini connection: the model id, the API key, an optional system instruction, and the transient-retry
 budget (@retry_attempts@ / @retry_base_ms@). Provider handler state — built once per `use gemini.provider(...)`."
-data connection(model: string, api_key: string of private, system: string, retry_attempts: integer, retry_base_ms: number)
+data connection(model: string, source: credentials.source, system: string, retry_attempts: integer, retry_base_ms: number)
 
 @"Serve `ai.infer_step` over Gemini for the extent of the continuation:
-`use gemini.provider(model = \"gemini-3.5-flash\", api_key = env.get_secret(key = \"GEMINI_API_KEY\"))`.
+`use gemini.provider(model = \"gemini-3.5-flash\", source = credentials.env(key = \"GEMINI_API_KEY\"))`.
 A step's provider failure (malformed JSON, a non-2xx status, a transport failure — `ai.step_error`) is
 handed back as an `ai.inference_failed` OUTCOME, never thrown — but a TRANSIENT one (a 429 rate limit, a
 5xx, a dropped connection) is first retried with exponential backoff (up to @retry_attempts@ attempts from
@@ -23,13 +23,13 @@ exhausted budget surfaces, and it surfaces as a value the loop handles at its ow
 out of this deep handler."
 agent provider[R, effect E](
   model: string,
-  api_key: string of private,
+  source: credentials.source,
   system: string ?= "",
   retry_attempts: integer ?= 6,
   retry_base_ms: number ?= 2000.0,
   continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
-) -> R with E | io {
-  use handler (var client = connection(model = model, api_key = api_key, system = system, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
+) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
+  use handler (var client = connection(model = model, source = source, system = system, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       // Retry a transient step with exponential backoff; a fatal error (a non-retryable status, malformed
       // JSON) or an exhausted budget propagates to the use site. The attempt handler (`gemini_step_attempt`)
@@ -79,17 +79,37 @@ agent provider[R, effect E](
 @"ONE Gemini step attempt, catching any `step_error` into an `ai.attempt` verdict so the provider's retry
 loop can classify it and decide to back off / retry or propagate — the handler that catches it lives here,
 at the agent top, so the loop that drives retries never nests a handler."
-agent gemini_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io {
+agent gemini_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
-    request prelude.throw(error: ai.step_error) -> never { break ai.attempt_err(error = error) }
+    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
+      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
+      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
+      // rethrows it toward the root, where the app's supervisor decides.
+      match (error) {
+        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
+        case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
+        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case rest -> { prelude.throw(error = rest) }
+      }
+    }
   }
   ai.attempt_ok(result = gemini_infer_step(client = client, history = history, tool_metas = tool_metas))
 }
 
 @"ONE Gemini structured-output attempt, the `gemini_step_attempt` twin for `infer_object`."
-agent gemini_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io {
+agent gemini_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
-    request prelude.throw(error: ai.step_error) -> never { break ai.attempt_err(error = error) }
+    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
+      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
+      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
+      // rethrows it toward the root, where the app's supervisor decides.
+      match (error) {
+        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
+        case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
+        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case rest -> { prelude.throw(error = rest) }
+      }
+    }
   }
   ai.attempt_ok(result = gemini_infer_object(client = client, history = history, schema = schema))
 }
@@ -385,7 +405,7 @@ agent gemini_infer_step(client: connection, history: array[types.message], tool_
   let response = http.post_json(
     url = url,
     body = body,
-    headers = { "x-goog-api-key" = client.api_key },
+    headers = { "x-goog-api-key" = credentials.resolve(source = client.source) },
   )
   types.step_result(step = gemini_parse_step(parsed = response), usage = gemini_usage(parsed = response))
 }
@@ -403,7 +423,7 @@ agent gemini_infer_object(client: connection, history: array[types.message], sch
   let response = http.post_json(
     url = url,
     body = body,
-    headers = { "x-goog-api-key" = client.api_key },
+    headers = { "x-goog-api-key" = credentials.resolve(source = client.source) },
   )
   // With no tools declared a functionCall part cannot occur, so the parse is always `step_final`;
   // the guard keeps the match total without inventing a value.

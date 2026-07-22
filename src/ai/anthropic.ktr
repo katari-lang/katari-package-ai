@@ -5,7 +5,7 @@
 // inline as `image` content blocks: the request body posts as an `http.json` value tree with
 // `http.fetch`, so each image's `data` slot base64s at the send boundary, never on the value plane.
 // Same agnostic vocabulary, different shaping — and the same one-line integration:
-// `use anthropic.provider(api_key = ...)`.
+// `use anthropic.provider(source = ...)`.
 
 import ai
 import ai.types
@@ -15,7 +15,7 @@ output-token cap the Messages API requires on every request. Provider handler st
 `use anthropic.provider(...)`."
 data connection(
   @"The Claude model id." model: string,
-  @"The API key, sent as the `x-api-key` header." api_key: string of private,
+  @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
   @"The system prompt; empty sends none." system: string,
   @"The required `max_tokens`: the output-token cap of one step." max_tokens: integer,
   @"How many times a transient step is attempted before its error propagates." retry_attempts: integer,
@@ -23,21 +23,21 @@ data connection(
 )
 
 @"Serve `ai.infer_step` over Anthropic for the extent of the continuation:
-`use anthropic.provider(api_key = env.get_secret(key = \"ANTHROPIC_API_KEY\"))`.
+`use anthropic.provider(source = credentials.env(key = \"ANTHROPIC_API_KEY\"))`.
 A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` OUTCOME, never
 thrown — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped connection) is first retried with
 exponential backoff (up to @retry_attempts@ attempts from @retry_base_ms@); only a fatal error or an
 exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw."
 agent provider[R, effect E](
   @"The Claude model id." model: string ?= "claude-sonnet-5",
-  @"The API key, sent as the `x-api-key` header." api_key: string of private,
+  @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
   @"An optional system prompt, sent as the top-level `system` field." system: string ?= "",
   @"The output-token cap of one step; the Messages API requires one on every request." max_tokens: integer ?= 4096,
   @"How many times a transient step (a 429 / 5xx / dropped connection) is attempted before its error becomes an `inference_failed` outcome." retry_attempts: integer ?= 6,
   @"The first backoff delay in milliseconds, doubled per retry (capped at one minute)." retry_base_ms: number ?= 2000.0,
   @"The computation to run with `ai.infer_step` / `ai.infer_object` served." continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
-) -> R with E | io {
-  use handler (var client = connection(model = model, api_key = api_key, system = system, max_tokens = max_tokens, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
+) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
+  use handler (var client = connection(model = model, source = source, system = system, max_tokens = max_tokens, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       // Retry a transient step with exponential backoff; a fatal error (a non-retryable status, malformed
       // JSON) or an exhausted budget propagates. The attempt handler lives in its own agent so the loop
@@ -85,17 +85,37 @@ agent provider[R, effect E](
 
 @"ONE Anthropic step attempt, catching any `step_error` into an `ai.attempt` verdict so the provider's
 retry loop can classify it — the catching handler lives here, at the agent top, so the loop never nests one."
-agent anthropic_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io {
+agent anthropic_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
-    request prelude.throw(error: ai.step_error) -> never { break ai.attempt_err(error = error) }
+    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
+      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
+      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
+      // rethrows it toward the root, where the app's supervisor decides.
+      match (error) {
+        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
+        case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
+        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case rest -> { prelude.throw(error = rest) }
+      }
+    }
   }
   ai.attempt_ok(result = anthropic_infer_step(client = client, history = history, tool_metas = tool_metas))
 }
 
 @"ONE Anthropic structured-output attempt, the `anthropic_step_attempt` twin for `infer_object`."
-agent anthropic_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io {
+agent anthropic_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
-    request prelude.throw(error: ai.step_error) -> never { break ai.attempt_err(error = error) }
+    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
+      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
+      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
+      // rethrows it toward the root, where the app's supervisor decides.
+      match (error) {
+        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
+        case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
+        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
+        case rest -> { prelude.throw(error = rest) }
+      }
+    }
   }
   ai.attempt_ok(result = anthropic_infer_object(client = client, history = history, schema = schema))
 }
@@ -361,7 +381,7 @@ agent anthropic_infer_step(
     url = "https://api.anthropic.com/v1/messages",
     body = body,
     headers = {
-      "x-api-key" = client.api_key,
+      "x-api-key" = credentials.resolve(source = client.source),
       "anthropic-version" = "2023-06-01",
     },
   )
@@ -402,7 +422,7 @@ agent anthropic_infer_object(
     url = "https://api.anthropic.com/v1/messages",
     body = body,
     headers = {
-      "x-api-key" = client.api_key,
+      "x-api-key" = credentials.resolve(source = client.source),
       "anthropic-version" = "2023-06-01",
     },
   )

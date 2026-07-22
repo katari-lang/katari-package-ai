@@ -133,6 +133,26 @@ data attempt_err(error: step_error)
 // A step attempt's verdict: the result, or the caught error to classify and maybe retry. (Type synonyms take no docs.)
 type attempt[T] = attempt_ok[T] | attempt_err
 
+@"Two tools in one loop's tool list share a metadata name, so the model's pick could not be routed
+unambiguously (dispatch matches by name — the first match would silently win, and the other tool
+would be unreachable). A configuration defect the app fixes — a `prefix` on one of the colliding MCP
+connections, or a rename — typed so a supervisor reports it instead of the run panicking."
+data duplicate_tool(@"The name two tools share." name: string)
+
+@"Validate one step's assembled tool metadata: every name unique, or the typed `duplicate_tool`.
+Every loop runs its tool list through this once per turn, so a colliding list fails loudly at the
+first step instead of silently routing every pick to whichever tool sorts first."
+agent ensure_unique_names(metas: array[reflection.agent_metadata]) -> array[reflection.agent_metadata] {
+  for (let meta in metas, var seen: record[boolean] = record.empty()) {
+    if (record.has(target = seen, key = meta.name)) {
+      prelude.throw(error = duplicate_tool(name = meta.name))
+    } else {
+      next with { seen = record.set(target = seen, key = meta.name, value = true) }
+    }
+  } then (_metas) { null }
+  metas
+}
+
 @"Tool: load an image file into your visual context. Pass the file's handle object — a bare
 {\"$katari_ref\": \"<id>\"} suffices (copy the id from the conversation); the image content arrives with
 this tool's result, so you can see it on your next step."
@@ -150,45 +170,20 @@ agent infer_with_tools[effect E](
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
 ) -> string {
-  let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
-  for (let _step in array.range(start = 0, end = max_steps), var conversation: array[types.message] = history) {
-    match (infer_step(history = conversation, tool_metas = tool_metas)) {
-      // A one-shot loop RE-RAISES a provider failure at its own perform site, so the caller's handler
-      // (`solve`'s root handler) catches it — this loop is not long-lived, so propagating up is correct.
-      case inference_failed(error => error) -> { prelude.throw(error = error) }
-      case inferred(result => result) -> {
-        match (result.step) {
-          case types.step_final(text => reply_text) -> { break reply_text }
-          case types.step_call(calls => calls) -> {
-            // Dispatch every requested tool in parallel; results come back in request order, each
-            // tagged with its tool name + call id so it round-trips as a function response.
-            let results = parallel for (let call in calls) {
-              next dispatch_one[E](tools = tools, call = call)
-            }
-            // Record BOTH the model's call turn and the results turn so the next step replays the
-            // full call / response exchange.
-            let with_calls = array.append(target = conversation, value = types.call_turn(calls = calls))
-            next with { conversation = array.append(target = with_calls, value = types.result_turn(results = results)) }
-          }
-        }
-      }
-    }
-  } then (_steps) {
-    // Budget exhausted without the model committing to an answer. Rather than discard everything the
-    // tools gathered (the old "(no final answer within the step budget)" dead end), force ONE last
-    // tool-less step: with no tools the model cannot keep researching and must answer from the
-    // conversation it has built. A closing user turn tells it the budget is spent so it commits.
-    reply(
-      history = array.append(
-        target = conversation,
-        value = types.turn(
-          role = "user",
-          text = "You have used your entire tool-call budget. Do not call any more tools. Answer the original question now, as best you can, using only what you have already gathered.",
-          files = [],
-        ),
-      ),
-    )
-  }
+  // The one turn loop lives in `session_turn_loop`; this one-shot shape is that loop minus the
+  // conversation and the usage figure it threads (a caller who wants those calls it directly).
+  session_turn_loop[E](conversation = history, tools = tools, max_steps = max_steps).reply
+}
+
+@"The forced tool-less close every loop plays when its step budget runs out: a user turn telling the
+model the budget is spent, so ONE last step commits to an answer from what the tools already gathered
+instead of discarding it."
+agent budget_exhausted_turn() -> types.message {
+  types.turn(
+    role = "user",
+    text = "You have used your entire tool-call budget. Do not call any more tools. Answer the original question now, as best you can, using only what you have already gathered.",
+    files = [],
+  )
 }
 
 @"Find the tool whose metadata name is the model's pick and invoke it by value via
@@ -294,6 +289,16 @@ frames the summarization step; @keep_recent@ is how many trailing history elemen
 verbatim — extended forward to a clean `turn` boundary, so a call turn is never severed from the
 results that answer it."
 data compaction(threshold_tokens: integer, prompt: string, keep_recent: integer)
+
+@"The default compaction policy both session shapes fall back to: compact past 100k tokens,
+summarize under the standard self-note prompt, keep the last 8 history elements verbatim."
+agent default_compaction() -> compaction {
+  compaction(
+    threshold_tokens = 100000,
+    prompt = "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
+    keep_recent = 8,
+  )
+}
 
 @"The verdict on a measured context occupancy: still under the threshold, with the room left."
 data within_budget(@"Tokens still free under the threshold." remaining: integer)
@@ -417,7 +422,7 @@ agent session_turn_loop[effect E](
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
 ) -> session_turn {
-  let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
+  let tool_metas = ensure_unique_names(metas = for (let tool in tools) { next reflection.get_metadata(value = tool) })
   for (let _step in array.range(start = 0, end = max_steps), var state: session_turn = session_turn(reply = "", conversation = conversation, used_tokens = 0)) {
     match (infer_step(history = state.conversation, tool_metas = tool_metas)) {
       // A served session is one-shot per message, so a provider failure re-raises at the perform site
@@ -444,15 +449,8 @@ agent session_turn_loop[effect E](
       }
     }
   } then (_steps) {
-    // Budget exhausted: the same forced tool-less close as `infer_with_tools`.
-    let closing = array.append(
-      target = state.conversation,
-      value = types.turn(
-        role = "user",
-        text = "You have used your entire tool-call budget. Do not call any more tools. Answer the original question now, as best you can, using only what you have already gathered.",
-        files = [],
-      ),
-    )
+    // Budget exhausted: the shared forced tool-less close.
+    let closing = array.append(target = state.conversation, value = budget_exhausted_turn())
     let answer = reply(history = closing)
     session_turn(
       reply = answer,
@@ -475,24 +473,25 @@ agent serve_session[R, effect E](
   @"The conversation the model starts from (system framing, prior turns)." context: array[types.message],
   @"The tools of every turn's loop." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"The per-message step budget." max_steps: integer,
-  @"The context-occupancy threshold (tokens) that triggers compaction." threshold_tokens: integer ?= 100000,
-  @"The summarization instruction compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
-  @"How many trailing history elements survive compaction verbatim." keep_recent: integer ?= 8,
+  @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
   @"The session body: bridges a transport into `session_message`." continuation: agent (value: null) -> R with {...E, session_message},
 ) -> R {
-  let policy = compaction(threshold_tokens = threshold_tokens, prompt = compact_prompt, keep_recent = keep_recent)
+  let effective_policy = match (policy) {
+    case null -> default_compaction()
+    case given -> given
+  }
   use handler (var state: session_state = session_state(conversation = context, used_tokens = 0)) {
     request session_message(content: string, files: array[file]) {
       let asked = array.append(target = state.conversation, value = types.turn(role = "user", text = content, files = files))
       let outcome = session_turn_loop[E](conversation = asked, tools = tools, max_steps = max_steps)
-      match (classify_budget(used = outcome.used_tokens, policy = policy)) {
+      match (classify_budget(used = outcome.used_tokens, policy = effective_policy)) {
         case within_budget(remaining => _) -> {
           next outcome.reply with { state = session_state(conversation = outcome.conversation, used_tokens = outcome.used_tokens) }
         }
         case over_budget(used => _) -> {
           // The compacted context's occupancy is unknown until the next step measures it; 0 says
           // "not yet measured", never an estimate.
-          next outcome.reply with { state = session_state(conversation = compact(history = outcome.conversation, policy = policy), used_tokens = 0) }
+          next outcome.reply with { state = session_state(conversation = compact(history = outcome.conversation, policy = effective_policy), used_tokens = 0) }
         }
       }
     }
@@ -724,10 +723,10 @@ agent region_turn_loop[effect E](
   // The model sees every synchronous tool, every startable monitor, and the two monitor-control tools
   // (`cancel_monitor` to stop one, `list_monitors` to see what is running).
   let control_metas = [reflection.get_metadata(value = cancel_monitor), reflection.get_metadata(value = list_monitors)]
-  let tool_metas = array.concat(
+  let tool_metas = ensure_unique_names(metas = array.concat(
     left = array.concat(left = sync_metas, right = monitor_metas),
     right = control_metas,
-  )
+  ))
   for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry, used_tokens = 0)) {
     match (infer_step(history = session.conversation, tool_metas = tool_metas)) {
       // ABSORB a provider failure: abandon just this turn (notice out, marker in) and wait for the next
@@ -769,14 +768,7 @@ agent region_turn_loop[effect E](
     // Budget exhausted: force ONE tool-less step so the model commits to an answer instead of losing
     // everything the tools gathered (the same close as `infer_with_tools`) — but drive the seam directly so
     // a failure here is ABSORBED too, keeping the region loop total.
-    let closing = array.append(
-      target = session.conversation,
-      value = types.turn(
-        role = "user",
-        text = "You have used your entire tool-call budget. Do not call any more tools. Answer now using only what you have already gathered.",
-        files = [],
-      ),
-    )
+    let closing = array.append(target = session.conversation, value = budget_exhausted_turn())
     match (infer_step(history = closing, tool_metas = [])) {
       case inference_failed(error => error) -> {
         abandoned_turn(conversation = closing, registry = session.registry, used_tokens = session.used_tokens, error = error)
@@ -827,13 +819,14 @@ agent infer_with_region[effect E](
   @"The ONE output wire: called once per observation with the model's reply @text@ and any @files@ on it. Established like `discord.watch_messages`' `deliver_to` — the app supplies it, and its effects flow to the app's handlers." deliver_to: agent (text: string, files: array[file]) -> null with {...E, observation} | io,
   @"The per-observation step budget." max_steps: integer,
   @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. To SEE what monitors you currently have running, call list_monitors — it returns each running monitor's id, name, topic and schedule, so you never have to guess an id. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop. If a monitor fails it stops and sends you a 'Notification from monitor' saying so; start it again if you still need that watch.",
-  @"The context-occupancy threshold (tokens) that triggers a compaction of the running conversation." threshold_tokens: integer ?= 100000,
-  @"The summarization instruction a compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
-  @"How many trailing history elements survive a compaction verbatim." keep_recent: integer ?= 8,
+  @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
 ) -> never {
   // A region session never returns, so its conversation would grow without bound; the same compaction
   // policy `serve_session` uses folds it back under the threshold after any over-budget turn.
-  let policy = compaction(threshold_tokens = threshold_tokens, prompt = compact_prompt, keep_recent = keep_recent)
+  let effective_policy = match (policy) {
+    case null -> default_compaction()
+    case given -> given
+  }
   let nursery: region.nursery[ai_turn, {...E, observation} | io] = use region.provide[ai_turn, {...E, observation} | io]
   // The durable state (conversation + monitor registry + freshest occupancy) lives in the handler that
   // answers every observation, so every model turn — from a source or from a started monitor — shares one thread.
@@ -867,12 +860,12 @@ agent infer_with_region[effect E](
       // Classify the freshest measured occupancy against the policy, exactly as `serve_session` does: an
       // over-budget turn summarizes everything before the kept tail. (0 says "not yet measured" after a
       // compaction — the next step re-measures.)
-      match (classify_budget(used = outcome.session.used_tokens, policy = policy)) {
+      match (classify_budget(used = outcome.session.used_tokens, policy = effective_policy)) {
         case within_budget(remaining => _) -> {
           next null with { session = outcome.session }
         }
         case over_budget(used => _) -> {
-          next null with { session = region_session(conversation = compact(history = outcome.session.conversation, policy = policy), registry = outcome.session.registry, used_tokens = 0) }
+          next null with { session = region_session(conversation = compact(history = outcome.session.conversation, policy = effective_policy), registry = outcome.session.registry, used_tokens = 0) }
         }
       }
     }
@@ -880,6 +873,35 @@ agent infer_with_region[effect E](
   // Start the always-on inputs, then pump every fiber's observations up to the handler above forever.
   let _sources = for (let source in sources) { next region.fork(nursery = nursery, task = source, argument = null) }
   region.watch(nursery = nursery)
+}
+
+// ── ambient-context middleware ────────────────────────────────────────────────
+
+@"Middleware over the seam: EVERY `infer_step`, prepend @inject@'s freshly computed text as a user
+turn and re-perform outward to the ambient provider — the generalization of the bot-side pattern
+that re-injects the current time and a memory index each turn. Install it INSIDE the provider
+(`use gemini.provider(...)` then `use ai.with_context(inject = ...)`), so the re-performed step
+reaches the model. An EMPTY injection skips the extra turn; the injected turn is never part of the
+conversation a loop persists (it is derived fresh each step, so persisting it would double it).
+`infer_object` passes through un-injected — structured extraction states its own context."
+agent with_context[R, effect E](
+  @"Computes the note to prepend this step — ambient state (the time, a memory index), fresh each step." inject: agent (value: null) -> string with {...E, infer_step},
+  @"The program to run with the injection installed." continuation: agent (value: null) -> R with {...E, infer_step},
+) -> R with E | infer_step {
+  use handler {
+    request infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> step_outcome {
+      let note = inject(value = null)
+      let injected = if (note == "") {
+        history
+      } else {
+        array.concat(left = [types.turn(role = "user", text = note, files = [])], right = history)
+      }
+      // Re-performing escalates PAST this handler to the ambient provider — the outward re-perform
+      // semantics a rethrown request uses.
+      next infer_step(history = injected, tool_metas = tool_metas)
+    }
+  }
+  continuation(value = null)
 }
 
 // ── wire tool names ───────────────────────────────────────────────────────────
