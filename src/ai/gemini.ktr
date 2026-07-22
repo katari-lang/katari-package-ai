@@ -16,10 +16,11 @@ data connection(model: string, api_key: string of private, system: string, retry
 @"Serve `ai.infer_step` over Gemini for the extent of the continuation:
 `use gemini.provider(model = \"gemini-3.5-flash\", api_key = env.get_secret(key = \"GEMINI_API_KEY\"))`.
 A step's provider failure (malformed JSON, a non-2xx status, a transport failure — `ai.step_error`) is
-raised here, at the provider's use site — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped
-connection) is first retried with exponential backoff (up to @retry_attempts@ attempts from
+handed back as an `ai.inference_failed` OUTCOME, never thrown — but a TRANSIENT one (a 429 rate limit, a
+5xx, a dropped connection) is first retried with exponential backoff (up to @retry_attempts@ attempts from
 @retry_base_ms@), so a passing rate limit no longer ends a long-lived loop; only a fatal error or an
-exhausted budget surfaces."
+exhausted budget surfaces, and it surfaces as a value the loop handles at its own perform site, not a throw
+out of this deep handler."
 agent provider[R, effect E](
   model: string,
   api_key: string of private,
@@ -27,7 +28,7 @@ agent provider[R, effect E](
   retry_attempts: integer ?= 6,
   retry_base_ms: number ?= 2000.0,
   continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
-) -> R with E | io | prelude.throw[ai.step_error] {
+) -> R with E | io {
   use handler (var client = connection(model = model, api_key = api_key, system = system, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
       // Retry a transient step with exponential backoff; a fatal error (a non-retryable status, malformed
@@ -35,10 +36,12 @@ agent provider[R, effect E](
       // lives in its own agent so the loop never nests a handler (only pure classification is inline here).
       next for (let attempt in array.range(start = 0, end = client.retry_attempts), var pending: null = null) {
         match (gemini_step_attempt(client = client, history = history, tool_metas = tool_metas)) {
-          case ai.attempt_ok(result => result) -> { break result }
+          case ai.attempt_ok(result => result) -> { break ai.inferred(result = result) }
           case ai.attempt_err(error => error) -> {
             if (!ai.is_transient(error = error) || attempt + 1 >= client.retry_attempts) {
-              prelude.throw(error = error)
+              // The provider never THROWS a step failure: a fatal error or an exhausted retry budget resolves
+              // the seam with `inference_failed`, so the failure reaches the loop's perform site as a value.
+              break ai.inference_failed(error = error)
             } else {
               time.sleep(milliseconds = ai.backoff_ms(attempt = attempt, base_ms = client.retry_base_ms))
               next with { pending = null }
@@ -47,16 +50,18 @@ agent provider[R, effect E](
         }
       } then (_attempts) {
         // Only reachable when retry_attempts < 1 (the loop never ran); otherwise the loop breaks or throws.
-        prelude.throw(error = http.fetch_error(message = "gemini step not attempted (retry_attempts must be >= 1)"))
+        ai.inference_failed(error = http.fetch_error(message = "gemini step not attempted (retry_attempts must be >= 1)"))
       }
     }
     request ai.infer_object(history: array[types.message], schema: unknown) {
       next for (let attempt in array.range(start = 0, end = client.retry_attempts), var pending: null = null) {
         match (gemini_object_attempt(client = client, history = history, schema = schema)) {
-          case ai.attempt_ok(result => result) -> { break result }
+          case ai.attempt_ok(result => result) -> { break ai.inferred(result = result) }
           case ai.attempt_err(error => error) -> {
             if (!ai.is_transient(error = error) || attempt + 1 >= client.retry_attempts) {
-              prelude.throw(error = error)
+              // The provider never THROWS a step failure: a fatal error or an exhausted retry budget resolves
+              // the seam with `inference_failed`, so the failure reaches the loop's perform site as a value.
+              break ai.inference_failed(error = error)
             } else {
               time.sleep(milliseconds = ai.backoff_ms(attempt = attempt, base_ms = client.retry_base_ms))
               next with { pending = null }
@@ -64,7 +69,7 @@ agent provider[R, effect E](
           }
         }
       } then (_attempts) {
-        prelude.throw(error = http.fetch_error(message = "gemini object step not attempted (retry_attempts must be >= 1)"))
+        ai.inference_failed(error = http.fetch_error(message = "gemini object step not attempted (retry_attempts must be >= 1)"))
       }
     }
   }
