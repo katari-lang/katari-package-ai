@@ -29,12 +29,6 @@ request infer_step(history: array[types.message], tool_metas: array[reflection.a
 // only JSON failure a step can raise is that parse. (Type synonyms take no docs.)
 type step_error = json.parse_error | http.status_error | http.fetch_error
 
-// What the loop itself can raise: a bad dynamic dispatch — a hallucinated tool call whose args fail
-// the tool's schema at the delegation boundary (`reflection.call_error`). The model's args ride as a
-// plain value and dispatch straight through `reflection.call_agent`, whose boundary unconditionally
-// turns any replayed `$katari_ref` into the `file` it denotes, so there is no separate step to fail here.
-type loop_error = reflection.call_error
-
 @"One structured-output step over the conversation — the seam's second request, served by the same
 provider handler as `infer_step`. @schema@ is the JSON Schema the reply must conform to (each
 provider maps it onto its native constrained decoding); the result carries the decoded object and
@@ -76,7 +70,7 @@ its tool by name and invokes it by value via `reflection.call_agent`, validating
 against the tool's schema), then feed every result back as a new turn; on a final answer, return it."
 agent infer_with_tools[effect E](
   history: array[types.message],
-  tools: array[agent never -> unknown with E],
+  tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
 ) -> string {
   let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
@@ -118,24 +112,37 @@ agent infer_with_tools[effect E](
 `reflection.call_agent` (the model's args ride as a plain value, and the delegation boundary
 validates them against the tool's schema — the compiled signature of a Katari agent, or the
 server-declared schema of an MCP tool — while the boundary's unconditional wire→value conversion turns
-any replayed `$katari_ref` into the `file` it denotes). A hallucinated name or a panicking tool is fed
-back as an error result so the model corrects on the next step; genuinely malformed args are a
-`reflection.call_error` that escalates to the app root (`loop_error`). The result's `file` values are
-collected off the result tree so the provider can show them to the model (their `$katari_ref` handles
-are already visible in the result text)."
-agent dispatch_one[effect E](tools: array[agent never -> unknown with E], call: types.tool_call) -> types.tool_result {
-  // A failing tool must never fail the conversation — that is the loop's whole premise. A panic (a
-  // crashed handler) escaping THIS call becomes an error result the model reads and corrects on its
-  // next step, instead of escalating to the app root. Only a `panic` folds back here, not a typed
-  // `throw`: a `throw` handler's overwrite semantics require the tools' abstract effect generic `E` to
-  // EXCLUDE `throw`, which a generic-over-tools loop cannot promise, so a tool's own `throw[my_error]`
-  // (and the dispatch's `throw[call_error]` = `loop_error`) still escalate to the app root as before.
+any replayed `$katari_ref` into the `file` it denotes). Every way a call can go wrong is fed back to the
+model as an error result it reads and corrects on its next step: a hallucinated name (nothing matches), a
+tool that panics, a tool's own typed `throw`, and malformed args (a `reflection.call_error` from the
+boundary) alike — none of them reaches the app root. The result's `file` values are collected off the
+result tree so the provider can show them to the model (their `$katari_ref` handles are already visible in
+the result text)."
+agent dispatch_one[effect E](tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}], call: types.tool_call) -> types.tool_result {
+  // A failing tool must never fail the conversation — that is the loop's whole premise, and it holds for
+  // BOTH ways a call can crash: a `panic` (a crashed handler) and any typed `throw` — the tool's own
+  // `throw[my_error]` and the boundary's `throw[call_error]` for hallucinated args alike — fold back HERE
+  // as an error result the model reads and corrects on its next step, instead of escalating to the app
+  // root. This is why the tools' effect is spelled `{...E, prelude.throw[unknown]}`: `E` stays throw-free,
+  // every error a tool can raise rides the EXPLICIT `prelude.throw[unknown]`, and the `throw(error: unknown)`
+  // handler below discharges exactly that row — so `E` escalates untouched while every tool failure returns
+  // to the model as feedback it can act on (a bad-arguments hallucination becomes self-correcting too).
   use handler {
     request panic(msg: string) {
       break types.tool_result(
         name = call.name,
         call_id = call.opaque,
         text = f"(tool failed: ${msg})",
+        files = [],
+      )
+    }
+  }
+  use handler {
+    request prelude.throw(error: unknown) -> never {
+      break types.tool_result(
+        name = call.name,
+        call_id = call.opaque,
+        text = f"(tool failed: ${json.stringify(value = error)})",
         files = [],
       )
     }
@@ -317,7 +324,7 @@ step's input covers the whole context, so only the freshest figure is the occupa
 add)."
 agent session_turn_loop[effect E](
   conversation: array[types.message],
-  tools: array[agent never -> unknown with E],
+  tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
 ) -> session_turn {
   let tool_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
@@ -370,7 +377,7 @@ for `infer_with_tools`; the continuation bridges its transport into `session_mes
 never returns (a `watch_messages` loop)."
 agent serve_session[R, effect E](
   @"The conversation the model starts from (system framing, prior turns)." context: array[types.message],
-  @"The tools of every turn's loop." tools: array[agent never -> unknown with E],
+  @"The tools of every turn's loop." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"The per-message step budget." max_steps: integer,
   @"The context-occupancy threshold (tokens) that triggers compaction." threshold_tokens: integer ?= 100000,
   @"The summarization instruction compaction frames its step with." compact_prompt: string ?= "Summarize the following conversation for your own future reference: keep every fact, decision, open question, and personal detail you might need again; drop the pleasantries and the dead ends. Answer with the summary only.",
@@ -467,7 +474,7 @@ its id), or run a SYNCHRONOUS tool (anything else — `dispatch_one`, exactly as
 Returns the model-facing result with the possibly-grown registry."
 agent route_region_call[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
-  @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with E],
+  @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"The startable monitors (forked detached), each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry (id → fiber)." registry: record[region.fiber[ai_turn, never]],
   @"The model's tool call." call: types.tool_call,
@@ -546,7 +553,7 @@ Returns the reply plus the advanced session (conversation + monitor registry)."
 agent region_turn_loop[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
   @"The conversation to advance (the observation already injected)." conversation: array[types.message],
-  @"The synchronous tools." tools: array[agent never -> unknown with E],
+  @"The synchronous tools." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"The startable monitors, each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry." registry: record[region.fiber[ai_turn, never]],
   @"The per-turn step budget." max_steps: integer,
@@ -630,7 +637,7 @@ the freshest measured occupancy is classified against @threshold_tokens@ and, ov
 summarized back down (`compact`, the same policy as `serve_session`)."
 agent infer_with_region[effect E](
   @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
-  @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with E],
+  @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"Startable monitors, each authored `agent (topic, schedule)`: forked detached when the model calls one (with the model's topic + schedule), they notify through `observation`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
   @"The per-observation step budget." max_steps: integer,
