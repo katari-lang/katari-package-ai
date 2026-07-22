@@ -56,6 +56,52 @@ agent infer_structured[T](history: array[types.message]) -> T {
   json.validate[T](value = result.value)
 }
 
+// ── transient retry: the provider layer's resilience ──────────────────────────
+//
+// A provider's `infer_step` / `infer_object` handler runs at the app root (its `use` site), ABOVE the
+// loop — so a step failure (`step_error`) surfaces THERE and the tool loop cannot catch it (the loop is the
+// handler's continuation, not an enclosing handler). A transient failure — a 429 rate limit, a 5xx, a
+// dropped connection — would therefore end a long-lived bot. The fix lives where the error IS catchable:
+// inside the provider's own handler body, whose effect row is CONCRETE, so a `prelude.throw[step_error]`
+// handler discharges it (the same shape as an app's resilient `try_send`). Each provider retries a
+// transient step with exponential backoff; these two pure helpers make the decision, and the retry loop
+// itself lives in each handler body — a callback-wrapped `retry(task)` would commonise the whole thing,
+// which is not the point (the decision is the shared part, not the control flow).
+
+@"Whether a step error is TRANSIENT — worth a backoff and a retry — as opposed to fatal. A transport
+failure (`http.fetch_error`: DNS, a refused connection, a timeout, a mid-flight restart) is always
+transient; a status error is transient for 408 (request timeout), 429 (rate limit) and any 5xx
+(server-side), and fatal for every other status (401/403/404 … — a retry will not fix them); a
+`json.parse_error` is fatal (a malformed body will not parse on a retry)."
+agent is_transient(error: step_error) -> boolean {
+  match (error) {
+    case http.fetch_error(message => _) -> true
+    case http.status_error(status => status, body => _) -> status == 408 || status == 429 || status >= 500
+    case json.parse_error(message => _) -> false
+  }
+}
+
+@"The backoff delay in milliseconds before retry @attempt@ (0-based): @base_ms@ doubled per attempt (base,
+2×base, 4×base, …) and capped at one minute, so a long outage does not sleep unboundedly between the final
+tries."
+agent backoff_ms(attempt: integer, base_ms: number) -> number {
+  let grown = for (let _step in array.range(start = 0, end = attempt), var delay: number = base_ms) {
+    next with { delay = delay * 2.0 }
+  } then (_steps) { delay }
+  math.min(left = grown, right = 60000.0)
+}
+
+@"The outcome of ONE provider step attempt, threaded back to a provider's retry loop: the step's @result@
+on success. A provider's per-attempt helper catches a `step_error` into `attempt_err` so the loop can
+classify it (`is_transient`) and either back off and retry or propagate."
+data attempt_ok[T](result: T)
+
+@"The outcome of ONE provider step attempt: the @error@ the attempt caught, for the retry loop to classify."
+data attempt_err(error: step_error)
+
+// A step attempt's verdict: the result, or the caught error to classify and maybe retry. (Type synonyms take no docs.)
+type attempt[T] = attempt_ok[T] | attempt_err
+
 @"Tool: load an image file into your visual context. Pass the file's handle object — a bare
 {\"$katari_ref\": \"<id>\"} suffices (copy the id from the conversation); the image content arrives with
 this tool's result, so you can see it on your next step."
@@ -415,10 +461,10 @@ agent serve_session[R, effect E](
 //
 // Structured concurrency forces the shape. `region.provide` CANCELS every still-running fiber when its
 // continuation returns, so for a monitor to outlive the reply that started it the loop MUST NOT return —
-// it runs for the session's lifetime. Hence `infer_with_region` returns `never`, and the model's replies
-// leave through the `observation` channel (each reply is the answer handed back to the fiber that
-// reported), not through a return value. `infer_with_tools` (the fork-join loop) stays for the plain
-// request/response case; this is its long-lived sibling.
+// it runs for the session's lifetime. Hence `infer_with_region` returns `never`. INPUT and OUTPUT are
+// separate wires: the `observation` channel is fire-and-forget (a source or monitor only reports an
+// event), and each turn's reply leaves through the separate `deliver_to` sink. `infer_with_tools` (the
+// fork-join loop) stays for the plain request/response case; this is its long-lived sibling.
 
 // The per-nursery scope marker for this module's region — region.ktr's "declare one marker per nursery"
 // rule. A nullary phantom: `region.provide` mints it for the loop's continuation and discharges it from
@@ -426,13 +472,14 @@ agent serve_session[R, effect E](
 @"The `infer_with_region` nursery scope: a nullary phantom marker carried by every monitor fiber, minted and discharged by the loop's `region.provide` so no fiber outlives the loop."
 effect ai_turn
 
-@"THE monitor→model channel: a background monitor reports @content@ (plus any @files@ attached to it)
-from @source@ and receives the model's answer back. It is the only effect a monitor raises besides
-`io`, which pins the nursery's ceiling to one row so a single `region.watch` covers every monitor. A
-`source` fiber or a started monitor performs it; the loop's own handler answers it by running a model
-turn over the injected report. @files@ ride the injection turn's `files` slot — the same text + files
-split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
-request observation(@"Which monitor is reporting (e.g. \"slack\")." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> string
+@"THE monitor→model channel: a background monitor pushes @content@ (plus any @files@ attached to it) from
+@source@ into the model's context. FIRE-AND-FORGET (`-> null`): a source or monitor only reports an event —
+the model's reply is NOT handed back here but delivered on the separate `deliver_to` wire. It is the only
+effect a monitor raises besides `io`, which pins the nursery's ceiling to one row so a single `region.watch`
+covers every monitor. A `source` fiber or a started monitor performs it; the loop's own handler answers it
+by running a model turn over the injected report. @files@ ride the injection turn's `files` slot — the same
+text + files split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
+request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> null
 
 @"What the model supplies when it STARTS a monitor: a free-text @topic@ naming exactly what to watch (empty
 falls back to the monitor's default target), and an optional cron @schedule@ (a 5- or 6-field expression,
@@ -449,8 +496,8 @@ measured context occupancy @used_tokens@ (0 until a step has run, and again righ
 until the next step re-measures). The id is what the model holds and passes back to stop a monitor."
 data region_session(conversation: array[types.message], registry: record[region.fiber[ai_turn, never]], used_tokens: integer)
 
-@"One model turn's outcome: the @reply@ handed back to the reporting fiber, plus the advanced @session@
-the loop persists for the next observation."
+@"One model turn's outcome: the @reply@ the loop hands to `deliver_to`, plus the advanced @session@ the
+loop persists for the next observation."
 data region_turn_result(reply: string, session: region_session)
 
 @"One routed tool call: the model-facing @result@ plus the possibly-grown monitor @registry@ (a started
@@ -620,17 +667,19 @@ agent region_turn_loop[effect E](
 @"Run the tool-using model loop over a `region` nursery, so the model can START background monitors and
 STOP them — the long-lived sibling of `infer_with_tools`. @tools@ are synchronous (called and awaited,
 exactly as `infer_with_tools`); @monitors@ are startable background fibers the model launches as tools
-(each forks detached and notifies the model through `observation`) and stops with `cancel_monitor`;
+(each forks detached and reports through `observation`) and stops with `cancel_monitor`;
 @sources@ are always-on input fibers forked at startup (e.g. a chat watcher that turns each user message
 into an `observation`) and are NOT shown as tools. @context@ seeds the conversation the model always
 sees, and @region_instructions@ (overridable) teaches the model the start / stop protocol, since a model
 is trained on tool calls but not on this fork / cancel discipline.
 
+INPUT and OUTPUT are separate wires. `observation` is fire-and-forget — a source or monitor only reports an
+event — and each turn's reply is delivered by @deliver_to@, the ONE place output is wired; a source /
+monitor never sends a reply.
+
 Returns `never`: structured concurrency cancels every fiber when the nursery closes, so to keep monitors
-alive the loop never returns — the model's replies leave through the `observation` channel (each is the
-answer handed to the fiber that reported), and the loop runs until the run is cancelled. The provider
-(`use gemini.provider(...)` …) and any @E@ handlers are installed by the caller, exactly as for
-`infer_with_tools`.
+alive the loop never returns — it runs until the run is cancelled. The provider (`use gemini.provider(...)`
+…) and any @E@ handlers are installed by the caller, exactly as for `infer_with_tools`.
 
 COMPACTION: unlike the plain loop, the conversation never resets across observations, so after each turn
 the freshest measured occupancy is classified against @threshold_tokens@ and, over it, the conversation is
@@ -640,6 +689,7 @@ agent infer_with_region[effect E](
   @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"Startable monitors, each authored `agent (topic, schedule)`: forked detached when the model calls one (with the model's topic + schedule), they notify through `observation`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
+  @"The ONE output wire: called once per observation with the model's reply @text@ and any @files@ on it. Established like `discord.watch_messages`' `deliver_to` — the app supplies it, and its effects flow to the app's handlers." deliver_to: agent (text: string, files: array[file]) -> null with {...E, observation} | io,
   @"The per-observation step budget." max_steps: integer,
   @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop. If a monitor fails it stops and sends you a 'Notification from monitor' saying so; start it again if you still need that watch.",
   @"The context-occupancy threshold (tokens) that triggers a compaction of the running conversation." threshold_tokens: integer ?= 100000,
@@ -660,7 +710,7 @@ agent infer_with_region[effect E](
     registry = record.empty(),
     used_tokens = 0,
   )) {
-    request observation(source: string, content: string, files: array[file]) -> string {
+    request observation(source: string, content: string, files: array[file]) {
       // The report's files ride the injection turn's `files` slot, exactly as an ordinary user turn's
       // attachments — so the provider's existing inline policy (`gemini_file_parts` /
       // `anthropic_turn_content`) shows the model any attached image with no observation-specific path.
@@ -676,15 +726,18 @@ agent infer_with_region[effect E](
         registry = session.registry,
         max_steps = max_steps,
       )
+      // Deliver this turn's reply on the separate output wire. The model's final text carries no files of
+      // its own, so the `files` slot is empty; `observation` itself resolves with `null` (fire-and-forget).
+      deliver_to(text = outcome.reply, files = [])
       // Classify the freshest measured occupancy against the policy, exactly as `serve_session` does: an
       // over-budget turn summarizes everything before the kept tail. (0 says "not yet measured" after a
       // compaction — the next step re-measures.)
       match (classify_budget(used = outcome.session.used_tokens, policy = policy)) {
         case within_budget(remaining => _) -> {
-          next outcome.reply with { session = outcome.session }
+          next null with { session = outcome.session }
         }
         case over_budget(used => _) -> {
-          next outcome.reply with { session = region_session(conversation = compact(history = outcome.session.conversation, policy = policy), registry = outcome.session.registry, used_tokens = 0) }
+          next null with { session = region_session(conversation = compact(history = outcome.session.conversation, policy = policy), registry = outcome.session.registry, used_tokens = 0) }
         }
       }
     }

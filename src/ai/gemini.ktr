@@ -9,29 +9,84 @@
 import ai
 import ai.types
 
-@"A Gemini connection: the model id, the API key, and an optional system instruction. Provider
-handler state — built once per `use gemini.provider(...)`."
-data connection(model: string, api_key: string of private, system: string)
+@"A Gemini connection: the model id, the API key, an optional system instruction, and the transient-retry
+budget (@retry_attempts@ / @retry_base_ms@). Provider handler state — built once per `use gemini.provider(...)`."
+data connection(model: string, api_key: string of private, system: string, retry_attempts: integer, retry_base_ms: number)
 
 @"Serve `ai.infer_step` over Gemini for the extent of the continuation:
 `use gemini.provider(model = \"gemini-3.5-flash\", api_key = env.get_secret(key = \"GEMINI_API_KEY\"))`.
-A step's provider failure (malformed JSON, a non-2xx status, a transport failure — `ai.step_error`)
-is raised here, at the provider's use site."
+A step's provider failure (malformed JSON, a non-2xx status, a transport failure — `ai.step_error`) is
+raised here, at the provider's use site — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped
+connection) is first retried with exponential backoff (up to @retry_attempts@ attempts from
+@retry_base_ms@), so a passing rate limit no longer ends a long-lived loop; only a fatal error or an
+exhausted budget surfaces."
 agent provider[R, effect E](
   model: string,
   api_key: string of private,
   system: string ?= "",
+  retry_attempts: integer ?= 6,
+  retry_base_ms: number ?= 2000.0,
   continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[ai.step_error] {
-  use handler (var client = connection(model = model, api_key = api_key, system = system)) {
+  use handler (var client = connection(model = model, api_key = api_key, system = system, retry_attempts = retry_attempts, retry_base_ms = retry_base_ms)) {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
-      next gemini_infer_step(client = client, history = history, tool_metas = tool_metas)
+      // Retry a transient step with exponential backoff; a fatal error (a non-retryable status, malformed
+      // JSON) or an exhausted budget propagates to the use site. The attempt handler (`gemini_step_attempt`)
+      // lives in its own agent so the loop never nests a handler (only pure classification is inline here).
+      next for (let attempt in array.range(start = 0, end = client.retry_attempts), var pending: null = null) {
+        match (gemini_step_attempt(client = client, history = history, tool_metas = tool_metas)) {
+          case ai.attempt_ok(result => result) -> { break result }
+          case ai.attempt_err(error => error) -> {
+            if (!ai.is_transient(error = error) || attempt + 1 >= client.retry_attempts) {
+              prelude.throw(error = error)
+            } else {
+              time.sleep(milliseconds = ai.backoff_ms(attempt = attempt, base_ms = client.retry_base_ms))
+              next with { pending = null }
+            }
+          }
+        }
+      } then (_attempts) {
+        // Only reachable when retry_attempts < 1 (the loop never ran); otherwise the loop breaks or throws.
+        prelude.throw(error = http.fetch_error(message = "gemini step not attempted (retry_attempts must be >= 1)"))
+      }
     }
     request ai.infer_object(history: array[types.message], schema: unknown) {
-      next gemini_infer_object(client = client, history = history, schema = schema)
+      next for (let attempt in array.range(start = 0, end = client.retry_attempts), var pending: null = null) {
+        match (gemini_object_attempt(client = client, history = history, schema = schema)) {
+          case ai.attempt_ok(result => result) -> { break result }
+          case ai.attempt_err(error => error) -> {
+            if (!ai.is_transient(error = error) || attempt + 1 >= client.retry_attempts) {
+              prelude.throw(error = error)
+            } else {
+              time.sleep(milliseconds = ai.backoff_ms(attempt = attempt, base_ms = client.retry_base_ms))
+              next with { pending = null }
+            }
+          }
+        }
+      } then (_attempts) {
+        prelude.throw(error = http.fetch_error(message = "gemini object step not attempted (retry_attempts must be >= 1)"))
+      }
     }
   }
   continuation(value = null)
+}
+
+@"ONE Gemini step attempt, catching any `step_error` into an `ai.attempt` verdict so the provider's retry
+loop can classify it and decide to back off / retry or propagate — the handler that catches it lives here,
+at the agent top, so the loop that drives retries never nests a handler."
+agent gemini_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io {
+  use handler {
+    request prelude.throw(error: ai.step_error) -> never { break ai.attempt_err(error = error) }
+  }
+  ai.attempt_ok(result = gemini_infer_step(client = client, history = history, tool_metas = tool_metas))
+}
+
+@"ONE Gemini structured-output attempt, the `gemini_step_attempt` twin for `infer_object`."
+agent gemini_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io {
+  use handler {
+    request prelude.throw(error: ai.step_error) -> never { break ai.attempt_err(error = error) }
+  }
+  ai.attempt_ok(result = gemini_infer_object(client = client, history = history, schema = schema))
 }
 
 // ── request body (built directly as a raw value tree) ─────────────────────────

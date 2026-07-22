@@ -35,6 +35,13 @@ Anthropic providers post an `http.json` value tree with `http.fetch` (so a turn'
 base64 at the send boundary, never on the value plane), OpenAI a plain-body `http.post_json`; every
 request body is built and every response parsed as `json` values in Katari.
 
+**Transient retry.** Each provider retries a transient step failure — a 429 rate limit, a 5xx, a dropped
+connection — with exponential backoff before surfacing it, so a passing rate limit does not end a
+long-lived loop (the handler that catches the step runs at the provider's use site, above the loop, so the
+loop itself cannot). `retry_attempts` (default 6) and `retry_base_ms` (default 2000, doubled per retry and
+capped at one minute) tune it. A fatal error (a non-retryable 4xx, malformed JSON) or an exhausted budget
+still surfaces at the provider's use site.
+
 ## Secrets / env
 
 - A model API key, provided to whichever provider you `use`:
