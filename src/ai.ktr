@@ -530,6 +530,23 @@ by running a model turn over the injected report. @files@ ride the injection tur
 text + files split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
 request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> null
 
+@"A monitor body reduced to its essence: on every occurrence of @schedule@, inject the freshly
+computed @prompt@ into the model's context as an observation from @source@ — the scheduled
+self-prompt every periodic watcher (check a repo, track a topic, look at a calendar) hand-rolled as
+its own `time.watch` adapter. @prompt@ is an agent so each tick recomputes it (an env-configured
+target re-reads, a date renders current); its effects @E@ flow to the app's handlers. Never returns:
+fork it as a monitor (the region loop does when the model starts one) and cancel it to stop."
+agent watch_prompt[effect E](
+  @"Which watcher is reporting; labels the injection turn (e.g. \"repo-issues\")." source: string,
+  @"Computes the report to inject, fresh at every occurrence." prompt: agent (value: null) -> string with E,
+  @"When occurrences fire: `time.interval(...)` or `time.cron(...)`." schedule: time.schedule,
+) -> never with {...E, observation} | io {
+  agent tick(time: number) -> null with {...E, observation} {
+    observation(source = source, content = prompt(value = null), files = [])
+  }
+  time.watch(schedule = schedule, deliver_to = tick)
+}
+
 @"What the model supplies when it STARTS a monitor: a free-text @topic@ naming exactly what to watch (empty
 falls back to the monitor's default target), and an optional cron @schedule@ (a 5- or 6-field expression,
 e.g. \"0 9 * * 1\" for every Monday at 09:00; empty means the monitor's own default cadence). `region.fork`
