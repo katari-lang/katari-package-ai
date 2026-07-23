@@ -183,6 +183,27 @@ agent infer_with_tools[effect E](
   session_turn_loop[E](conversation = history, tools = tools, max_steps = max_steps).reply
 }
 
+@"WHO a step is on behalf of: the @author@ of the NEWEST user turn in @history@ — taken AS-IS, null
+included, with no further scanning back. The newest user turn is the turn that triggered the current
+model turn, so a system-triggered turn (a monitor tick, whose injection carries `author = null`)
+shields the earlier human turns instead of misattributing the step to whoever spoke last; the
+loop-synthesized user turns (the budget close, the empty-final renudge) are also null and likewise
+read as unattributed. Providers lift a non-null result into their end-user metadata field
+(Anthropic's `metadata.user_id`, OpenAI's `safety_identifier`); Gemini has no such field and ignores
+it."
+agent attribution(history: array[types.message]) -> string | null {
+  for (let message in history, var newest: string | null = null) {
+    match (message) {
+      case types.turn(role => role, text => _, files => _, author => author) -> {
+        // A LATER user turn always overwrites — a null author on the newest user turn deliberately
+        // erases an earlier human's tag rather than letting the scan reach past the trigger.
+        if (role == "user") { next with { newest = author } } else { next with { newest = newest } }
+      }
+      case _ -> { next with { newest = newest } }
+    }
+  } then (_messages) { newest }
+}
+
 @"The one-shot renudge a loop plays when the model's final step came back EMPTY: an empty string is
 a lost answer in an interactive exchange (a thinking model can finish a heavy turn with only thought
 parts and no text), so the loop asks ONCE for a plain-text answer before accepting the silence. The
@@ -564,7 +585,7 @@ effect a monitor raises besides `io`, which pins the nursery's ceiling to one ro
 covers every monitor. A `source` fiber or a started monitor performs it; the loop's own handler answers it
 by running a model turn over the injected report. @files@ ride the injection turn's `files` slot — the same
 text + files split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
-request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file]) -> null
+request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a monitor tick). Rides the injection turn's `author`, so the triggered turn's requests carry the right abuse-attribution metadata." author: string | null ?= null) -> null
 
 @"A monitor body reduced to its essence: on every occurrence of @schedule@, inject the freshly
 computed @prompt@ into the model's context as an observation from @source@ — the scheduled
@@ -924,13 +945,13 @@ agent infer_with_region[effect E](
     registry = record.empty(),
     used_tokens = 0,
   )) {
-    request observation(source: string, content: string, files: array[file]) {
+    request observation(source: string, content: string, files: array[file], author: string | null) {
       // The report's files ride the injection turn's `files` slot, exactly as an ordinary user turn's
       // attachments — so the provider's existing inline policy (`gemini_file_parts` /
       // `anthropic_turn_content`) shows the model any attached image with no observation-specific path.
       let injected = array.append(
         target = session.conversation,
-        value = types.turn(role = "user", text = f"Notification from ${source}:\n${content}", files = files),
+        value = types.turn(role = "user", text = f"Notification from ${source}:\n${content}", files = files, author = author),
       )
       let outcome = region_turn_loop[E](
         nursery = nursery,

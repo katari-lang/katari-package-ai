@@ -200,18 +200,21 @@ agent openai_function_tool(meta: reflection.agent_metadata, map: ai.name_map) ->
 // OpenAI stays handle-only).
 agent openai_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata], map: ai.name_map) -> unknown {
   let messages = openai_messages(client = client, history = history, map = map)
+  let base: record[unknown] = {
+    model = client.model,
+    messages = messages,
+  }
+  // The newest user turn's opaque author tag rides `safety_identifier` (the successor of the
+  // deprecated `user` field) for abuse attribution; the field is omitted when no author flows.
+  let with_attribution = match (ai.attribution(history = history)) {
+    case null -> base
+    case author -> record.set(target = base, key = "safety_identifier", value = author)
+  }
   if (array.length(target = tool_metas) == 0) {
-    {
-      model = client.model,
-      messages = messages,
-    }
+    with_attribution
   } else {
     let tools = for (let meta in tool_metas) { next openai_function_tool(meta = meta, map = map) }
-    {
-      model = client.model,
-      messages = messages,
-      tools = tools,
-    }
+    record.set(target = with_attribution, key = "tools", value = tools)
   }
 }
 

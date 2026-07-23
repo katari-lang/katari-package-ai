@@ -285,15 +285,22 @@ agent anthropic_request_body(
   } else {
     record.set(target = base, key = "system", value = client.system)
   }
+  // The newest user turn's opaque author tag becomes the abuse-attribution metadata — the field is
+  // omitted entirely for an unattributed step (a monitor tick, a loop-synthesized close), keeping
+  // the wire unchanged when no author flows.
+  let with_metadata = match (ai.attribution(history = history)) {
+    case null -> with_system
+    case author -> record.set(target = with_system, key = "metadata", value = { user_id = author })
+  }
   // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
   // slot contract base64s each `file` leaf — the image `data` slots placed directly above — in place at
   // the send boundary, so the bytes never land on the value plane. A tool schema's literal `$ref` /
   // `$defs` keys ride verbatim because `meta.input` is already a document value spliced in as-is.
   if (array.length(target = tool_metas) == 0) {
-    with_system
+    with_metadata
   } else {
     let tools = for (let meta in tool_metas) { next anthropic_tool(meta = meta, map = map) }
-    record.set(target = with_system, key = "tools", value = tools)
+    record.set(target = with_metadata, key = "tools", value = tools)
   }
 }
 

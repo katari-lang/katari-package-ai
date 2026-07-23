@@ -5,8 +5,12 @@
 
 @"One turn in a conversation: who spoke (\"user\" / \"model\"), what they said, and any files attached
 to it (a Discord attachment, a generated image). Files ride as blob handles; each provider decides
-when to inline their content for the model (see the providers' inline policy)."
-data turn(role: string, text: string, files: array[file])
+when to inline their content for the model (see the providers' inline policy). @author@ is the
+OPTIONAL opaque end-user tag of a user turn (e.g. a hashed chat-user id) — never shown to the model;
+providers lift the newest user turn's author into their abuse-attribution request metadata
+(`ai.attribution`). `null` (the default) means the turn is not attributable to an end user: a system
+framing turn, a monitor notification, a loop-synthesized turn."
+data turn(role: string, text: string, files: array[file], author: string | null ?= null)
 
 @"One tool the model wants to invoke this step — @name@ is its function name (the dispatch key and
 the model-facing call/response record), @opaque@ is any provider token that must be replayed

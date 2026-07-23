@@ -5,6 +5,9 @@
 // `file` inlines (its `data` slot base64s at the send boundary, never on the value plane). Swapping
 // providers means swapping this one `use` line; nothing else in the app or the `ai` layer knows
 // Gemini exists.
+// Attribution: `generateContent` has NO end-user metadata field (unlike Anthropic's
+// `metadata.user_id` / OpenAI's `safety_identifier`), so `types.turn.author` is deliberately not
+// read here — the tag simply does not reach the Gemini wire.
 
 import ai
 import ai.types
