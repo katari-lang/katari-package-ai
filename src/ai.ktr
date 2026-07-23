@@ -587,6 +587,65 @@ by running a model turn over the injected report. @files@ ride the injection tur
 text + files split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
 request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a monitor tick). Rides the injection turn's `author`, so the triggered turn's requests carry the right abuse-attribution metadata." author: string | null ?= null) -> null
 
+@"The ambient PRINCIPAL of the current model turn: the opaque author tag of the observation that
+triggered it (`ai.attribution` of the turn's context), or `null` for a system-triggered turn (a
+monitor tick, a loop-synthesized step). The region loop serves it around every synchronous tool
+dispatch, so a tool may perform it for finer per-user decisions (a rate limit, a personalized view)
+than the central `access_policy` gate expresses. The value-level shadow of a future attribute-refined
+capability system."
+request turn_author() -> string | null
+
+@"WHO may invoke WHAT, as one datum the region loop enforces at its single dispatch point — the
+value-level shadow of attribute-refined capabilities (v0.2+ may promote it into the type system).
+@requirements@ maps a tool's metadata name (`reflection.get_metadata(value = tool).name` — the same
+key for synchronous tools, monitors, and the loop's own `cancel_monitor` / `list_monitors`) to the
+permission it demands; an unlisted tool demands nothing. @grants@ maps an author tag (the opaque
+`types.turn.author` value) to the permissions that user holds; @anonymous@ is what an UNATTRIBUTED
+turn holds (empty = a monitor tick may touch nothing gated). Enforcement is the dispatcher's, not the
+model's: a denied call never runs — the model gets a refusal result to read back. Permission names
+are the app's vocabulary; the loop only ever asks set membership."
+data access_policy(
+  @"Tool metadata name -> the permission it demands." requirements: record[string],
+  @"Author tag -> the permissions that user holds." grants: record[array[string]],
+  @"The permissions of an unattributed (system-triggered) turn." anonymous: array[string],
+)
+
+@"The dispatch gate's verdict: run the call, or refuse it naming the missing permission."
+data authorized()
+data denied(@"The permission the call demanded and the principal lacks." permission: string)
+type access_decision = authorized | denied
+
+@"Decide one tool call against the policy: `null` policy admits everything (gating is opt-in);
+an unlisted tool demands nothing; otherwise the principal's held permissions (the author's grants,
+or @anonymous@ for a null author — an author with no grants entry holds none) must contain the
+demanded one. Total and pure — the single `if` the whole authorization mechanism spends."
+agent authorize(policy: access_policy | null, author: string | null, tool_name: string) -> access_decision {
+  match (policy) {
+    case null -> authorized()
+    case given -> {
+      match (record.get(target = given.requirements, key = tool_name)) {
+        case null -> authorized()
+        case required -> {
+          let held = match (author) {
+            case null -> given.anonymous
+            case tag -> {
+              match (record.get(target = given.grants, key = tag)) {
+                case null -> array.empty()
+                case granted -> granted
+              }
+            }
+          }
+          if (array.contains(target = held, value = required)) {
+            authorized()
+          } else {
+            denied(permission = required)
+          }
+        }
+      }
+    }
+  }
+}
+
 @"A monitor body reduced to its essence: on every occurrence of @schedule@, inject the freshly
 computed @prompt@ into the model's context as an observation from @source@ — the scheduled
 self-prompt every periodic watcher (check a repo, track a topic, look at a calendar) hand-rolled as
@@ -670,17 +729,60 @@ agent render_monitor_listing(registry: record[monitor_entry]) -> string {
   }
 }
 
-@"Route one tool call inside the region loop: STOP a monitor (`cancel_monitor` — cancel the fiber the
-model's id names), LIST the running monitors (`list_monitors` — render the registry back), START a monitor
-(a name in @monitors@ — `region.fork` it detached and hand the model its id), or run a SYNCHRONOUS tool
-(anything else — `dispatch_one`, exactly as `infer_with_tools`). Returns the model-facing result with the
-possibly-grown registry."
+@"Serve the current turn's principal to one synchronous tool dispatch: `turn_author` answers with
+@author@ for the extent of the call, and the handler discharges it from the tools' row so the loop's
+own effect stays clean. The `{...E, turn_author}` instantiation of `dispatch_one` is where the served
+name and the tools' row meet."
+agent dispatch_with_principal[effect E](
+  @"The turn's principal (the triggering observation's author)." author: string | null,
+  @"The synchronous tools." tools: array[agent never -> unknown with {...E, prelude.throw[unknown], turn_author}],
+  @"The model's tool call." call: types.tool_call,
+) -> types.tool_result {
+  use handler {
+    request turn_author() { next author }
+  }
+  dispatch_one[{...E, turn_author}](tools = tools, call = call)
+}
+
+@"The region loop's ONE authorization gate: every tool call — synchronous tool, monitor start,
+`cancel_monitor`, `list_monitors` — passes through `authorize` here before anything runs. A denial
+never executes the call; the model reads back a refusal naming the missing permission, so it can
+explain rather than retry. Authorized calls route to `route_authorized_call`."
 agent route_region_call[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
-  @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"The synchronous tools; `turn_author` is served around their dispatch." tools: array[agent never -> unknown with {...E, prelude.throw[unknown], turn_author}],
   @"The startable monitors (forked detached), each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry (id → `monitor_entry`)." registry: record[monitor_entry],
   @"The model's tool call." call: types.tool_call,
+  @"The turn's principal: the triggering observation's author." author: string | null,
+  @"The access policy; `null` admits everything." access: access_policy | null,
+) -> region_step_result {
+  match (authorize(policy = access, author = author, tool_name = call.name)) {
+    case denied(permission => permission) -> region_step_result(
+      result = types.tool_result(
+        name = call.name,
+        call_id = call.opaque,
+        text = f"(refused: ${call.name} demands the \"${permission}\" permission, which the user who triggered this turn does not hold. Explain the refusal instead of retrying.)",
+        files = [],
+      ),
+      registry = registry,
+    )
+    case authorized() -> route_authorized_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = registry, call = call, author = author)
+  }
+}
+
+@"Route one AUTHORIZED tool call inside the region loop: STOP a monitor (`cancel_monitor` — cancel the fiber the
+model's id names), LIST the running monitors (`list_monitors` — render the registry back), START a monitor
+(a name in @monitors@ — `region.fork` it detached and hand the model its id), or run a SYNCHRONOUS tool
+(anything else — `dispatch_with_principal`, which is `dispatch_one` with `turn_author` served). Returns the
+model-facing result with the possibly-grown registry."
+agent route_authorized_call[effect E](
+  @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
+  @"The synchronous tools (called and awaited); `turn_author` is served around their dispatch." tools: array[agent never -> unknown with {...E, prelude.throw[unknown], turn_author}],
+  @"The startable monitors (forked detached), each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
+  @"The started-monitor registry (id → `monitor_entry`)." registry: record[monitor_entry],
+  @"The model's tool call." call: types.tool_call,
+  @"The turn's principal, served to the synchronous dispatch as `turn_author`." author: string | null,
 ) -> region_step_result {
   if (call.name == reflection.get_metadata(value = cancel_monitor).name) {
     // Stop: look the id up and tear its fiber down. An unknown id is fed back as an error result so the
@@ -750,7 +852,7 @@ agent route_region_call[effect E](
         next with { registry_acc = registry_acc }
       }
     } then (_monitors) {
-      region_step_result(result = dispatch_one[E](tools = tools, call = call), registry = registry_acc)
+      region_step_result(result = dispatch_with_principal[E](author = author, tools = tools, call = call), registry = registry_acc)
     }
   }
 }
@@ -789,11 +891,16 @@ session (conversation + monitor registry)."
 agent region_turn_loop[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
   @"The conversation to advance (the observation already injected)." conversation: array[types.message],
-  @"The synchronous tools." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"The synchronous tools; `turn_author` is served around their dispatch." tools: array[agent never -> unknown with {...E, prelude.throw[unknown], turn_author}],
   @"The startable monitors, each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry." registry: record[monitor_entry],
   @"The per-turn step budget." max_steps: integer,
+  @"The access policy enforced at dispatch; `null` admits everything." access: access_policy | null,
 ) -> region_turn_result {
+  // The turn's PRINCIPAL, fixed once from the trigger: the newest user turn of the incoming
+  // conversation is the observation that started this turn, so every dispatch in the turn is decided
+  // against the same author — the model cannot escalate mid-turn by growing the transcript.
+  let author = attribution(history = conversation)
   let sync_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
   let monitor_metas = for (let monitor in monitors) { next reflection.get_metadata(value = monitor) }
   // The model sees every synchronous tool, every startable monitor, and the two monitor-control tools
@@ -830,7 +937,7 @@ agent region_turn_loop[effect E](
             // Route the batch SEQUENTIALLY: starting / stopping a monitor threads the durable registry, so —
             // unlike `infer_with_tools`' parallel batch — the calls run in order (synchronous tools included).
             let batch = for (let call in calls, var acc: region_batch = region_batch(registry = session.registry, results = [])) {
-              let step = route_region_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = acc.registry, call = call)
+              let step = route_region_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = acc.registry, call = call, author = author, access = access)
               next with { acc = region_batch(registry = step.registry, results = array.append(target = acc.results, value = step.result)) }
             } then (_calls) { acc }
             let with_calls = array.append(target = session.conversation, value = types.call_turn(calls = calls))
@@ -917,16 +1024,24 @@ alive the loop never returns — it runs until the run is cancelled. The provide
 
 COMPACTION: unlike the plain loop, the conversation never resets across observations, so after each turn
 the freshest measured occupancy is classified against @threshold_tokens@ and, over it, the conversation is
-summarized back down (`compact`, the same policy as `serve_session`)."
+summarized back down (`compact`, the same policy as `serve_session`).
+
+AUTHORIZATION: @access@ (optional) is enforced at the loop's single dispatch point — every call the model
+makes (synchronous tool, monitor start, `cancel_monitor`, `list_monitors`) is decided against the turn's
+principal (`ai.attribution` of the trigger; a monitor tick is anonymous), and a denial returns a refusal
+result instead of running. `turn_author` is served to synchronous tools for finer in-tool decisions. The
+gate binds to the turn's TRIGGER, not to whoever a request in the transcript came from — pair it with
+speaker tags in the observation content and instructions to re-confirm cross-user asks."
 agent infer_with_region[effect E](
   @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
-  @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"Synchronous tools: called and awaited, the result fed back. `turn_author` is served around each dispatch, so a tool may perform it." tools: array[agent never -> unknown with {...E, prelude.throw[unknown], turn_author}],
   @"Startable monitors, each authored `agent (topic, schedule)`: forked detached when the model calls one (with the model's topic + schedule), they notify through `observation`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
   @"The ONE output wire: called once per observation with the model's reply @text@ and any @files@ on it. Established like `discord.watch_messages`' `deliver_to` — the app supplies it, and its effects flow to the app's handlers. Its row deliberately EXCLUDES `observation`: input and output are separate wires, and a sink that could observe would both feed the loop back into itself and ride the turn handler's body row out to the run root." deliver_to: agent (text: string, files: array[file]) -> null with E | io,
   @"The per-observation step budget." max_steps: integer,
   @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. To SEE what monitors you currently have running, call list_monitors — it returns each running monitor's id, name, topic and schedule, so you never have to guess an id. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop. If a monitor fails it stops and sends you a 'Notification from monitor' saying so; start it again if you still need that watch.",
   @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
+  @"WHO may invoke WHAT — one `access_policy(...)` datum enforced at the loop's single dispatch point (see its docstring); `null` (the default) admits everything." access: access_policy | null ?= null,
 ) -> never {
   // A region session never returns, so its conversation would grow without bound; the same compaction
   // policy `serve_session` uses folds it back under the threshold after any over-budget turn.
@@ -960,6 +1075,7 @@ agent infer_with_region[effect E](
         monitors = monitors,
         registry = session.registry,
         max_steps = max_steps,
+        access = access,
       )
       // Deliver this turn's reply on the separate output wire. The model's final text carries no files of
       // its own, so the `files` slot is empty; `observation` itself resolves with `null` (fire-and-forget).
