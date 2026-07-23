@@ -10,7 +10,7 @@ OPTIONAL opaque end-user tag of a user turn (e.g. a hashed chat-user id) — nev
 providers lift the newest user turn's author into their abuse-attribution request metadata
 (`ai.attribution`). `null` (the default) means the turn is not attributable to an end user: a system
 framing turn, a monitor notification, a loop-synthesized turn."
-data turn(role: string, text: string, files: array[file], author: string | null ?= null)
+data turn(role: string, text: string, files: array[file] ?= [], author: string | null ?= null)
 
 @"One tool the model wants to invoke this step — @name@ is its function name (the dispatch key and
 the model-facing call/response record), @opaque@ is any provider token that must be replayed

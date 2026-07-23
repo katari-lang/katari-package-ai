@@ -173,14 +173,15 @@ with `reflection.get_metadata`, then up to @max_steps@ times perform `infer_step
 provider; on a batch of tool calls, dispatch them all CONCURRENTLY with `parallel for` (each resolves
 its tool by name and invokes it by value via `reflection.call_agent`, validating the model's args
 against the tool's schema), then feed every result back as a new turn; on a final answer, return it."
-agent infer_with_tools[effect E](
+agent infer_with_tools[effect E lacks time.race_settled](
   history: array[types.message],
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
+  @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
 ) -> string {
   // The one turn loop lives in `take_turn`; this one-shot shape re-raises a failure at the perform
   // site (a one-shot caller has no loop to absorb into) and keeps only the reply.
-  match (take_turn[E](conversation = history, tools = tools, max_steps = max_steps)) {
+  match (take_turn[E](conversation = history, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds)) {
     case session_turn(reply => reply_text, conversation => _, used_tokens => _) -> reply_text
     case failed_turn(conversation => _, error => error) -> prelude.throw(error = error)
   }
@@ -237,11 +238,12 @@ validates them against the tool's schema — the compiled signature of a Katari 
 server-declared schema of an MCP tool — while the boundary's unconditional wire→value conversion turns
 any replayed `$katari_ref` into the `file` it denotes). Every way a call can go wrong is fed back to the
 model as an error result it reads and corrects on its next step: a hallucinated name (nothing matches), a
-tool that panics, a tool's own typed `throw`, and malformed args (a `reflection.call_error` from the
-boundary) alike — none of them reaches the app root. The result's `file` values are collected off the
+tool that panics, a tool's own typed `throw`, malformed args (a `reflection.call_error` from the
+boundary), and a call that outruns @budget_milliseconds@ (raced via `time.with_deadline`, the late
+call cancelled) alike — none of them reaches the app root. The result's `file` values are collected off the
 result tree so the provider can show them to the model (their `$katari_ref` handles are already visible in
 the result text)."
-agent dispatch_one[effect E](tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}], call: types.tool_call) -> types.tool_result {
+agent dispatch_one[effect E lacks time.race_settled](tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}], call: types.tool_call, @"The per-call budget in milliseconds, or `null` for no deadline." budget_milliseconds: number | null) -> types.tool_result {
   // A failing tool must never fail the conversation — that is the loop's whole premise, and it holds for
   // BOTH ways a call can crash: a `panic` (a crashed handler) and any typed `throw` — the tool's own
   // `throw[my_error]` and the boundary's `throw[call_error]` for hallucinated args alike — fold back HERE
@@ -270,19 +272,45 @@ agent dispatch_one[effect E](tools: array[agent never -> unknown with {...E, pre
       )
     }
   }
+  // The result a completed call folds to — shared by the bare and the deadlined path. `stringify`
+  // renders the result's wire form (files show as `$katari_ref` handles) for the model, while the
+  // actual `file` values are collected off the result tree for inlining.
+  agent delivered(result: unknown) -> types.tool_result {
+    types.tool_result(
+      name = call.name,
+      call_id = call.opaque,
+      text = json.stringify(value = result),
+      files = collect_result_files(node = result),
+    )
+  }
   for (let tool in tools) {
     let meta = reflection.get_metadata(value = tool)
     if (meta.name == call.name) {
       // The args are already a plain value; the boundary unconditionally turns any replayed `$katari_ref`
-      // into a `file`. `stringify` renders the result's wire form (files show as `$katari_ref` handles) for
-      // the model, while the actual `file` values are collected off the result tree for inlining.
-      let result = reflection.call_agent(target = tool, args = call.args)
-      return types.tool_result(
-        name = call.name,
-        call_id = call.opaque,
-        text = json.stringify(value = result),
-        files = collect_result_files(node = result),
-      )
+      // into a `file`. A `null` budget calls the tool bare; a number races it against the deadline
+      // (`time.with_deadline` — first wins, the loser cancelled), so no single tool can hang the turn:
+      // the timeout comes back to the model as an error result it reads, like every other tool failure.
+      match (budget_milliseconds) {
+        case null -> {
+          return delivered(result = reflection.call_agent(target = tool, args = call.args))
+        }
+        case limit -> {
+          agent attempt(value: null) -> unknown with {...E, prelude.throw[unknown]} {
+            reflection.call_agent(target = tool, args = call.args)
+          }
+          match (time.with_deadline(milliseconds = limit, task = attempt)) {
+            case time.completed(value => result) -> { return delivered(result = result) }
+            case time.deadline_passed() -> {
+              return types.tool_result(
+                name = call.name,
+                call_id = call.opaque,
+                text = f"(tool timed out after ${limit}ms; the call was cancelled)",
+                files = [],
+              )
+            }
+          }
+        }
+      }
     } else {
       null
     }
@@ -496,11 +524,18 @@ a caller whose protocol gives the empty reply meaning still receives the second 
 provider failure at any step returns `failed_turn` rather than unwinding, so an app-owned event loop
 absorbs it as one match arm. This is the ai package's ONE loop: sessions (`serve_session`) and
 resident agents (an app-owned `observation` handler over a `region` nursery) are compositions over
-it."
-agent take_turn[effect E](
+it. The two knobs are policy the caller owns: @tool_budget_milliseconds@ deadlines every tool call
+(null = no deadline), and @nudge_empty_reply@ = false accepts an empty final as-is — for a caller
+whose protocol gives the empty reply meaning (a watcher that stays quiet), so a quiet turn does not
+pay the renudge's extra step."
+agent take_turn[effect E lacks time.race_settled](
   conversation: array[types.message],
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
+  @"The per-tool-call budget in milliseconds — every call races it via `time.with_deadline`, and a timeout
+comes back to the model as an error result. `null` (the default) sets no deadline." tool_budget_milliseconds: number | null ?= null,
+  @"Whether an empty final reply is renudged once for a plain-text answer (the interactive default).
+Pass `false` when the empty reply is a meaningful signal in your protocol." nudge_empty_reply: boolean ?= true,
 ) -> turn_result {
   let tool_metas = ensure_unique_names(metas = for (let tool in tools) { next reflection.get_metadata(value = tool) })
   let outcome = for (let _step in array.range(start = 0, end = max_steps), var state: session_turn = session_turn(reply = "", conversation = conversation, used_tokens = 0)) {
@@ -518,7 +553,7 @@ agent take_turn[effect E](
           }
           case types.step_call(calls => calls) -> {
             let results = parallel for (let call in calls) {
-              next dispatch_one[E](tools = tools, call = call)
+              next dispatch_one[E](tools = tools, call = call, budget_milliseconds = tool_budget_milliseconds)
             }
             let with_calls = array.append(target = state.conversation, value = types.call_turn(calls = calls))
             next with { state = session_turn(reply = "", conversation = array.append(target = with_calls, value = types.result_turn(results = results)), used_tokens = measured) }
@@ -530,12 +565,13 @@ agent take_turn[effect E](
     // Budget exhausted: the shared forced tool-less close.
     closing_step(history = array.append(target = state.conversation, value = budget_exhausted_turn()))
   }
-  // An EMPTY final is a lost answer: renudge ONCE with an explicit ask, and accept whatever the
-  // extra step says — a second empty comes back as-is (honestly) rather than looping. A failed turn
-  // passes through untouched.
+  // An EMPTY final is a lost answer IN AN INTERACTIVE EXCHANGE: renudge ONCE with an explicit ask,
+  // and accept whatever the extra step says — a second empty comes back as-is (honestly) rather than
+  // looping. A caller whose protocol gives the empty reply meaning (a quiet watcher) opts out with
+  // @nudge_empty_reply@ = false and pays nothing. A failed turn passes through untouched.
   match (outcome) {
     case session_turn(reply => reply_text, conversation => advanced, used_tokens => used) -> {
-      if (reply_text == "") {
+      if (reply_text == "" && nudge_empty_reply) {
         closing_step(history = array.append(target = advanced, value = empty_reply_nudge()))
       } else {
         session_turn(reply = reply_text, conversation = advanced, used_tokens = used)
@@ -554,11 +590,14 @@ measured occupancy is classified against @threshold_tokens@: over it, the conver
 provider (`use gemini.provider(...)` …) and any @E@ handlers are installed by the caller, exactly as
 for `infer_with_tools`; the continuation bridges its transport into `session_message` and typically
 never returns (a `watch_messages` loop)."
-agent serve_session[R, effect E](
-  @"The conversation the model starts from (system framing, prior turns)." context: array[types.message],
+agent serve_session[R, effect E lacks time.race_settled](
+  @"The conversation the model starts from (PRIOR TURNS only — standing instructions belong in the
+provider's `system` parameter, which every provider takes and compaction never touches; anything put
+here is history, and the first compaction folds it into the summary)." context: array[types.message],
   @"The tools of every turn's loop." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"The per-message step budget." max_steps: integer,
   @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
+  @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
   @"The session body: bridges a transport into `session_message`." continuation: agent (value: null) -> R with {...E, session_message},
 ) -> R {
   let effective_policy = match (policy) {
@@ -568,7 +607,7 @@ agent serve_session[R, effect E](
   use handler (var state: session_state = session_state(conversation = context, used_tokens = 0)) {
     request session_message(content: string, files: array[file]) {
       let asked = array.append(target = state.conversation, value = types.turn(role = "user", text = content, files = files))
-      match (take_turn[E](conversation = asked, tools = tools, max_steps = max_steps)) {
+      match (take_turn[E](conversation = asked, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds)) {
         // A served session is one-shot per message, so a provider failure re-raises at the perform
         // site for the app's transport bridge (the `session_message` caller) to handle.
         case failed_turn(conversation => _, error => error) -> { prelude.throw(error = error) }
@@ -592,12 +631,14 @@ agent serve_session[R, effect E](
 
 // ── event vocabulary: observations and scheduled prompts ─────────────────────
 //
-// The resident-agent pattern (an app-owned event loop: fork sources into a `region` nursery, serve
-// `observation` with a stateful handler that injects each report and advances the conversation with
-// `take_turn`) is COMPOSED BY THE APP from these two pieces plus the prelude's `region` — the ai
-// package deliberately owns no loop beyond `take_turn`. Watches become ordinary tools the app
-// writes: a hand-authored adapter (with its own model-facing description) that approves, forks and
-// registers a fiber however the app sees fit.
+// The resident-agent pattern: sources and watches fork into a `region` nursery and push
+// `observation`s; a stateful handler injects each report and advances the conversation with
+// `take_turn`. That serving handler is `serve_observations` below — the resident sibling of
+// `serve_session`, and like it a composition OVER the package's one loop. The REGION wiring stays
+// with the app (the nursery, its ceiling, the forks, and the `region.crashed` interpretation):
+// lifetime is the app's data, not this package's. Watches stay ordinary tools the app writes: a
+// hand-authored adapter (with its own model-facing description) that approves and forks a fiber
+// however the app sees fit.
 
 @"THE event→model channel: a background fiber (an always-on source such as a chat watcher, or a
 started watch) pushes @content@ (plus any @files@) from @source@ into the model's context.
@@ -607,7 +648,7 @@ a user turn, advances the conversation (`take_turn`), and routes the reply where
 the provider's existing inline policy shows the model any attached image. @author@ rides the
 injection turn's `author`, so the triggered turn's requests carry the right abuse-attribution
 metadata (`ai.attribution`)."
-request observation(@"Which fiber is reporting (e.g. \"discord:<channel>\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a scheduled tick)." author: string | null ?= null) -> null
+request observation(@"Which fiber is reporting (e.g. \"discord:<channel>\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model; defaults to none." files: array[file] ?= [], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a scheduled tick)." author: string | null ?= null) -> null
 
 @"A watch body reduced to its essence: on every occurrence of @schedule@, inject the freshly
 computed @prompt@ into the model's context as an observation from @source@ — the scheduled
@@ -621,9 +662,67 @@ agent watch_prompt[effect E](
   @"When occurrences fire: `time.interval(...)` or `time.cron(...)`." schedule: time.schedule,
 ) -> never with {...E, observation} | io {
   agent tick(time: number) -> null with {...E, observation} {
-    observation(source = source, content = prompt(value = null), files = [])
+    observation(source = source, content = prompt(value = null))
   }
   time.watch(schedule = schedule, deliver_to = tick)
+}
+
+@"Serve a RESIDENT agent's observations for the extent of @continuation@ — the resident sibling of
+`serve_session`, and the one home of the absorb / deliver / compact skeleton every resident app
+hand-rolled: each `observation` injects as a user turn (source-labelled, files and author riding it),
+one `take_turn` advances the conversation, and the reply leaves through @deliver_to@. THE RESIDENT
+PROTOCOL IS BUILT IN: an empty (blank) reply means 'nothing to say' — it is not delivered and not
+renudged, so a quiet watcher tick costs exactly one model step. A provider failure is ABSORBED as one
+match arm — @deliver_to@ gets a one-line notice, the conversation is annotated, and the loop awaits
+the next event — because a resident must outlive a failed step. After each turn the measured
+occupancy classifies against @policy@ and an over-budget conversation compacts. The conversation
+starts EMPTY: standing instructions belong in the provider's `system` parameter, which compaction
+never touches. Install this INSIDE your providers and ABOVE your `region.watch` call; the region
+wiring — the nursery, its ceiling, the registry, the forks — stays yours."
+agent serve_observations[R, effect E lacks time.race_settled](
+  @"The tools of every turn's loop." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"The per-observation step budget." max_steps: integer,
+  @"Where a turn's non-empty reply (and a step-failure notice) is delivered." deliver_to: agent (reply: string) -> null with E,
+  @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
+  @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
+  @"The resident body: forks its sources and typically never returns (`region.watch`)." continuation: agent (value: null) -> R with {...E, observation},
+) -> R {
+  let effective_policy = match (policy) {
+    case null -> default_compaction()
+    case given -> given
+  }
+  use handler (var state: session_state = session_state(conversation = [], used_tokens = 0)) {
+    request observation(source: string, content: string, files: array[file], author: string | null) {
+      let injected = array.append(target = state.conversation, value = types.turn(role = "user", text = f"Notification from ${source}:\n${content}", files = files, author = author))
+      match (take_turn[E](conversation = injected, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds, nudge_empty_reply = false)) {
+        // ABSORB a provider failure: notify, annotate, await the next event — the resident loop
+        // must survive a failed step, not unwind on it.
+        case failed_turn(conversation => at_failure, error => error) -> {
+          let rendered = json.stringify(value = error)
+          deliver_to(reply = f"(model error — the turn was dropped: ${rendered})")
+          let marked = array.append(target = at_failure, value = types.turn(role = "user", text = f"[model step failed: ${rendered}. The turn was abandoned; context is preserved.]", files = []))
+          next null with { state = session_state(conversation = marked, used_tokens = state.used_tokens) }
+        }
+        case session_turn(reply => reply_text, conversation => advanced, used_tokens => used) -> {
+          // A blank reply is the protocol's silence — deliver nothing.
+          if (string.is_blank(value = reply_text)) {
+            null
+          } else {
+            deliver_to(reply = reply_text)
+          }
+          match (classify_budget(used = used, policy = effective_policy)) {
+            case within_budget(remaining => _) -> {
+              next null with { state = session_state(conversation = advanced, used_tokens = used) }
+            }
+            case over_budget(used => _) -> {
+              next null with { state = session_state(conversation = compact(history = advanced, policy = effective_policy), used_tokens = 0) }
+            }
+          }
+        }
+      }
+    }
+  }
+  continuation(value = null)
 }
 
 // ── ambient-context middleware ────────────────────────────────────────────────
