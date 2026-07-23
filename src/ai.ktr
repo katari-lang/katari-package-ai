@@ -178,9 +178,12 @@ agent infer_with_tools[effect E](
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
 ) -> string {
-  // The one turn loop lives in `session_turn_loop`; this one-shot shape is that loop minus the
-  // conversation and the usage figure it threads (a caller who wants those calls it directly).
-  session_turn_loop[E](conversation = history, tools = tools, max_steps = max_steps).reply
+  // The one turn loop lives in `take_turn`; this one-shot shape re-raises a failure at the perform
+  // site (a one-shot caller has no loop to absorb into) and keeps only the reply.
+  match (take_turn[E](conversation = history, tools = tools, max_steps = max_steps)) {
+    case session_turn(reply => reply_text, conversation => _, used_tokens => _) -> reply_text
+    case failed_turn(conversation => _, error => error) -> prelude.throw(error = error)
+  }
 }
 
 @"WHO a step is on behalf of: the @author@ of the NEWEST user turn in @history@ — taken AS-IS, null
@@ -207,8 +210,8 @@ agent attribution(history: array[types.message]) -> string | null {
 @"The one-shot renudge a loop plays when the model's final step came back EMPTY: an empty string is
 a lost answer in an interactive exchange (a thinking model can finish a heavy turn with only thought
 parts and no text), so the loop asks ONCE for a plain-text answer before accepting the silence. The
-region loop's wording also names the legitimate way out — a monitor with truly nothing to report
-answers empty again, and the second empty is accepted."
+wording also names the legitimate way out — a watcher protocol with truly nothing to report answers
+empty again, and the second empty is accepted as-is."
 agent empty_reply_nudge() -> types.message {
   types.turn(
     role = "user",
@@ -454,23 +457,55 @@ data session_state(conversation: array[types.message], used_tokens: integer)
 @"One served turn's outcome: the reply, the advanced conversation, and the freshest measurement."
 data session_turn(reply: string, conversation: array[types.message], used_tokens: integer)
 
-@"The per-message tool loop of a served session — `infer_with_tools` threading the seam's usage
-through: up to @max_steps@ steps, tool batches dispatched in parallel, the model's reply appended as
-a model turn, and the LAST step's `input + output` carried out as the context measurement (each
-step's input covers the whole context, so only the freshest figure is the occupancy — steps do not
-add). An EMPTY final is renudged once for a plain-text answer — a one-shot exchange has no quiet
-channel, so an empty here is a lost answer, not a signal."
-agent session_turn_loop[effect E](
+@"A turn the provider FAILED mid-way: the conversation as far as it got (completed call / result
+exchanges included) and the step error. `take_turn` hands failure back as a VALUE so a long-lived
+caller — an app-owned event loop — can ABSORB it as one match arm (annotate the conversation, notify
+a channel, await the next event) instead of unwinding; a one-shot caller re-raises it
+(`infer_with_tools`, `serve_session`)."
+data failed_turn(conversation: array[types.message], error: step_error)
+
+type turn_result = session_turn | failed_turn
+
+@"ONE tool-less step over @history@, folded to a `turn_result`: the shared closing move of the
+budget exhaustion and the empty-final renudge — both must commit to an answer without tools, and
+both hand a provider failure back as a value."
+agent closing_step(history: array[types.message]) -> turn_result {
+  match (infer_step(history = history, tool_metas = [])) {
+    case inference_failed(error => error) -> failed_turn(conversation = history, error = error)
+    case inferred(result => result) -> {
+      let answer = match (result.step) {
+        case types.step_final(text => text) -> text
+        case types.step_call(calls => _) -> "(unexpected tool call without tools)"
+      }
+      session_turn(
+        reply = answer,
+        conversation = array.append(target = history, value = types.turn(role = "model", text = answer, files = [])),
+        used_tokens = result.usage.input_tokens + result.usage.output_tokens,
+      )
+    }
+  }
+}
+
+@"THE turn loop — advance @conversation@ by one model turn and hand back a VALUE either way: up to
+@max_steps@ steps against the ambient provider, tool batches dispatched in parallel, the model's
+reply appended as a model turn, and the LAST step's `input + output` carried out as the context
+measurement (each step's input covers the whole context, so only the freshest figure is the
+occupancy — steps do not add). Budget spent, one forced tool-less close commits to an answer; an
+EMPTY final is renudged once for a plain-text answer (an empty here is a lost answer, not a signal —
+a caller whose protocol gives the empty reply meaning still receives the second empty as-is). A
+provider failure at any step returns `failed_turn` rather than unwinding, so an app-owned event loop
+absorbs it as one match arm. This is the ai package's ONE loop: sessions (`serve_session`) and
+resident agents (an app-owned `observation` handler over a `region` nursery) are compositions over
+it."
+agent take_turn[effect E](
   conversation: array[types.message],
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
-) -> session_turn {
+) -> turn_result {
   let tool_metas = ensure_unique_names(metas = for (let tool in tools) { next reflection.get_metadata(value = tool) })
   let outcome = for (let _step in array.range(start = 0, end = max_steps), var state: session_turn = session_turn(reply = "", conversation = conversation, used_tokens = 0)) {
     match (infer_step(history = state.conversation, tool_metas = tool_metas)) {
-      // A served session is one-shot per message, so a provider failure re-raises at the perform site
-      // for the app's transport bridge (the `session_message` caller) to handle.
-      case inference_failed(error => error) -> { prelude.throw(error = error) }
+      case inference_failed(error => error) -> { break failed_turn(conversation = state.conversation, error = error) }
       case inferred(result => result) -> {
         let measured = result.usage.input_tokens + result.usage.output_tokens
         match (result.step) {
@@ -493,27 +528,20 @@ agent session_turn_loop[effect E](
     }
   } then (_steps) {
     // Budget exhausted: the shared forced tool-less close.
-    let closing = array.append(target = state.conversation, value = budget_exhausted_turn())
-    let answer = reply(history = closing)
-    session_turn(
-      reply = answer,
-      conversation = array.append(target = closing, value = types.turn(role = "model", text = answer, files = [])),
-      used_tokens = state.used_tokens,
-    )
+    closing_step(history = array.append(target = state.conversation, value = budget_exhausted_turn()))
   }
-  // An EMPTY final is a lost answer in a one-shot exchange (no quiet channel exists here): renudge
-  // ONCE with an explicit ask, and accept whatever the extra step says — a second empty comes back
-  // as-is (honestly) rather than looping.
-  if (outcome.reply == "") {
-    let nudged = array.append(target = outcome.conversation, value = empty_reply_nudge())
-    let answer = reply(history = nudged)
-    session_turn(
-      reply = answer,
-      conversation = array.append(target = nudged, value = types.turn(role = "model", text = answer, files = [])),
-      used_tokens = outcome.used_tokens,
-    )
-  } else {
-    outcome
+  // An EMPTY final is a lost answer: renudge ONCE with an explicit ask, and accept whatever the
+  // extra step says — a second empty comes back as-is (honestly) rather than looping. A failed turn
+  // passes through untouched.
+  match (outcome) {
+    case session_turn(reply => reply_text, conversation => advanced, used_tokens => used) -> {
+      if (reply_text == "") {
+        closing_step(history = array.append(target = advanced, value = empty_reply_nudge()))
+      } else {
+        session_turn(reply = reply_text, conversation = advanced, used_tokens = used)
+      }
+    }
+    case failed -> failed
   }
 }
 
@@ -540,15 +568,21 @@ agent serve_session[R, effect E](
   use handler (var state: session_state = session_state(conversation = context, used_tokens = 0)) {
     request session_message(content: string, files: array[file]) {
       let asked = array.append(target = state.conversation, value = types.turn(role = "user", text = content, files = files))
-      let outcome = session_turn_loop[E](conversation = asked, tools = tools, max_steps = max_steps)
-      match (classify_budget(used = outcome.used_tokens, policy = effective_policy)) {
-        case within_budget(remaining => _) -> {
-          next outcome.reply with { state = session_state(conversation = outcome.conversation, used_tokens = outcome.used_tokens) }
-        }
-        case over_budget(used => _) -> {
-          // The compacted context's occupancy is unknown until the next step measures it; 0 says
-          // "not yet measured", never an estimate.
-          next outcome.reply with { state = session_state(conversation = compact(history = outcome.conversation, policy = effective_policy), used_tokens = 0) }
+      match (take_turn[E](conversation = asked, tools = tools, max_steps = max_steps)) {
+        // A served session is one-shot per message, so a provider failure re-raises at the perform
+        // site for the app's transport bridge (the `session_message` caller) to handle.
+        case failed_turn(conversation => _, error => error) -> { prelude.throw(error = error) }
+        case session_turn(reply => reply_text, conversation => advanced, used_tokens => used) -> {
+          match (classify_budget(used = used, policy = effective_policy)) {
+            case within_budget(remaining => _) -> {
+              next reply_text with { state = session_state(conversation = advanced, used_tokens = used) }
+            }
+            case over_budget(used => _) -> {
+              // The compacted context's occupancy is unknown until the next step measures it; 0 says
+              // "not yet measured", never an estimate.
+              next reply_text with { state = session_state(conversation = compact(history = advanced, policy = effective_policy), used_tokens = 0) }
+            }
+          }
         }
       }
     }
@@ -556,61 +590,31 @@ agent serve_session[R, effect E](
   continuation(value = null)
 }
 
-// ── region-integrated loop: dynamic monitors over a nursery ───────────────────
+// ── event vocabulary: observations and scheduled prompts ─────────────────────
 //
-// `infer_with_tools` is fork-JOIN only: every tool call is awaited before the loop moves on, so an
-// agent cannot "start something and forget it". `infer_with_region` adds exactly that, over a `region`
-// nursery (structured concurrency): the model may START a background monitor (a fiber that runs on its
-// own and notifies the model later) and STOP it, without ever leaving the loop. A monitor speaks to the
-// model through ONE channel — the `observation` request — so the nursery's effect ceiling is a single
-// fixed row (`{...E, observation} | io`), and one `region.watch` covering it covers every monitor.
-//
-// Structured concurrency forces the shape. `region.provide` CANCELS every still-running fiber when its
-// continuation returns, so for a monitor to outlive the reply that started it the loop MUST NOT return —
-// it runs for the session's lifetime. Hence `infer_with_region` returns `never`. INPUT and OUTPUT are
-// separate wires: the `observation` channel is fire-and-forget (a source or monitor only reports an
-// event), and each turn's reply leaves through the separate `deliver_to` sink. `infer_with_tools` (the
-// fork-join loop) stays for the plain request/response case; this is its long-lived sibling.
+// The resident-agent pattern (an app-owned event loop: fork sources into a `region` nursery, serve
+// `observation` with a stateful handler that injects each report and advances the conversation with
+// `take_turn`) is COMPOSED BY THE APP from these two pieces plus the prelude's `region` — the ai
+// package deliberately owns no loop beyond `take_turn`. Watches become ordinary tools the app
+// writes: a hand-authored adapter (with its own model-facing description) that approves, forks and
+// registers a fiber however the app sees fit.
 
-// The per-nursery scope marker for this module's region — region.ktr's "declare one marker per nursery"
-// rule. A nullary phantom: `region.provide` mints it for the loop's continuation and discharges it from
-// its own result, so no monitor fiber can outlive `infer_with_region`.
-@"The `infer_with_region` nursery scope: a nullary phantom marker carried by every monitor fiber, minted and discharged by the loop's `region.provide` so no fiber outlives the loop."
-effect ai_turn
+@"THE event→model channel: a background fiber (an always-on source such as a chat watcher, or a
+started watch) pushes @content@ (plus any @files@) from @source@ into the model's context.
+FIRE-AND-FORGET (`-> null`): a fiber only reports — the app's serving handler injects the report as
+a user turn, advances the conversation (`take_turn`), and routes the reply wherever it belongs.
+@files@ ride the injection turn's `files` slot — the same text + files split as `types.turn` — so
+the provider's existing inline policy shows the model any attached image. @author@ rides the
+injection turn's `author`, so the triggered turn's requests carry the right abuse-attribution
+metadata (`ai.attribution`)."
+request observation(@"Which fiber is reporting (e.g. \"discord:<channel>\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a scheduled tick)." author: string | null ?= null) -> null
 
-@"THE monitor→model channel: a background monitor pushes @content@ (plus any @files@ attached to it) from
-@source@ into the model's context. FIRE-AND-FORGET (`-> null`): a source or monitor only reports an event —
-the model's reply is NOT handed back here but delivered on the separate `deliver_to` wire. It is the only
-effect a monitor raises besides `io`, which pins the nursery's ceiling to one row so a single `region.watch`
-covers every monitor. A `source` fiber or a started monitor performs it; the loop's own handler answers it
-by running a model turn over the injected report. @files@ ride the injection turn's `files` slot — the same
-text + files split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
-request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a monitor tick). Rides the injection turn's `author`, so the triggered turn's requests carry the right abuse-attribution metadata." author: string | null ?= null) -> null
-
-@"One monitor-lifecycle action awaiting authorization: STARTING a watcher (it will run and spend
-until stopped) or STOPPING one (silently disabling something someone may rely on). The reading side
-(`list_monitors`) asks nothing."
-data monitor_start(@"The monitor's metadata name." name: string, @"The model's topic (empty = the monitor's default)." topic: string, @"The model's cron schedule (empty = the monitor's default)." schedule: string)
-data monitor_stop(@"The registry id being stopped." id: string, @"The stopped monitor's metadata name." name: string)
-type monitor_action = monitor_start | monitor_stop
-
-@"The authorization escalation the region loop fires BEFORE any monitor-lifecycle action runs,
-carrying WHAT is asked and WHO asked (@author@ — the turn's principal via `ai.attribution`; `null`
-is a system-triggered turn). `true` runs the action; `false` refuses it with a result the model
-reads back (and should explain, not retry). Install a provider to decide it — a human-approval
-prompt in an operators' channel, a policy check, an auto-approve for trusted authors; a provider
-that cannot decide RE-PERFORMS the request to pass it up. UNHANDLED, it escalates like any request
-to the run's entry row, where the katari operator answers it from the admin surface — the parent of
-a run always holds more authority than the run, and than any chat user inside it. The turn BLOCKS
-until the decision lands (observations queue behind it)."
-request authorize_monitor(@"What the model asks to do." action: monitor_action, @"The turn's principal (null = system-triggered)." author: string | null) -> boolean
-
-@"A monitor body reduced to its essence: on every occurrence of @schedule@, inject the freshly
+@"A watch body reduced to its essence: on every occurrence of @schedule@, inject the freshly
 computed @prompt@ into the model's context as an observation from @source@ — the scheduled
 self-prompt every periodic watcher (check a repo, track a topic, look at a calendar) hand-rolled as
 its own `time.watch` adapter. @prompt@ is an agent so each tick recomputes it (an env-configured
 target re-reads, a date renders current); its effects @E@ flow to the app's handlers. Never returns:
-fork it as a monitor (the region loop does when the model starts one) and cancel it to stop."
+fork it into the app's nursery and cancel its fiber to stop."
 agent watch_prompt[effect E](
   @"Which watcher is reporting; labels the injection turn (e.g. \"repo-issues\")." source: string,
   @"Computes the report to inject, fresh at every occurrence." prompt: agent (value: null) -> string with E,
@@ -620,413 +624,6 @@ agent watch_prompt[effect E](
     observation(source = source, content = prompt(value = null), files = [])
   }
   time.watch(schedule = schedule, deliver_to = tick)
-}
-
-@"What the model supplies when it STARTS a monitor: a free-text @topic@ naming exactly what to watch (empty
-falls back to the monitor's default target), and an optional cron @schedule@ (a 5- or 6-field expression,
-e.g. \"0 9 * * 1\" for every Monday at 09:00; empty means the monitor's own default cadence). `region.fork`
-applies a task to `{ input: <argument> }` — one value — so the model's two flat fields ride as ONE
-`instruction`, the argument the loop forks each monitor with. A monitor stays authored as
-`agent (topic, schedule)` — the friendly flat schema the model sees — and the loop adapts that shape to the
-fork's `agent (input: instruction)` shape with a one-line closure."
-data instruction(@"Free-text description of exactly what to watch; empty falls back to the monitor's default target." topic: string, @"A cron expression (e.g. \"0 9 * * 1\"); empty falls back to the monitor's default cadence." schedule: string)
-
-@"One entry in the started-monitor registry: the fiber @handle@ `region.cancel` needs, plus the brief the
-model reads back through `list_monitors` — the monitor's @name@ and the @topic@ / @schedule@ it was
-started with (each empty when the model let it fall back to the monitor's default). Keyed in the registry
-by the stable id the model holds."
-data monitor_entry(handle: region.fiber[ai_turn, never], name: string, topic: string, schedule: string)
-
-@"The loop's durable state, threaded across every observation: the running @conversation@, the
-@registry@ of started monitors (a stable id → the `monitor_entry` carrying the fiber handle `region.cancel`
-needs and the brief `list_monitors` reads back), and the freshest measured context occupancy @used_tokens@
-(0 until a step has run, and again right after a compaction until the next step re-measures). The id is
-what the model holds and passes back to stop or list a monitor."
-data region_session(conversation: array[types.message], registry: record[monitor_entry], used_tokens: integer)
-
-@"One model turn's outcome: the @reply@ the loop hands to `deliver_to`, plus the advanced @session@ the
-loop persists for the next observation."
-data region_turn_result(reply: string, session: region_session)
-
-@"One routed tool call: the model-facing @result@ plus the possibly-grown monitor @registry@ (a started
-monitor adds its id → `monitor_entry`; a stop or a synchronous tool leaves it be)."
-data region_step_result(result: types.tool_result, registry: record[monitor_entry])
-
-@"One routed batch: the registry after the whole batch plus the results in call order — one var so the
-batch fold threads both at once."
-data region_batch(registry: record[monitor_entry], results: array[types.tool_result])
-
-@"Tool: STOP a background monitor you started earlier. Pass the monitor id you were given when it
-started. The region loop INTERCEPTS this call (only the loop holds the nursery `region.cancel` needs),
-so this body is the schema seam and never runs; it returns a note so a stray direct call stays total."
-agent cancel_monitor(@"The id you were given when the monitor started." monitor_id: string) -> string {
-  f"(cancel_monitor is serviced by the region loop; id ${monitor_id})"
-}
-
-@"Tool: LIST the background monitors you currently have running — each rendered as
-`id: name (topic=..., schedule=...)`, with `(default)` where you let the monitor pick its own target or
-cadence, and `(no monitors running)` when none are. Call it to check what you are already watching before
-starting or stopping one. The region loop INTERCEPTS this call (only the loop holds the registry), so this
-body is the schema seam and never runs; it returns a note so a stray direct call stays total."
-agent list_monitors() -> string {
-  "(list_monitors is serviced by the region loop)"
-}
-
-@"Render the monitor registry for `list_monitors`: one `id: name (topic=..., schedule=...)` line per
-running monitor (an empty topic / schedule shows as `(default)`), or `(no monitors running)` when the
-registry is empty."
-agent render_monitor_listing(registry: record[monitor_entry]) -> string {
-  let lines = for (let [id, entry] in record.entries(target = registry)) {
-    let topic_text = if (string.length(value = entry.topic) == 0) { "(default)" } else { entry.topic }
-    let schedule_text = if (string.length(value = entry.schedule) == 0) { "(default)" } else { entry.schedule }
-    next f"${id}: ${entry.name} (topic=${topic_text}, schedule=${schedule_text})"
-  }
-  if (array.length(target = lines) == 0) {
-    "(no monitors running)"
-  } else {
-    string.join(parts = lines, separator = "\n")
-  }
-}
-
-@"Route one tool call inside the region loop: STOP a monitor (`cancel_monitor` — cancel the fiber the
-model's id names), LIST the running monitors (`list_monitors` — render the registry back), START a monitor
-(a name in @monitors@ — `region.fork` it detached and hand the model its id), or run a SYNCHRONOUS tool
-(anything else — `dispatch_one`, exactly as `infer_with_tools`). A start and a stop fire the
-`authorize_monitor` escalation first and are refused on `false`; listing and synchronous tools ask
-nothing. Returns the model-facing result with the possibly-grown registry."
-agent route_region_call[effect E](
-  @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
-  @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
-  @"The startable monitors (forked detached), each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
-  @"The started-monitor registry (id → `monitor_entry`)." registry: record[monitor_entry],
-  @"The model's tool call." call: types.tool_call,
-  @"The turn's principal, carried on the authorization escalation." author: string | null,
-) -> region_step_result {
-  if (call.name == reflection.get_metadata(value = cancel_monitor).name) {
-    // Stop: look the id up and tear its fiber down. An unknown id is fed back as an error result so the
-    // model corrects; `region.cancel` is idempotent, so the entry stays (ids never collide, see below).
-    let requested_id = json.text(target = json.field(target = call.args, key = "monitor_id"))
-    match (record.get(target = registry, key = requested_id)) {
-      case null -> region_step_result(
-        result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(no such monitor: ${requested_id})", files = []),
-        registry = registry,
-      )
-      case entry -> {
-        if (authorize_monitor(action = monitor_stop(id = requested_id, name = entry.name), author = author)) {
-          region.cancel(nursery = nursery, handle = entry.handle)
-          region_step_result(
-            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor stopped: ${requested_id})", files = []),
-            registry = registry,
-          )
-        } else {
-          region_step_result(
-            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(refused: the operator declined stopping monitor ${requested_id}. Explain the refusal instead of retrying.)", files = []),
-            registry = registry,
-          )
-        }
-      }
-    }
-  } else if (call.name == reflection.get_metadata(value = list_monitors).name) {
-    // List: the loop is the only holder of the registry, so it services `list_monitors` the same way it
-    // services `cancel_monitor` — intercept the call and render the registry the model cannot otherwise see.
-    region_step_result(
-      result = types.tool_result(name = call.name, call_id = call.opaque, text = render_monitor_listing(registry = registry), files = []),
-      registry = registry,
-    )
-  } else {
-    // Start the monitor whose name the model picked, else fall through to a synchronous tool.
-    // `region.fork` returns AT ONCE with the fiber handle; the fiber runs on and notifies through
-    // `observation`. The id is derived from the registry size and entries are never removed, so ids
-    // grow monotonically and never collide.
-    for (let monitor in monitors, var registry_acc: record[monitor_entry] = registry) {
-      if (reflection.get_metadata(value = monitor).name == call.name) {
-        let id = f"monitor-${string.to_string(value = record.size(target = registry_acc) + 1)}"
-        // The model's args are the monitor's flat `{ topic, schedule }`; a field the model omitted degrades
-        // to the empty string (the monitor reads that as "use my default"), so a bare start still works.
-        let topic = json.text(target = json.field(target = call.args, key = "topic"))
-        let schedule = json.text(target = json.field(target = call.args, key = "schedule"))
-        // The monitor's name, captured now so the fork adapter's failure notice can name which monitor died,
-        // and so the registry entry `list_monitors` reads back can label the fiber.
-        let monitor_name = reflection.get_metadata(value = monitor).name
-        // `region.fork` applies its task to `{ input: <argument> }` — one value — so wrap the two fields as
-        // one `instruction` and adapt the monitor's `(topic, schedule)` shape to the fork's `(input:)` shape.
-        // A monitor fiber that CRASHES (a panic) otherwise tears down silently — the model started a watcher
-        // and would never learn it died (worse, the panic wells up through `region.watch` and takes the whole
-        // loop with it). Catch it inside the fiber, tell the model through the SAME `observation` channel every
-        // monitor reports on (so it can restart the watcher if it still wants it), then idle forever: a monitor
-        // is `never`, so after notifying there is nothing to return to, and the model reclaims the dead fiber
-        // with `cancel_monitor`. (A typed `throw` cannot be folded back the same way — a `throw` handler's
-        // overwrite semantics require the fiber's abstract effect generic to exclude `throw`, which it cannot,
-        // so a monitor's typed error still escalates through `region.watch` as before; only `panic` is ambient
-        // enough to catch here. See dispatch_one for the same asymmetry on the synchronous tool path.)
-        agent start(input: instruction) -> never {
-          use handler {
-            request panic(msg: string) {
-              observation(source = "monitor", content = f"(monitor ${monitor_name} failed: ${msg}. It has stopped; start it again if still needed.)", files = [])
-              forever { time.sleep(milliseconds = 3600000.0) }
-            }
-          }
-          monitor(topic = input.topic, schedule = input.schedule)
-        }
-        // The lifecycle escalation runs BEFORE the fork, so a declined start never creates the fiber
-        // (nothing to tear down) and never mints a registry id.
-        if (authorize_monitor(action = monitor_start(name = monitor_name, topic = topic, schedule = schedule), author = author)) {
-          let handle = region.fork(nursery = nursery, task = start, argument = instruction(topic = topic, schedule = schedule))
-          break region_step_result(
-            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor started with id ${id}; it will notify you as observations)", files = []),
-            registry = record.set(target = registry_acc, key = id, value = monitor_entry(handle = handle, name = monitor_name, topic = topic, schedule = schedule)),
-          )
-        } else {
-          break region_step_result(
-            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(refused: the operator declined starting monitor ${monitor_name}. Explain the refusal instead of retrying.)", files = []),
-            registry = registry_acc,
-          )
-        }
-      } else {
-        next with { registry_acc = registry_acc }
-      }
-    } then (_monitors) {
-      region_step_result(result = dispatch_one[E](tools = tools, call = call), registry = registry_acc)
-    }
-  }
-}
-
-@"A turn the loop had to ABANDON because the provider surfaced a failure (`inference_failed`) mid-turn.
-Rather than let that failure unwind the long-lived loop, the region loop folds it into a turn result: a
-short notice for `deliver_to` (so the channel sees it) plus a `[model step failed …]` user turn appended to
-the persisted conversation (so the model learns, next observation, that the turn was dropped and its
-context kept). The completed call / result exchanges earlier in the turn stay in the conversation, and the
-last measured occupancy carries forward unchanged."
-agent abandoned_turn(conversation: array[types.message], registry: record[monitor_entry], used_tokens: integer, error: step_error) -> region_turn_result {
-  let rendered = json.stringify(value = error)
-  region_turn_result(
-    reply = f"(I hit a model error and had to drop that turn: ${rendered})",
-    session = region_session(
-      conversation = array.append(
-        target = conversation,
-        value = types.turn(role = "user", text = f"[model step failed: ${rendered}. The turn was abandoned; context is preserved.]", files = []),
-      ),
-      registry = registry,
-      used_tokens = used_tokens,
-    ),
-  )
-}
-
-@"One model turn-loop over @conversation@ WITH region powers — the region-aware twin of the
-`infer_with_tools` loop. Up to @max_steps@ times: ask the provider for a step; on a tool batch, route
-every call (`route_region_call`: a synchronous tool feeds its result back, a monitor tool forks a
-detached fiber whose id feeds back, `cancel_monitor` stops one, `list_monitors` reports them), record the
-call + result turns, and continue; on a final answer, stop. A provider FAILURE does not unwind the loop —
-it is ABSORBED (`abandoned_turn`): the turn is dropped, a notice delivered, and the loop awaits the next
-observation. Budget spent, force one tool-less close (as `infer_with_tools`, absorbing a failure there
-too). A turn that ran tools and still ended EMPTY is renudged once for a plain-text answer (an
-immediate empty stays the monitors' legitimate quiet reply). Returns the reply plus the advanced
-session (conversation + monitor registry)."
-agent region_turn_loop[effect E](
-  @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
-  @"The conversation to advance (the observation already injected)." conversation: array[types.message],
-  @"The synchronous tools." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
-  @"The startable monitors, each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
-  @"The started-monitor registry." registry: record[monitor_entry],
-  @"The per-turn step budget." max_steps: integer,
-) -> region_turn_result {
-  // The turn's PRINCIPAL, fixed once from the trigger: the newest user turn of the incoming
-  // conversation is the observation that started this turn, so every escalation in the turn names
-  // the same author.
-  let author = attribution(history = conversation)
-  let sync_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
-  let monitor_metas = for (let monitor in monitors) { next reflection.get_metadata(value = monitor) }
-  // The model sees every synchronous tool, every startable monitor, and the two monitor-control tools
-  // (`cancel_monitor` to stop one, `list_monitors` to see what is running).
-  let control_metas = [reflection.get_metadata(value = cancel_monitor), reflection.get_metadata(value = list_monitors)]
-  let tool_metas = ensure_unique_names(metas = array.concat(
-    left = array.concat(left = sync_metas, right = monitor_metas),
-    right = control_metas,
-  ))
-  let outcome = for (let _step in array.range(start = 0, end = max_steps), var session: region_session = region_session(conversation = conversation, registry = registry, used_tokens = 0)) {
-    match (infer_step(history = session.conversation, tool_metas = tool_metas)) {
-      // ABSORB a provider failure: abandon just this turn (notice out, marker in) and wait for the next
-      // observation — the long-lived loop must survive a step failure, not unwind on it.
-      case inference_failed(error => error) -> {
-        break abandoned_turn(conversation = session.conversation, registry = session.registry, used_tokens = session.used_tokens, error = error)
-      }
-      case inferred(result => result) -> {
-        // Each step's input covers the whole context, so the FRESHEST figure IS the occupancy (steps do not add).
-        let measured = result.usage.input_tokens + result.usage.output_tokens
-        match (result.step) {
-          case types.step_final(text => reply_text) -> {
-            // Record the model's reply as a model turn — exactly as `session_turn_loop` does — so the running
-            // conversation is a faithful transcript the next observation (and `compact`) can read back.
-            break region_turn_result(
-              reply = reply_text,
-              session = region_session(
-                conversation = array.append(target = session.conversation, value = types.turn(role = "model", text = reply_text, files = [])),
-                registry = session.registry,
-                used_tokens = measured,
-              ),
-            )
-          }
-          case types.step_call(calls => calls) -> {
-            // Route the batch SEQUENTIALLY: starting / stopping a monitor threads the durable registry, so —
-            // unlike `infer_with_tools`' parallel batch — the calls run in order (synchronous tools included).
-            let batch = for (let call in calls, var acc: region_batch = region_batch(registry = session.registry, results = [])) {
-              let step = route_region_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = acc.registry, call = call, author = author)
-              next with { acc = region_batch(registry = step.registry, results = array.append(target = acc.results, value = step.result)) }
-            } then (_calls) { acc }
-            let with_calls = array.append(target = session.conversation, value = types.call_turn(calls = calls))
-            let with_results = array.append(target = with_calls, value = types.result_turn(results = batch.results))
-            next with { session = region_session(conversation = with_results, registry = batch.registry, used_tokens = measured) }
-          }
-        }
-      }
-    }
-  } then (_steps) {
-    // Budget exhausted: force ONE tool-less step so the model commits to an answer instead of losing
-    // everything the tools gathered (the same close as `infer_with_tools`) — but drive the seam directly so
-    // a failure here is ABSORBED too, keeping the region loop total.
-    let closing = array.append(target = session.conversation, value = budget_exhausted_turn())
-    match (infer_step(history = closing, tool_metas = [])) {
-      case inference_failed(error => error) -> {
-        abandoned_turn(conversation = closing, registry = session.registry, used_tokens = session.used_tokens, error = error)
-      }
-      case inferred(result => result) -> {
-        let answer = match (result.step) {
-          case types.step_final(text => text) -> text
-          case types.step_call(calls => _) -> "(unexpected tool call without tools)"
-        }
-        region_turn_result(
-          reply = answer,
-          session = region_session(
-            conversation = array.append(target = closing, value = types.turn(role = "model", text = answer, files = [])),
-            registry = session.registry,
-            used_tokens = result.usage.input_tokens + result.usage.output_tokens,
-          ),
-        )
-      }
-    }
-  }
-  // A turn that WORKED and still ended EMPTY is a lost answer, not the monitors' deliberate quiet: a
-  // thinking model can burn a heavy turn on thought parts and finish with no text. "Worked" is read
-  // off the transcript — a straight answer appends exactly ONE model turn, so any further growth
-  // means a tool batch ran. Renudge ONCE (absorbing a provider failure exactly as the loop does) and
-  // accept a second empty as genuine quiet; an IMMEDIATE empty (no tools) passes through untouched,
-  // because that is the quiet reply the monitor protocol depends on. `abandoned_turn` never trips
-  // this — its notice reply is non-empty.
-  if (outcome.reply == "" && array.length(target = outcome.session.conversation) > array.length(target = conversation) + 1) {
-    let nudged = array.append(target = outcome.session.conversation, value = empty_reply_nudge())
-    match (infer_step(history = nudged, tool_metas = [])) {
-      case inference_failed(error => error) -> {
-        abandoned_turn(conversation = nudged, registry = outcome.session.registry, used_tokens = outcome.session.used_tokens, error = error)
-      }
-      case inferred(result => result) -> {
-        let answer = match (result.step) {
-          case types.step_final(text => text) -> text
-          case types.step_call(calls => _) -> "(unexpected tool call without tools)"
-        }
-        region_turn_result(
-          reply = answer,
-          session = region_session(
-            conversation = array.append(target = nudged, value = types.turn(role = "model", text = answer, files = [])),
-            registry = outcome.session.registry,
-            used_tokens = result.usage.input_tokens + result.usage.output_tokens,
-          ),
-        )
-      }
-    }
-  } else {
-    outcome
-  }
-}
-
-@"Run the tool-using model loop over a `region` nursery, so the model can START background monitors and
-STOP them — the long-lived sibling of `infer_with_tools`. @tools@ are synchronous (called and awaited,
-exactly as `infer_with_tools`); @monitors@ are startable background fibers the model launches as tools
-(each forks detached and reports through `observation`) and stops with `cancel_monitor`;
-@sources@ are always-on input fibers forked at startup (e.g. a chat watcher that turns each user message
-into an `observation`) and are NOT shown as tools. @context@ seeds the conversation the model always
-sees, and @region_instructions@ (overridable) teaches the model the start / stop protocol, since a model
-is trained on tool calls but not on this fork / cancel discipline.
-
-INPUT and OUTPUT are separate wires. `observation` is fire-and-forget — a source or monitor only reports an
-event — and each turn's reply is delivered by @deliver_to@, the ONE place output is wired; a source /
-monitor never sends a reply.
-
-Returns `never`: structured concurrency cancels every fiber when the nursery closes, so to keep monitors
-alive the loop never returns — it runs until the run is cancelled. The provider (`use gemini.provider(...)`
-…) and any @E@ handlers are installed by the caller, exactly as for `infer_with_tools`.
-
-COMPACTION: unlike the plain loop, the conversation never resets across observations, so after each turn
-the freshest measured occupancy is classified against @threshold_tokens@ and, over it, the conversation is
-summarized back down (`compact`, the same policy as `serve_session`).
-
-AUTHORIZATION: every monitor-lifecycle action (a start, a `cancel_monitor`) fires the
-`authorize_monitor` escalation BEFORE running, carrying the action and the turn's principal
-(`ai.attribution` of the trigger; a monitor tick is null). Install a provider around this call to
-decide it (a human-approval prompt, a policy check) — or install none and let it escalate to the run
-root, where the katari operator answers it: the parent of a run always outranks the run. A `false`
-returns a refusal result the model reads back; the turn blocks while the decision is pending."
-agent infer_with_region[effect E](
-  @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
-  @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
-  @"Startable monitors, each authored `agent (topic, schedule)`: forked detached when the model calls one (with the model's topic + schedule), they notify through `observation`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
-  @"Always-on input fibers forked at startup (not shown as tools)." sources: array[agent (input: null) -> never with {...E, observation} | io],
-  @"The ONE output wire: called once per observation with the model's reply @text@ and any @files@ on it. Established like `discord.watch_messages`' `deliver_to` — the app supplies it, and its effects flow to the app's handlers. Its row deliberately EXCLUDES `observation`: input and output are separate wires, and a sink that could observe would both feed the loop back into itself and ride the turn handler's body row out to the run root." deliver_to: agent (text: string, files: array[file]) -> null with E | io,
-  @"The per-observation step budget." max_steps: integer,
-  @"How the model should use the monitor start / stop tools; override to specialise." region_instructions: string ?= "You have background MONITOR tools in addition to ordinary tools. An ordinary tool returns its result immediately. Calling a MONITOR tool instead STARTS a background watcher and returns a monitor id; that watcher keeps running on its own and notifies you later, each notification arriving as a 'Notification from <source>' message. When you start a monitor you may give it a topic (free text describing exactly what to watch) and a schedule (a cron expression, e.g. '0 9 * * 1' = every Monday at 09:00; leave it empty to use the monitor's default cadence); leave the topic empty to watch its default target. To STOP a monitor, call cancel_monitor with the id you were given. To SEE what monitors you currently have running, call list_monitors — it returns each running monitor's id, name, topic and schedule, so you never have to guess an id. Start a monitor when the user asks you to keep an eye on something, and stop it when they ask you to stop. If a monitor fails it stops and sends you a 'Notification from monitor' saying so; start it again if you still need that watch.",
-  @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
-) -> never {
-  // A region session never returns, so its conversation would grow without bound; the same compaction
-  // policy `serve_session` uses folds it back under the threshold after any over-budget turn.
-  let effective_policy = match (policy) {
-    case null -> default_compaction()
-    case given -> given
-  }
-  let nursery: region.nursery[ai_turn, {...E, observation} | io] = use region.provide[ai_turn, {...E, observation} | io]
-  // The durable state (conversation + monitor registry + freshest occupancy) lives in the handler that
-  // answers every observation, so every model turn — from a source or from a started monitor — shares one thread.
-  use handler (var session: region_session = region_session(
-    conversation = array.concat(
-      left = [types.turn(role = "user", text = region_instructions, files = [])],
-      right = context,
-    ),
-    registry = record.empty(),
-    used_tokens = 0,
-  )) {
-    request observation(source: string, content: string, files: array[file], author: string | null) {
-      // The report's files ride the injection turn's `files` slot, exactly as an ordinary user turn's
-      // attachments — so the provider's existing inline policy (`gemini_file_parts` /
-      // `anthropic_turn_content`) shows the model any attached image with no observation-specific path.
-      let injected = array.append(
-        target = session.conversation,
-        value = types.turn(role = "user", text = f"Notification from ${source}:\n${content}", files = files, author = author),
-      )
-      let outcome = region_turn_loop[E](
-        nursery = nursery,
-        conversation = injected,
-        tools = tools,
-        monitors = monitors,
-        registry = session.registry,
-        max_steps = max_steps,
-      )
-      // Deliver this turn's reply on the separate output wire. The model's final text carries no files of
-      // its own, so the `files` slot is empty; `observation` itself resolves with `null` (fire-and-forget).
-      deliver_to(text = outcome.reply, files = [])
-      // Classify the freshest measured occupancy against the policy, exactly as `serve_session` does: an
-      // over-budget turn summarizes everything before the kept tail. (0 says "not yet measured" after a
-      // compaction — the next step re-measures.)
-      match (classify_budget(used = outcome.session.used_tokens, policy = effective_policy)) {
-        case within_budget(remaining => _) -> {
-          next null with { session = outcome.session }
-        }
-        case over_budget(used => _) -> {
-          next null with { session = region_session(conversation = compact(history = outcome.session.conversation, policy = effective_policy), registry = outcome.session.registry, used_tokens = 0) }
-        }
-      }
-    }
-  }
-  // Start the always-on inputs, then pump every fiber's observations up to the handler above forever.
-  let _sources = for (let source in sources) { next region.fork(nursery = nursery, task = source, argument = null) }
-  region.watch(nursery = nursery)
 }
 
 // ── ambient-context middleware ────────────────────────────────────────────────
