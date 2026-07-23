@@ -587,6 +587,24 @@ by running a model turn over the injected report. @files@ ride the injection tur
 text + files split as `types.turn` — so the provider's existing inline policy shows the model any attached image."
 request observation(@"Which monitor is reporting (e.g. \"slack\"); it labels the report's injection turn." source: string, @"The report to inject into the model's context." content: string, @"Any files attached to the report (a Discord / Slack attachment), injected on the report's turn so the provider inlines them for the model." files: array[file], @"The opaque end-user tag of the human behind this report (e.g. a hashed chat-user id), or `null` for a system report (a monitor tick). Rides the injection turn's `author`, so the triggered turn's requests carry the right abuse-attribution metadata." author: string | null ?= null) -> null
 
+@"One monitor-lifecycle action awaiting authorization: STARTING a watcher (it will run and spend
+until stopped) or STOPPING one (silently disabling something someone may rely on). The reading side
+(`list_monitors`) asks nothing."
+data monitor_start(@"The monitor's metadata name." name: string, @"The model's topic (empty = the monitor's default)." topic: string, @"The model's cron schedule (empty = the monitor's default)." schedule: string)
+data monitor_stop(@"The registry id being stopped." id: string, @"The stopped monitor's metadata name." name: string)
+type monitor_action = monitor_start | monitor_stop
+
+@"The authorization escalation the region loop fires BEFORE any monitor-lifecycle action runs,
+carrying WHAT is asked and WHO asked (@author@ — the turn's principal via `ai.attribution`; `null`
+is a system-triggered turn). `true` runs the action; `false` refuses it with a result the model
+reads back (and should explain, not retry). Install a provider to decide it — a human-approval
+prompt in an operators' channel, a policy check, an auto-approve for trusted authors; a provider
+that cannot decide RE-PERFORMS the request to pass it up. UNHANDLED, it escalates like any request
+to the run's entry row, where the katari operator answers it from the admin surface — the parent of
+a run always holds more authority than the run, and than any chat user inside it. The turn BLOCKS
+until the decision lands (observations queue behind it)."
+request authorize_monitor(@"What the model asks to do." action: monitor_action, @"The turn's principal (null = system-triggered)." author: string | null) -> boolean
+
 @"A monitor body reduced to its essence: on every occurrence of @schedule@, inject the freshly
 computed @prompt@ into the model's context as an observation from @source@ — the scheduled
 self-prompt every periodic watcher (check a repo, track a topic, look at a calendar) hand-rolled as
@@ -673,14 +691,16 @@ agent render_monitor_listing(registry: record[monitor_entry]) -> string {
 @"Route one tool call inside the region loop: STOP a monitor (`cancel_monitor` — cancel the fiber the
 model's id names), LIST the running monitors (`list_monitors` — render the registry back), START a monitor
 (a name in @monitors@ — `region.fork` it detached and hand the model its id), or run a SYNCHRONOUS tool
-(anything else — `dispatch_one`, exactly as `infer_with_tools`). Returns the model-facing result with the
-possibly-grown registry."
+(anything else — `dispatch_one`, exactly as `infer_with_tools`). A start and a stop fire the
+`authorize_monitor` escalation first and are refused on `false`; listing and synchronous tools ask
+nothing. Returns the model-facing result with the possibly-grown registry."
 agent route_region_call[effect E](
   @"The nursery to fork / cancel monitors in." nursery: region.nursery[ai_turn, {...E, observation} | io],
   @"The synchronous tools (called and awaited)." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   @"The startable monitors (forked detached), each authored `agent (topic, schedule)`." monitors: array[agent (topic: string, schedule: string) -> never with {...E, observation} | io],
   @"The started-monitor registry (id → `monitor_entry`)." registry: record[monitor_entry],
   @"The model's tool call." call: types.tool_call,
+  @"The turn's principal, carried on the authorization escalation." author: string | null,
 ) -> region_step_result {
   if (call.name == reflection.get_metadata(value = cancel_monitor).name) {
     // Stop: look the id up and tear its fiber down. An unknown id is fed back as an error result so the
@@ -692,11 +712,18 @@ agent route_region_call[effect E](
         registry = registry,
       )
       case entry -> {
-        region.cancel(nursery = nursery, handle = entry.handle)
-        region_step_result(
-          result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor stopped: ${requested_id})", files = []),
-          registry = registry,
-        )
+        if (authorize_monitor(action = monitor_stop(id = requested_id, name = entry.name), author = author)) {
+          region.cancel(nursery = nursery, handle = entry.handle)
+          region_step_result(
+            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor stopped: ${requested_id})", files = []),
+            registry = registry,
+          )
+        } else {
+          region_step_result(
+            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(refused: the operator declined stopping monitor ${requested_id}. Explain the refusal instead of retrying.)", files = []),
+            registry = registry,
+          )
+        }
       }
     }
   } else if (call.name == reflection.get_metadata(value = list_monitors).name) {
@@ -741,11 +768,20 @@ agent route_region_call[effect E](
           }
           monitor(topic = input.topic, schedule = input.schedule)
         }
-        let handle = region.fork(nursery = nursery, task = start, argument = instruction(topic = topic, schedule = schedule))
-        break region_step_result(
-          result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor started with id ${id}; it will notify you as observations)", files = []),
-          registry = record.set(target = registry_acc, key = id, value = monitor_entry(handle = handle, name = monitor_name, topic = topic, schedule = schedule)),
-        )
+        // The lifecycle escalation runs BEFORE the fork, so a declined start never creates the fiber
+        // (nothing to tear down) and never mints a registry id.
+        if (authorize_monitor(action = monitor_start(name = monitor_name, topic = topic, schedule = schedule), author = author)) {
+          let handle = region.fork(nursery = nursery, task = start, argument = instruction(topic = topic, schedule = schedule))
+          break region_step_result(
+            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(monitor started with id ${id}; it will notify you as observations)", files = []),
+            registry = record.set(target = registry_acc, key = id, value = monitor_entry(handle = handle, name = monitor_name, topic = topic, schedule = schedule)),
+          )
+        } else {
+          break region_step_result(
+            result = types.tool_result(name = call.name, call_id = call.opaque, text = f"(refused: the operator declined starting monitor ${monitor_name}. Explain the refusal instead of retrying.)", files = []),
+            registry = registry_acc,
+          )
+        }
       } else {
         next with { registry_acc = registry_acc }
       }
@@ -794,6 +830,10 @@ agent region_turn_loop[effect E](
   @"The started-monitor registry." registry: record[monitor_entry],
   @"The per-turn step budget." max_steps: integer,
 ) -> region_turn_result {
+  // The turn's PRINCIPAL, fixed once from the trigger: the newest user turn of the incoming
+  // conversation is the observation that started this turn, so every escalation in the turn names
+  // the same author.
+  let author = attribution(history = conversation)
   let sync_metas = for (let tool in tools) { next reflection.get_metadata(value = tool) }
   let monitor_metas = for (let monitor in monitors) { next reflection.get_metadata(value = monitor) }
   // The model sees every synchronous tool, every startable monitor, and the two monitor-control tools
@@ -830,7 +870,7 @@ agent region_turn_loop[effect E](
             // Route the batch SEQUENTIALLY: starting / stopping a monitor threads the durable registry, so —
             // unlike `infer_with_tools`' parallel batch — the calls run in order (synchronous tools included).
             let batch = for (let call in calls, var acc: region_batch = region_batch(registry = session.registry, results = [])) {
-              let step = route_region_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = acc.registry, call = call)
+              let step = route_region_call[E](nursery = nursery, tools = tools, monitors = monitors, registry = acc.registry, call = call, author = author)
               next with { acc = region_batch(registry = step.registry, results = array.append(target = acc.results, value = step.result)) }
             } then (_calls) { acc }
             let with_calls = array.append(target = session.conversation, value = types.call_turn(calls = calls))
@@ -917,7 +957,14 @@ alive the loop never returns — it runs until the run is cancelled. The provide
 
 COMPACTION: unlike the plain loop, the conversation never resets across observations, so after each turn
 the freshest measured occupancy is classified against @threshold_tokens@ and, over it, the conversation is
-summarized back down (`compact`, the same policy as `serve_session`)."
+summarized back down (`compact`, the same policy as `serve_session`).
+
+AUTHORIZATION: every monitor-lifecycle action (a start, a `cancel_monitor`) fires the
+`authorize_monitor` escalation BEFORE running, carrying the action and the turn's principal
+(`ai.attribution` of the trigger; a monitor tick is null). Install a provider around this call to
+decide it (a human-approval prompt, a policy check) — or install none and let it escalate to the run
+root, where the katari operator answers it: the parent of a run always outranks the run. A `false`
+returns a refusal result the model reads back; the turn blocks while the decision is pending."
 agent infer_with_region[effect E](
   @"The conversation the model always sees (system framing, prior turns)." context: array[types.message],
   @"Synchronous tools: called and awaited, the result fed back." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
