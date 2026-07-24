@@ -137,12 +137,12 @@ agent openai_call_entry(call: types.tool_call, map: ai.name_map) -> unknown {
 image inlining — the Gemini and Anthropic providers are the multimodal ones); the handle note still
 lets the model replay a file into a tool call (`view_image` / `send_files`)."
 agent openai_file_notes(files: array[file]) -> string {
-  let notes = for (let f in files) { next f"\n[attached file: ${json.stringify(value = f)}]" }
+  let notes = for (let attachment in files) { next f"\n[attached file: ${json.stringify(value = attachment)}]" }
   string.join(parts = notes, separator = "")
 }
 
-agent openai_messages_of(msg: types.message, map: ai.name_map) -> array[unknown] {
-  match (msg) {
+agent openai_messages_of(message: types.message, map: ai.name_map) -> array[unknown] {
+  match (message) {
     case types.turn(role => role, text => text, files => files) -> {
       [{
         role = openai_role(role = role),
@@ -168,9 +168,9 @@ agent openai_messages_of(msg: types.message, map: ai.name_map) -> array[unknown]
 }
 
 agent openai_messages(client: connection, history: array[types.message], map: ai.name_map) -> array[unknown] {
-  let base = for (let msg in history, var acc: array[unknown] = []) {
-    next with { acc = array.concat(left = acc, right = openai_messages_of(msg = msg, map = map)) }
-  } then (_messages) { acc }
+  let base = for (let message in history, var accumulator: array[unknown] = []) {
+    next with { accumulator = array.concat(left = accumulator, right = openai_messages_of(message = message, map = map)) }
+  } then (_messages) { accumulator }
   if (client.system == "") {
     base
   } else {
@@ -224,13 +224,13 @@ agent openai_message(parsed: unknown) -> unknown {
   json.field(target = json.element(target = json.field(target = parsed, key = "choices"), index = 0), key = "message")
 }
 
-agent openai_tool_call_of(tc: unknown, map: ai.name_map) -> types.tool_call with prelude.throw[json.parse_error] {
-  let function = json.field(target = tc, key = "function")
+agent openai_tool_call_of(tool_call: unknown, map: ai.name_map) -> types.tool_call with prelude.throw[json.parse_error] {
+  let function = json.field(target = tool_call, key = "function")
   types.tool_call(
     // Reverse the wire name back to the real qualified name: the loop dispatches by matching this
     // against tool metadata, so it must be the real name, not the shortened one the model saw.
     name = ai.real_name_of(map = map, wire = json.text(target = json.field(target = function, key = "name"))),
-    opaque = json.text(target = json.field(target = tc, key = "id")),
+    opaque = json.text(target = json.field(target = tool_call, key = "id")),
     // OpenAI ships the arguments as a JSON *string*; parse it back to the plain args document.
     args = json.parse(text = json.text(target = json.field(target = function, key = "arguments"))),
   )
@@ -239,8 +239,8 @@ agent openai_tool_call_of(tc: unknown, map: ai.name_map) -> types.tool_call with
 agent openai_parse_step(response: unknown, map: ai.name_map) -> types.step with prelude.throw[json.parse_error] {
   let message = openai_message(parsed = response)
   match (json.field(target = message, key = "tool_calls")) {
-    case array(tcs) -> {
-      let calls = for (let tc in tcs) { next openai_tool_call_of(tc = tc, map = map) }
+    case array(tool_calls) -> {
+      let calls = for (let tool_call in tool_calls) { next openai_tool_call_of(tool_call = tool_call, map = map) }
       if (array.length(target = calls) == 0) {
         types.step_final(text = json.text(target = json.field(target = message, key = "content")))
       } else {

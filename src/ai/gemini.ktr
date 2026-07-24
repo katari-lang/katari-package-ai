@@ -158,7 +158,7 @@ agent gemini_result_part(result: types.tool_result) -> unknown {
 @"The file's recorded content type, or \"\" when the handle is gone (freed, or never named a live blob).
 A gone file cannot inline — its handle note still rides — so `gone` folds to the same \"cannot inline\"
 signal as an unrecorded type, and never fails a whole step over one stale attachment."
-agent gemini_content_type(f: file) -> string {
+agent gemini_content_type(attachment: file) -> string {
   // `files.content_type` throws `files.gone` for a stale handle (freed, or an id that never named a
   // live blob). Catch exactly that and recover with "" (cannot inline), so one stale attachment never
   // fails a whole step. The `files` module qualifier is nameable in type position — the `file`
@@ -166,20 +166,20 @@ agent gemini_content_type(f: file) -> string {
   use handler {
     request prelude.throw(error: files.gone) -> never { break "" }
   }
-  files.content_type(value = f)
+  files.content_type(value = attachment)
 }
 
 @"A file's content as an inlineData part — what lets the model actually SEE an image. The `data` slot
 holds the file VALUE placed DIRECTLY into the tree; `http.json` reads its bytes and base64s them in
 place only at the send boundary, so the content never rides the value plane. Only the freshest history
 element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
-agent gemini_inline_part(f: file) -> unknown {
+agent gemini_inline_part(attachment: file) -> unknown {
   // The file rides as its handle in the `data` slot; `http.json` base64s it at the send boundary (no
   // `read_base64`).
   {
     inlineData = {
-      mimeType = gemini_content_type(f = f),
-      "data" = f,
+      mimeType = gemini_content_type(attachment = attachment),
+      "data" = attachment,
     },
   }
 }
@@ -187,19 +187,19 @@ agent gemini_inline_part(f: file) -> unknown {
 @"A file as its `$katari_ref` handle note — the resting representation. The handle is the exact object the
 model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the note IS
 the affordance, not just a description."
-agent gemini_handle_part(f: file) -> unknown {
-  gemini_text_part(text = f"[attached file: ${json.stringify(value = f)}]")
+agent gemini_handle_part(attachment: file) -> unknown {
+  gemini_text_part(text = f"[attached file: ${json.stringify(value = attachment)}]")
 }
 
 @"Render a turn's / result's files: inlined (content + handle note, so the model both sees the image
 and learns the handle to replay) while fresh, the handle note alone once older — the model re-reads
 an old image on demand with `view_image`. A file with no recorded MIME type cannot inline."
 agent gemini_file_parts(files: array[file], inline: boolean) -> array[unknown] {
-  array.flatten(target = for (let f in files) {
-    if (inline && gemini_content_type(f = f) != "") {
-      next [gemini_handle_part(f = f), gemini_inline_part(f = f)]
+  array.flatten(target = for (let attachment in files) {
+    if (inline && gemini_content_type(attachment = attachment) != "") {
+      next [gemini_handle_part(attachment = attachment), gemini_inline_part(attachment = attachment)]
     } else {
-      next [gemini_handle_part(f = f)]
+      next [gemini_handle_part(attachment = attachment)]
     }
   })
 }
@@ -207,8 +207,8 @@ agent gemini_file_parts(files: array[file], inline: boolean) -> array[unknown] {
 @"One history element as a Gemini content. @inline@ marks the freshest element — the only one whose
 files inline their content (older elements show handles only, keeping the request small; the model
 re-reads any old image with `view_image`)."
-agent gemini_content(msg: types.message, inline: boolean) -> unknown {
-  match (msg) {
+agent gemini_content(message: types.message, inline: boolean) -> unknown {
+  match (message) {
     case types.turn(role => role, text => text, files => files) -> {
       {
         role = gemini_role(role = role),
@@ -255,13 +255,13 @@ agent gemini_drop_schema_key(key: string) -> boolean {
 agent gemini_sanitize(node: unknown) -> unknown with pure {
   match (node) {
     case record(entries) -> {
-      for (let key in record.keys(target = entries), var acc: record[unknown] = record.empty()) {
+      for (let key in record.keys(target = entries), var accumulator: record[unknown] = record.empty()) {
         if (gemini_drop_schema_key(key = key)) {
-          next with { acc = acc }
+          next with { accumulator = accumulator }
         } else {
-          next with { acc = record.set(target = acc, key = key, value = gemini_sanitize(node = record.get(target = entries, key = key))) }
+          next with { accumulator = record.set(target = accumulator, key = key, value = gemini_sanitize(node = record.get(target = entries, key = key))) }
         }
-      } then (_values) { acc }
+      } then (_values) { accumulator }
     }
     case array(items) -> {
       for (let item in items) { next gemini_sanitize(node = item) }
@@ -287,11 +287,11 @@ agent gemini_base_body(client: connection, history: array[types.message]) -> rec
   // Only the FRESHEST history element inlines its files' content (the model just received them);
   // older elements shrink to handle notes — the model re-reads any of those with `view_image`.
   let count = array.length(target = history)
-  let older = for (let msg in array.slice(target = history, start = 0, end = count - 1)) {
-    next gemini_content(msg = msg, inline = false)
+  let older = for (let message in array.slice(target = history, start = 0, end = count - 1)) {
+    next gemini_content(message = message, inline = false)
   }
-  let freshest = for (let msg in array.slice(target = history, start = count - 1, end = count)) {
-    next gemini_content(msg = msg, inline = true)
+  let freshest = for (let message in array.slice(target = history, start = count - 1, end = count)) {
+    next gemini_content(message = message, inline = true)
   }
   let contents = array.concat(left = older, right = freshest)
   let base: record[unknown] = { contents = contents }
@@ -383,31 +383,31 @@ agent gemini_finish_reason(parsed: unknown) -> string {
 
 agent gemini_parse_step(parsed: unknown) -> types.step {
   let parts = gemini_parts(parsed = parsed)
-  let calls = for (let part in parts, var acc: array[types.tool_call] = []) {
+  let calls = for (let part in parts, var accumulator: array[types.tool_call] = []) {
     if (gemini_is_call(part = part)) {
-      next with { acc = array.append(target = acc, value = gemini_tool_call(part = part)) }
+      next with { accumulator = array.append(target = accumulator, value = gemini_tool_call(part = part)) }
     } else {
-      next with { acc = acc }
+      next with { accumulator = accumulator }
     }
-  } then (_parts) { acc }
+  } then (_parts) { accumulator }
   if (array.length(target = calls) == 0) {
     // Only the ANSWER parts become the reply: joining every part wholesale leaked the model's thought
     // summaries (and their mid-word fragments) straight into the Discord reply — observed. A part
     // with no string `text` (an image part, a bare signature carrier) contributes nothing either.
-    let texts = for (let part in parts, var acc: array[string] = []) {
+    let texts = for (let part in parts, var accumulator: array[string] = []) {
       if (gemini_is_thought(part = part)) {
-        next with { acc = acc }
+        next with { accumulator = accumulator }
       } else {
         match (json.field(target = part, key = "text")) {
           case string(value) -> {
-            next with { acc = array.append(target = acc, value = value) }
+            next with { accumulator = array.append(target = accumulator, value = value) }
           }
           case _ -> {
-            next with { acc = acc }
+            next with { accumulator = accumulator }
           }
         }
       }
-    } then (_parts) { acc }
+    } then (_parts) { accumulator }
     let joined = string.join(parts = texts, separator = "")
     let finish = gemini_finish_reason(parsed = parsed)
     // An EMPTY final with an abnormal finish is not an answer — the thought parts (stripped above)
