@@ -178,10 +178,11 @@ agent infer_with_tools[effect E lacks time.race_settled](
   tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
   max_steps: integer,
   @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
+  @"Tool names exempt from the deadline race (human-latency tools) — see `take_turn`." unbounded_tool_names: array[string] ?= [],
 ) -> string {
   // The one turn loop lives in `take_turn`; this one-shot shape re-raises a failure at the perform
   // site (a one-shot caller has no loop to absorb into) and keeps only the reply.
-  match (take_turn[E](conversation = history, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds)) {
+  match (take_turn[E](conversation = history, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds, unbounded_tool_names = unbounded_tool_names)) {
     case session_turn(reply => reply_text, conversation => _, used_tokens => _) -> reply_text
     case failed_turn(conversation => _, error => error) -> prelude.throw(error = error)
   }
@@ -243,7 +244,7 @@ boundary), and a call that outruns @budget_milliseconds@ (raced via `time.with_d
 call cancelled) alike — none of them reaches the app root. The result's `file` values are collected off the
 result tree so the provider can show them to the model (their `$katari_ref` handles are already visible in
 the result text)."
-agent dispatch_one[effect E lacks time.race_settled](tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}], call: types.tool_call, @"The per-call budget in milliseconds, or `null` for no deadline." budget_milliseconds: number | null) -> types.tool_result {
+agent dispatch_one[effect E lacks time.race_settled](tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}], call: types.tool_call, @"The per-call budget in milliseconds, or `null` for no deadline." budget_milliseconds: number | null, @"Metadata names exempt from the deadline race — human-latency tools; see `take_turn`." unbounded_tool_names: array[string] ?= []) -> types.tool_result {
   // A failing tool must never fail the conversation — that is the loop's whole premise, and it holds for
   // BOTH ways a call can crash: a `panic` (a crashed handler) and any typed `throw` — the tool's own
   // `throw[my_error]` and the boundary's `throw[call_error]` for hallucinated args alike — fold back HERE
@@ -290,7 +291,15 @@ agent dispatch_one[effect E lacks time.race_settled](tools: array[agent never ->
       // into a `file`. A `null` budget calls the tool bare; a number races it against the deadline
       // (`time.with_deadline` — first wins, the loser cancelled), so no single tool can hang the turn:
       // the timeout comes back to the model as an error result it reads, like every other tool failure.
-      match (budget_milliseconds) {
+      // A name in @unbounded_tool_names@ is exempted the same way a null budget is: deadlines bound
+      // MACHINE latency, and a tool legitimately waiting on a human is visible in the admin surface
+      // while it waits, so it is left unbounded instead of cancelled mid-ask.
+      let effective_budget = if (array.contains(target = unbounded_tool_names, value = call.name)) {
+        null
+      } else {
+        budget_milliseconds
+      }
+      match (effective_budget) {
         case null -> {
           return delivered(result = reflection.call_agent(target = tool, args = call.args))
         }
@@ -524,8 +533,9 @@ a caller whose protocol gives the empty reply meaning still receives the second 
 provider failure at any step returns `failed_turn` rather than unwinding, so an app-owned event loop
 absorbs it as one match arm. This is the ai package's ONE loop: sessions (`serve_session`) and
 resident agents (an app-owned `observation` handler over a `region` nursery) are compositions over
-it. The two knobs are policy the caller owns: @tool_budget_milliseconds@ deadlines every tool call
-(null = no deadline), and @nudge_empty_reply@ = false accepts an empty final as-is — for a caller
+it. The knobs are policy the caller owns: @tool_budget_milliseconds@ deadlines every tool call
+(null = no deadline), @unbounded_tool_names@ exempts the named human-latency tools from that
+deadline, and @nudge_empty_reply@ = false accepts an empty final as-is — for a caller
 whose protocol gives the empty reply meaning (a watcher that stays quiet), so a quiet turn does not
 pay the renudge's extra step."
 agent take_turn[effect E lacks time.race_settled](
@@ -534,6 +544,11 @@ agent take_turn[effect E lacks time.race_settled](
   max_steps: integer,
   @"The per-tool-call budget in milliseconds — every call races it via `time.with_deadline`, and a timeout
 comes back to the model as an error result. `null` (the default) sets no deadline." tool_budget_milliseconds: number | null ?= null,
+  @"The metadata names of tools EXEMPT from the deadline race — the human-latency tools: an
+approval-gated adapter that blocks on an operator's click, an MCP call that may park on an OAuth
+authorization. The doctrine: a deadline bounds MACHINE latency, and a pending ask or park is visible
+in the admin surface while it waits, so such a call may be left unbounded rather than cancelled
+mid-ask. Defaults to none — every tool stays under the budget." unbounded_tool_names: array[string] ?= [],
   @"Whether an empty final reply is renudged once for a plain-text answer (the interactive default).
 Pass `false` when the empty reply is a meaningful signal in your protocol." nudge_empty_reply: boolean ?= true,
 ) -> turn_result {
@@ -553,7 +568,7 @@ Pass `false` when the empty reply is a meaningful signal in your protocol." nudg
           }
           case types.step_call(calls => calls) -> {
             let results = parallel for (let call in calls) {
-              next dispatch_one[E](tools = tools, call = call, budget_milliseconds = tool_budget_milliseconds)
+              next dispatch_one[E](tools = tools, call = call, budget_milliseconds = tool_budget_milliseconds, unbounded_tool_names = unbounded_tool_names)
             }
             let with_calls = array.append(target = state.conversation, value = types.call_turn(calls = calls))
             next with { state = session_turn(reply = "", conversation = array.append(target = with_calls, value = types.result_turn(results = results)), used_tokens = measured) }
@@ -598,6 +613,7 @@ here is history, and the first compaction folds it into the summary)." context: 
   @"The per-message step budget." max_steps: integer,
   @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
   @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
+  @"Tool names exempt from the deadline race (human-latency tools) — see `take_turn`." unbounded_tool_names: array[string] ?= [],
   @"The session body: bridges a transport into `session_message`." continuation: agent (value: null) -> R with {...E, session_message},
 ) -> R {
   let effective_policy = match (policy) {
@@ -607,7 +623,7 @@ here is history, and the first compaction folds it into the summary)." context: 
   use handler (var state: session_state = session_state(conversation = context, used_tokens = 0)) {
     request session_message(content: string, files: array[file]) {
       let asked = array.append(target = state.conversation, value = types.turn(role = "user", text = content, files = files))
-      match (take_turn[E](conversation = asked, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds)) {
+      match (take_turn[E](conversation = asked, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds, unbounded_tool_names = unbounded_tool_names)) {
         // A served session is one-shot per message, so a provider failure re-raises at the perform
         // site for the app's transport bridge (the `session_message` caller) to handle.
         case failed_turn(conversation => _, error => error) -> { prelude.throw(error = error) }
@@ -685,6 +701,7 @@ agent serve_observations[R, effect E lacks time.race_settled](
   @"Where a turn's non-empty reply (and a step-failure notice) is delivered." deliver_to: agent (reply: string) -> null with E,
   @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
   @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
+  @"Tool names exempt from the deadline race (human-latency tools) — see `take_turn`." unbounded_tool_names: array[string] ?= [],
   @"The resident body: forks its sources and typically never returns (`region.watch`)." continuation: agent (value: null) -> R with {...E, observation},
 ) -> R {
   let effective_policy = match (policy) {
@@ -694,7 +711,7 @@ agent serve_observations[R, effect E lacks time.race_settled](
   use handler (var state: session_state = session_state(conversation = [], used_tokens = 0)) {
     request observation(source: string, content: string, files: array[file], author: string | null) {
       let injected = array.append(target = state.conversation, value = types.turn(role = "user", text = f"Notification from ${source}:\n${content}", files = files, author = author))
-      match (take_turn[E](conversation = injected, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds, nudge_empty_reply = false)) {
+      match (take_turn[E](conversation = injected, tools = tools, max_steps = max_steps, tool_budget_milliseconds = tool_budget_milliseconds, unbounded_tool_names = unbounded_tool_names, nudge_empty_reply = false)) {
         // ABSORB a provider failure: notify, annotate, await the next event — the resident loop
         // must survive a failed step, not unwind on it.
         case failed_turn(conversation => at_failure, error => error) -> {
