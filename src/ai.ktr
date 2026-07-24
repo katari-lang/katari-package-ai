@@ -742,6 +742,44 @@ agent serve_observations[R, effect E lacks time.race_settled](
   continuation(value = null)
 }
 
+// ── the supervisor: a restart loop with backoff and same-reason suppression ────
+//
+// A resident that must OUTLIVE its own crashes needs a supervisor: run one session, and when it ends
+// with a recoverable reason, wait a backoff and start a fresh one. The mechanism is generic — the
+// session body, the restart-notice sink, and the backoff numbers are all DATA — so an app keeps every
+// specific it owns: WHICH crashes are fatal (its session re-raises those PAST `supervise`, which only
+// ever sees a RETURNED recoverable reason), WHAT a restart notice says, and WHERE it goes. This is the
+// lifetime sibling of `serve_observations`: that one keeps a resident alive across a failed STEP; this
+// one keeps it alive across a failed SESSION.
+
+@"Supervise a restartable @session@ FOREVER: run one attempt, and when it ends by RETURNING a
+recoverable crash reason, call @on_restart@, wait the current backoff, and start a fresh attempt. The
+backoff starts at @initial_delay_ms@ and grows by @factor@ each time the SAME reason repeats (a
+sustained outage), capped at @max_delay_ms@; a CHANGED reason resets it to the floor. @on_restart@'s
+@repeated@ is whether this reason equals the immediately preceding one, so the sink can shorten (or
+suppress) a repeat notice to one quiet line. Fatal-vs-restartable is the SESSION's decision, not this
+loop's: a session that hits an unrecoverable error re-raises it, and it propagates through `supervise`
+UNTOUCHED to a handler the app installed above; `supervise` only ever sees the reason a session hands
+back by RETURNING, and every such return is a restart. Returns `never` — the loop ends only when a
+session's fatal re-raise unwinds past it."
+agent supervise[effect E](
+  @"One attempt: run the resident until it ends recoverably and RETURN the crash reason to restart from. A fatal error re-raises past `supervise` instead of returning." session: agent (value: null) -> string with E,
+  @"The restart-notice sink, called once per restart with the returned @reason@ and whether it @repeated@ the immediately preceding reason (so a repeat can be shortened or dropped)." on_restart: agent (reason: string, repeated: boolean) -> null with E,
+  @"The backoff floor in milliseconds — the first wait, and the wait a changed reason resets to. Default 30s." initial_delay_ms: number ?= 30000.0,
+  @"The factor the backoff grows by while the same reason repeats. Default 2." factor: number ?= 2.0,
+  @"The backoff ceiling in milliseconds — the growing delay never exceeds it. Default 15 minutes." max_delay_ms: number ?= 900000.0,
+) -> never with E | io {
+  forever (var delay: number = initial_delay_ms, var last_reason: string = "") {
+    let reason = session(value = null)
+    let repeated = reason == last_reason
+    on_restart(reason = reason, repeated = repeated)
+    time.sleep(milliseconds = delay)
+    // Grow the delay while the reason repeats (a sustained outage); reset to the floor when it changes.
+    let next_delay = if (repeated) { math.min(left = delay * factor, right = max_delay_ms) } else { initial_delay_ms }
+    next with { delay = next_delay, last_reason = reason }
+  }
+}
+
 // ── ambient-context middleware ────────────────────────────────────────────────
 
 @"Middleware over the seam: EVERY `infer_step`, prepend @inject@'s freshly computed text as a user
