@@ -1,9 +1,11 @@
 // Anthropic provider: serves the `ai.infer_step` request over the Messages API. Where OpenAI ships
 // tool arguments as a JSON string, Anthropic keeps them as parsed JSON inside `tool_use` content
 // blocks, keyed by a block id (carried in tool_call.opaque / tool_result.call_id) that the next user
-// turn echoes back as `tool_result` blocks — one message for the whole batch. A turn's image files
-// inline as `image` content blocks: the request body posts as an `http.json` value tree with
-// `http.fetch`, so each image's `data` slot base64s at the send boundary, never on the value plane.
+// turn echoes back as `tool_result` blocks — one message for the whole batch. A turn's files inline by
+// CONTENT TYPE (`anthropic_file_blocks` dispatches over `ai.file_kind`): an image as an `image` block, a
+// PDF as a `document` block, a textual file as text, and anything the API has no block for as a note that
+// says so. The request body posts as an `http.json` value tree with `http.fetch`, so each inlined file's
+// `data` slot base64s at the send boundary, never on the value plane.
 // Same agnostic vocabulary, different shaping — and the same one-line integration:
 // `use anthropic.provider(source = ...)`. Unlike the other two providers this one also has to ASK for
 // prompt caching, by marking `cache_control` breakpoints on the request it builds — see the
@@ -139,36 +141,6 @@ agent anthropic_role(@"The `ai.types` turn role (\"user\" / \"model\")." role: s
   }
 }
 
-@"Every file of a turn as a handle note, joined for the turn's text. The `$katari_ref` handle is the exact
-object the model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the
-note is the replay affordance — kept for an image too, alongside the image block that lets the model
-SEE it (see `anthropic_turn_content`)."
-agent anthropic_file_notes(@"The files attached to a turn." files: array[file]) -> string {
-  let notes = for (let attachment in files) { next f"\n[attached file: ${json.stringify(value = attachment)}]" }
-  string.join(parts = notes, separator = "")
-}
-
-@"The file's recorded content type, or \"\" when the handle is gone (freed, or never named a live blob).
-A gone file cannot inline — its handle note still rides — so `gone` folds to the same \"not an image\"
-signal as an unrecorded type, and never fails a whole step over one stale attachment."
-agent anthropic_content_type(@"The file to read." attachment: file) -> string {
-  // `files.content_type` throws `files.gone` for a stale handle (freed, or an id that never named a
-  // live blob). Catch exactly that and recover with "" (not an image), so one stale attachment never
-  // fails a whole step. The `files` module qualifier is nameable in type position — the `file`
-  // builtin-type keyword no longer shadows it.
-  use handler {
-    request prelude.throw(error: files.gone) -> never { break "" }
-  }
-  files.content_type(value = attachment)
-}
-
-@"Whether a file inlines as an Anthropic image block: its recorded content type begins \"image/\" (the
-Messages API image block takes only image media types). A file with another or no recorded type stays
-a handle note."
-agent anthropic_is_image(@"The file to test." attachment: file) -> boolean {
-  string.starts_with(value = anthropic_content_type(attachment = attachment), search = "image/")
-}
-
 @"A text content block — `{ \"type\": \"text\", \"text\": @text@ }`, built as a raw value tree."
 agent anthropic_text_block(@"The block's text." text: string) -> unknown {
   { "type" = "text", text = text }
@@ -178,36 +150,85 @@ agent anthropic_text_block(@"The block's text." text: string) -> unknown {
 `data` slot holds the file VALUE placed DIRECTLY into the tree. `http.json` materialises that slot —
 reading the bytes and base64-ing them in place — only at the send boundary, so the image content never
 rides the value plane, the durable call record or the trace."
-agent anthropic_image_block(@"The image file to inline." attachment: file) -> unknown {
+agent anthropic_image_block(
+  @"The image file to inline." attachment: file,
+  @"Its recorded content type, which the API takes as the block's `media_type`." media_type: string,
+) -> unknown {
   {
     "type" = "image",
     source = {
       "type" = "base64",
-      media_type = anthropic_content_type(attachment = attachment),
+      media_type = media_type,
       "data" = attachment,
     },
   }
 }
 
-@"A turn's content: the plain string (text + every file's handle note) when the turn carries no image,
-or an array of one text block plus one image block per image file when it does. An image file inlines
-so the model can SEE it; a non-image file stays a handle note (the image block takes only images). The
-text block still carries every file's handle note, so the model can replay any of them into a tool."
+@"A PDF content block — the SAME mechanism one arm over: `{ \"type\": \"document\", \"source\": {
+\"type\": \"base64\", \"media_type\": \"application/pdf\", \"data\": … } }`, with the file value in the
+`data` slot so its bytes base64 at the send boundary exactly like an image's. The Messages API reads a
+document's pages as text AND as images, which is why a PDF must take this block rather than degrade to a
+note: the model genuinely reads it."
+agent anthropic_document_block(
+  @"The PDF file to inline." attachment: file,
+  @"Its recorded content type — `application/pdf`, the only media type this block accepts." media_type: string,
+) -> unknown {
+  {
+    "type" = "document",
+    source = {
+      "type" = "base64",
+      media_type = media_type,
+      "data" = attachment,
+    },
+  }
+}
+
+@"ONE attached file as the content blocks it becomes — the per-file dispatch over `ai.file_kind`, one arm
+per shape the Messages API accepts. An image and a PDF inline as their own block, each preceded by its
+handle note so the model keeps the replay affordance; a textual file inlines as text (nothing on this wire
+carries it better); audio and video have no Messages API block at all, so they and every opaque type
+become the note that states the content is unreadable rather than a bare handle the model would guess from."
+agent anthropic_file_blocks(@"One file attached to a turn." attachment: file) -> array[unknown] {
+  match (ai.classify_file(attachment = attachment)) {
+    case ai.image_file(content_type => content_type) -> [
+      anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
+      anthropic_image_block(attachment = attachment, media_type = content_type),
+    ]
+    case ai.document_file(content_type => content_type) -> [
+      anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
+      anthropic_document_block(attachment = attachment, media_type = content_type),
+    ]
+    case ai.text_file(content_type => content_type) -> [
+      anthropic_text_block(text = ai.file_text_note(attachment = attachment, content_type = content_type)),
+    ]
+    case ai.audio_file(content_type => content_type) -> [
+      anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+    ]
+    case ai.video_file(content_type => content_type) -> [
+      anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+    ]
+    case ai.opaque_file(content_type => content_type) -> [
+      anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+    ]
+  }
+}
+
+@"A turn's content: the plain string when the turn carries no file, and otherwise the turn's text block
+followed by each file's blocks (`anthropic_file_blocks`). A file-less turn keeps the string shape both
+because it says the same thing in fewer bytes and because those bytes are the prompt-cache prefix — a
+turn whose rendering never changes keeps reading its cached span."
 agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's files." files: array[file]) -> unknown {
-  let image_blocks = array.flatten(target = for (let attachment in files) {
-    if (anthropic_is_image(attachment = attachment)) {
-      next [anthropic_image_block(attachment = attachment)]
-    } else {
-      next []
-    }
+  let file_blocks = array.flatten(target = for (let attachment in files) {
+    next anthropic_file_blocks(attachment = attachment)
   })
-  let note_text = f"${text}${anthropic_file_notes(files = files)}"
-  if (array.length(target = image_blocks) == 0) {
-    // No image to inline: the plain string content (text + handle notes), exactly as before.
-    note_text
+  if (array.length(target = file_blocks) == 0) {
+    text
   } else {
-    // Images present: a text block (text + every file's handle note) followed by the image blocks.
-    array.concat(left = [anthropic_text_block(text = note_text)], right = image_blocks)
+    // An EMPTY text block is rejected by the API, and a turn that is only attachments (an image posted
+    // with no caption) has empty text — so the text block rides only when there is text to put in it.
+    // Each file's blocks carry their own note, so nothing is lost when the heading is absent.
+    let heading: array[unknown] = if (text == "") { [] } else { [anthropic_text_block(text = text)] }
+    array.concat(left = heading, right = file_blocks)
   }
 }
 
@@ -271,8 +292,8 @@ agent anthropic_system_blocks(@"The system prompt; never the empty one, which se
   [anthropic_cached_block(block = anthropic_text_block(text = system))]
 }
 
-@"A message's content with the breakpoint on its last block. A turn with no image carries its content
-as a plain STRING, which has no block to mark: it becomes the one-element block array that says
+@"A message's content with the breakpoint on its last block. A turn with no attachment carries its
+content as a plain STRING, which has no block to mark: it becomes the one-element block array that says
 exactly the same thing."
 agent anthropic_cached_content(@"The message's content — a string or an array of blocks." content: unknown) -> unknown {
   match (content) {
@@ -391,8 +412,8 @@ agent anthropic_request_body(
     case author -> record.set(target = with_system, key = "metadata", value = { user_id = author })
   }
   // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
-  // slot contract base64s each `file` leaf — the image `data` slots placed directly above — in place at
-  // the send boundary, so the bytes never land on the value plane. A tool schema's literal `$ref` /
+  // slot contract base64s each `file` leaf — the image / document `data` slots placed directly above — in
+  // place at the send boundary, so the bytes never land on the value plane. A tool schema's literal `$ref` /
   // `$defs` keys ride verbatim because `meta.input` is already a document value spliced in as-is.
   if (array.length(target = tool_metas) == 0) {
     with_metadata
@@ -510,7 +531,7 @@ agent anthropic_usage(@"The parsed response document." parsed: unknown) -> types
 }
 
 @"One Anthropic model step over the history + tool schemas (the body built as a value tree and the
-reply parsed by `post_json` in Katari; only the POST leaves the runtime, and each image `file` in the
+reply parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined `file` in the
 body base64s at that send boundary via the `http.json` slot contract)."
 agent anthropic_infer_step(
   @"The provider connection." client: connection,
@@ -521,7 +542,7 @@ agent anthropic_infer_step(
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
   let map = ai.build_name_map(tool_metas = tool_metas)
   let body = anthropic_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
-  // `post_json` serialises the value tree as application/json (each image `file` leaf read from the blob
+  // `post_json` serialises the value tree as application/json (each inlined `file` leaf read from the blob
   // store and base64'd only at the send boundary), checks the status (a non-2xx is `http.status_error`),
   // and parses the reply back to a document value.
   let response = http.post_json(

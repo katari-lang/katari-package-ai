@@ -1,8 +1,9 @@
 // Gemini provider: serves the `ai.infer_step` request over the generativelanguage generateContent
 // API. `use gemini.provider(model = ..., source = ...)` at the app root is the whole integration —
 // the request body is built as a value tree and the response parsed from `json`, entirely in Katari;
-// the only network call is the prelude's `http.fetch` with an `http.json` body, so a turn's image
-// `file` inlines (its `data` slot base64s at the send boundary, never on the value plane). Swapping
+// the only network call is the prelude's `http.fetch` with an `http.json` body, so a turn's inlinable
+// `file` (an image, a PDF, audio, video — `gemini_file_parts_of` dispatches over `ai.file_kind`) rides an
+// `inlineData` part whose `data` slot base64s at the send boundary, never on the value plane. Swapping
 // providers means swapping this one `use` line; nothing else in the app or the `ai` layer knows
 // Gemini exists.
 // Attribution: `generateContent` has NO end-user metadata field (unlike Anthropic's
@@ -158,58 +159,83 @@ agent gemini_result_part(result: types.tool_result) -> unknown {
   }
 }
 
-@"The file's recorded content type, or \"\" when the handle is gone (freed, or never named a live blob).
-A gone file cannot inline — its handle note still rides — so `gone` folds to the same \"cannot inline\"
-signal as an unrecorded type, and never fails a whole step over one stale attachment."
-agent gemini_content_type(attachment: file) -> string {
-  // `files.content_type` throws `files.gone` for a stale handle (freed, or an id that never named a
-  // live blob). Catch exactly that and recover with "" (cannot inline), so one stale attachment never
-  // fails a whole step. The `files` module qualifier is nameable in type position — the `file`
-  // builtin-type keyword no longer shadows it.
-  use handler {
-    request prelude.throw(error: files.gone) -> never { break "" }
-  }
-  files.content_type(value = attachment)
-}
-
-@"A file's content as an inlineData part — what lets the model actually SEE an image. The `data` slot
+@"A file's content as an inlineData part — what lets the model actually SEE the file. The `data` slot
 holds the file VALUE placed DIRECTLY into the tree; `http.json` reads its bytes and base64s them in
 place only at the send boundary, so the content never rides the value plane. Only the freshest history
 element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
-agent gemini_inline_part(attachment: file) -> unknown {
+agent gemini_inline_part(
+  @"The file to inline." attachment: file,
+  @"Its recorded content type, which `generateContent` takes as the part's `mimeType`." mime_type: string,
+) -> unknown {
   // The file rides as its handle in the `data` slot; `http.json` base64s it at the send boundary (no
   // `read_base64`).
   {
     inlineData = {
-      mimeType = gemini_content_type(attachment = attachment),
+      mimeType = mime_type,
       "data" = attachment,
     },
   }
 }
 
-@"A file as its `$katari_ref` handle note — the resting representation. The handle is the exact object the
-model replays into a tool call (`view_image` to re-see it, `send_files` to post it), so the note IS
-the affordance, not just a description."
+@"A file as its `$katari_ref` handle note part — the resting representation, and the affordance the model
+replays into any tool it holds that takes a file (`ai.file_handle_note` states the note once for all
+three providers)."
 agent gemini_handle_part(attachment: file) -> unknown {
-  gemini_text_part(text = f"[attached file: ${json.stringify(value = attachment)}]")
+  gemini_text_part(text = ai.file_handle_note(attachment = attachment))
 }
 
-@"Render a turn's / result's files: inlined (content + handle note, so the model both sees the image
-and learns the handle to replay) while fresh, the handle note alone once older — the model re-reads
-an old image on demand with `view_image`. A file with no recorded MIME type cannot inline."
+@"ONE attached file as the parts it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
+`generateContent` accepts. An image, a PDF, audio and video all ride the SAME `inlineData` part keyed by
+their mime type (that one part is Gemini's whole multimodal surface), each preceded by its handle note so
+the model keeps the replay affordance; a textual file rides as text, capped; and a content type Gemini has
+no inline family for becomes the note that says the content is unreadable. That last arm is a NARROWING of
+the rule this replaced (\"inline anything with a recorded type\"), which shipped an archive or a font as an
+inlineData part and earned a 400 in the middle of a conversation."
+agent gemini_file_parts_of(attachment: file, inline: boolean) -> array[unknown] {
+  // An OLDER history element shows the handle alone, whatever the type: re-sending every attachment's
+  // content on every step is what makes a long conversation's requests huge, and the model re-reads any
+  // older file on demand with `view_file`.
+  if (!inline) {
+    [gemini_handle_part(attachment = attachment)]
+  } else {
+    match (ai.classify_file(attachment = attachment)) {
+      case ai.image_file(content_type => content_type) -> [
+        gemini_handle_part(attachment = attachment),
+        gemini_inline_part(attachment = attachment, mime_type = content_type),
+      ]
+      case ai.document_file(content_type => content_type) -> [
+        gemini_handle_part(attachment = attachment),
+        gemini_inline_part(attachment = attachment, mime_type = content_type),
+      ]
+      case ai.audio_file(content_type => content_type) -> [
+        gemini_handle_part(attachment = attachment),
+        gemini_inline_part(attachment = attachment, mime_type = content_type),
+      ]
+      case ai.video_file(content_type => content_type) -> [
+        gemini_handle_part(attachment = attachment),
+        gemini_inline_part(attachment = attachment, mime_type = content_type),
+      ]
+      case ai.text_file(content_type => content_type) -> [
+        gemini_text_part(text = ai.file_text_note(attachment = attachment, content_type = content_type)),
+      ]
+      case ai.opaque_file(content_type => content_type) -> [
+        gemini_text_part(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+      ]
+    }
+  }
+}
+
+@"Render a turn's / result's files: each file's parts by content type while fresh (@inline@), the handle
+note alone once older."
 agent gemini_file_parts(files: array[file], inline: boolean) -> array[unknown] {
   array.flatten(target = for (let attachment in files) {
-    if (inline && gemini_content_type(attachment = attachment) != "") {
-      next [gemini_handle_part(attachment = attachment), gemini_inline_part(attachment = attachment)]
-    } else {
-      next [gemini_handle_part(attachment = attachment)]
-    }
+    next gemini_file_parts_of(attachment = attachment, inline = inline)
   })
 }
 
 @"One history element as a Gemini content. @inline@ marks the freshest element — the only one whose
 files inline their content (older elements show handles only, keeping the request small; the model
-re-reads any old image with `view_image`)."
+re-reads any older file with `view_file`)."
 agent gemini_content(message: types.message, inline: boolean) -> unknown {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {
@@ -288,7 +314,7 @@ instruction. Kept a `record` so each caller extends it — `gemini_request_body`
 `gemini_infer_object` with the structured-output generationConfig."
 agent gemini_base_body(client: connection, history: array[types.message]) -> record[unknown] {
   // Only the FRESHEST history element inlines its files' content (the model just received them);
-  // older elements shrink to handle notes — the model re-reads any of those with `view_image`.
+  // older elements shrink to handle notes — the model re-reads any of those with `view_file`.
   let count = array.length(target = history)
   let older = for (let message in array.slice(target = history, start = 0, end = count - 1)) {
     next gemini_content(message = message, inline = false)
@@ -441,12 +467,12 @@ agent gemini_usage(parsed: unknown) -> types.usage {
 }
 
 @"One Gemini model step over the history + tool schemas (the body built as a value tree and the reply
-parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined image `file` in the
-body base64s at that send boundary via the `http.json` slot contract)."
+parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined `file` in the body
+base64s at that send boundary via the `http.json` slot contract)."
 agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result {
   let body = gemini_request_body(client = client, history = history, tool_metas = tool_metas)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
-  // `post_json` serialises the value tree as application/json (each inlined image `file` leaf read from
+  // `post_json` serialises the value tree as application/json (each inlined `file` leaf read from
   // the blob store and base64'd only at the send boundary), checks the status (a non-2xx is
   // `http.status_error`), and parses the reply back to a document value.
   let response = http.post_json(

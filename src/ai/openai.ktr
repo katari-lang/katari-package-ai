@@ -3,6 +3,9 @@
 // tool_call.opaque / tool_result.call_id) and ships the arguments as a JSON *string*. Same agnostic
 // vocabulary, different shaping — and the same one-line integration:
 // `use openai.provider(model = ..., source = ...)`.
+// Files: a message's content here is a plain STRING, so a TEXTUAL attachment inlines as text (capped) and
+// every other kind rides a note that tells the model plainly it cannot read that content type — see the
+// comment above `openai_messages_of` for why an image or a PDF cannot inline on this wire.
 
 import ai
 import ai.types
@@ -136,14 +139,38 @@ agent openai_call_entry(call: types.tool_call, map: ai.name_map) -> unknown {
   }
 }
 
-@"A turn's files as text notes appended to its content. This provider keeps files handle-only (no
-image inlining — the Gemini and Anthropic providers are the multimodal ones); the handle note still
-lets the model replay a file into a tool call (`view_image` / `send_files`)."
+@"ONE attached file as the text it contributes to a message's content — the per-file dispatch over
+`ai.file_kind`, over the two outcomes this wire can offer. A TEXTUAL file inlines its decoded text
+(capped): the Chat Completions content is a plain string, so text needs no wire shape at all and this
+provider reads a .md / .csv / .json as well as either other one does. Every other kind gets the note that
+states the content is unreadable — see `openai_messages_of` for why the binary kinds cannot inline here.
+The arms are spelled out rather than collapsed into a catch-all so that a NEW `file_kind` fails to compile
+here and this provider has to decide about it, instead of silently degrading to a note."
+agent openai_file_note(attachment: file) -> string {
+  match (ai.classify_file(attachment = attachment)) {
+    case ai.text_file(content_type => content_type) -> ai.file_text_note(attachment = attachment, content_type = content_type)
+    case ai.image_file(content_type => content_type) -> ai.unreadable_file_note(attachment = attachment, content_type = content_type)
+    case ai.document_file(content_type => content_type) -> ai.unreadable_file_note(attachment = attachment, content_type = content_type)
+    case ai.audio_file(content_type => content_type) -> ai.unreadable_file_note(attachment = attachment, content_type = content_type)
+    case ai.video_file(content_type => content_type) -> ai.unreadable_file_note(attachment = attachment, content_type = content_type)
+    case ai.opaque_file(content_type => content_type) -> ai.unreadable_file_note(attachment = attachment, content_type = content_type)
+  }
+}
+
+@"A turn's files as the text they contribute, each on its own line."
 agent openai_file_notes(files: array[file]) -> string {
-  let notes = for (let attachment in files) { next f"\n[attached file: ${json.stringify(value = attachment)}]" }
+  let notes = for (let attachment in files) { next f"\n${openai_file_note(attachment = attachment)}" }
   string.join(parts = notes, separator = "")
 }
 
+// WHY a binary attachment cannot inline on this provider, when the API itself would take it: Chat
+// Completions carries an image as `image_url.url` and a PDF as `file.file_data`, and both are DATA URIs —
+// a string with the base64 INSIDE it. `http.json`'s slot contract replaces a whole slot with a file's
+// base64; it cannot build `"data:application/pdf;base64," ++ <the bytes>`. Producing that string means
+// `files.read_base64` onto the value plane, which is exactly what this codebase moved the AI providers
+// away from (docs/2026-07-18-http-file-body.md). So the binary kinds report honestly here instead, and the
+// wire shape stays a plain string. Text is different in kind, not degree: its content IS a string, so it
+// inlines with no data URI and no slot at all.
 agent openai_messages_of(message: types.message, map: ai.name_map) -> array[unknown] {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {

@@ -8,8 +8,9 @@ module, not editing the loop.
 
 - `ai` — the loop. `ai.infer_with_tools(history, tools, max_steps)` runs the model until it stops
   calling tools, dispatching each tool batch concurrently (`parallel for`) and validating every call
-  against its tool's schema (`reflection.call_agent`). Also exposes `ai.view_image` (a tool that
-  inlines an image for the model to look at); `use ai.serve_session(...)` — the chat-bot serve
+  against its tool's schema (`reflection.call_agent`). Also exposes `ai.view_file` (a tool that reads an
+  attachment — an image, a PDF, or a text document) and the `file_kind` classification every provider
+  dispatches over (see **Attached files** below); `use ai.serve_session(...)` — the chat-bot serve
   skeleton as one provider (a durable conversation answering `ai.session_message`, with token
   metering off the seam's `usage` and automatic compaction past a threshold; the summary prompt,
   the threshold and the kept tail are overridable scalars); `ai.compact(history, policy)` on its
@@ -24,20 +25,61 @@ module, not editing the loop.
   step's token accounting (`usage`, carried by `step_result` — what `ai.infer_step` returns). Apps
   and providers speak only this; no wire-format detail leaks in.
 - `ai.gemini` — a provider over Google's `generateContent` API. `use gemini.provider(model = ...,
-  api_key = ...)` serves `ai.infer_step` for the continuation. **Images: yes** — a turn's image files
-  inline as `inlineData` parts (freshest turn only, to keep the request small).
-- `ai.openai` — a provider over the OpenAI responses API. `use openai.provider(model = ...,
-  api_key = ...)` — swap it for `gemini.provider` (or vice versa) with no other change. **Images: no**
-  — a turn's files appear to the model as handle notes only.
+  api_key = ...)` serves `ai.infer_step` for the continuation. **Files: images, PDFs, audio, video and
+  text** — the binary kinds all ride the one `inlineData` part keyed by their mime type; text inlines as
+  text (freshest turn only, to keep the request small).
+- `ai.openai` — a provider over the OpenAI Chat Completions API. `use openai.provider(model = ...,
+  api_key = ...)` — swap it for `gemini.provider` (or vice versa) with no other change. **Files: text
+  only** — a message's content here is a plain string, which text needs no wire shape to ride; an image or
+  a PDF would need a `data:` URI (base64 inside a string), which the `http.json` slot contract cannot
+  build, so those report to the model as unreadable rather than being faked.
 - `ai.anthropic` — a provider over the Anthropic Messages API. `use anthropic.provider(api_key =
   ...)` — `model` defaults to `claude-sonnet-5` and `max_tokens` (the per-step output cap the API
-  requires) to 4096; swap it for either other provider with no other change. **Images: yes** — a
-  turn's image files inline as `image` content blocks.
+  requires) to 4096; swap it for either other provider with no other change. **Files: images, PDFs and
+  text** — an `image` content block, a `document` content block (base64 `application/pdf`), and inlined
+  text respectively; audio and video have no Messages API block, so they report as unreadable.
 
 Pure Katari — no FFI sidecar. The only network call is the prelude's HTTP client: the Gemini and
-Anthropic providers post an `http.json` value tree with `http.fetch` (so a turn's image `file` leaves
-base64 at the send boundary, never on the value plane), OpenAI a plain-body `http.post_json`; every
-request body is built and every response parsed as `json` values in Katari.
+Anthropic providers post an `http.json` value tree with `http.fetch` (so an inlined `file` leaves base64
+at the send boundary, never on the value plane), OpenAI a plain-body `http.post_json`; every request body
+is built and every response parsed as `json` values in Katari.
+
+## Attached files
+
+How a file reaches the model follows from ONE datum — its recorded content type. `ai.classify_file` turns
+that string into the closed `ai.file_kind` sum (`image_file`, `document_file`, `text_file`, `audio_file`,
+`video_file`, `opaque_file`), and each provider MATCHES it, one arm per shape its own API accepts:
+
+| content type | Anthropic | Gemini | OpenAI |
+| --- | --- | --- | --- |
+| `image/*` | `image` block | `inlineData` part | unreadable note |
+| `application/pdf` | `document` block | `inlineData` part | unreadable note |
+| `text/*`, `application/json` / `xml` / `csv` | inlined text | inlined text | inlined text |
+| `audio/*`, `video/*` | unreadable note | `inlineData` part | unreadable note |
+| anything else (`application/octet-stream`, an archive, an unrecorded or freed handle) | unreadable note | unreadable note | unreadable note |
+
+Two rules make this honest rather than merely wide:
+
+- **Inlined text is capped and the cut is announced.** `ai.file_text_note` prefixes the handle and the
+  content type, then the decoded text, cut at 24000 code points (~6k tokens) with an explicit `TRUNCATED`
+  marker stating how much of the file was sent. A model that cannot tell it is holding a fragment answers
+  confidently from the fragment, so the tail is never dropped silently.
+- **An unreadable file SAYS it is unreadable.** `ai.unreadable_file_note` states the content type and that
+  the content is absent, and tells the model to report that instead of guessing — a bare handle with no
+  explanation is what makes a model invent a file's contents.
+
+The content type is taken as recorded; nothing here sniffs a file's bytes to guess a better type. A sender
+that labels a `.md` as `application/octet-stream` therefore gets the unreadable note, and the fix belongs
+at the upload boundary that recorded the type. What IS normalized is the label's own syntax — RFC 2045
+makes a media type case-insensitive and lets a sender append parameters, so `Text/Plain; charset=utf-8`
+reads as `text/plain` for both the dispatch and the provider's `media_type` field.
+
+The table above is the TURN path (a file the user attached). A file arriving in a **tool result** — what
+`ai.view_file` hands back — inlines only on Gemini, because the Anthropic and OpenAI providers render a
+tool result as its text alone. That is why `ai.view_file` answers a text document and an unreadable type
+with a VALUE (the text, or the note) instead of leaving both to the provider: those two work on every
+provider. An image or a PDF re-read through the tool still depends on the provider, so the tool's `@doc`
+tells the model to say it cannot see the file rather than guess when no content appears.
 
 **The seam is outcome-typed; providers never throw.** `ai.infer_step` / `ai.infer_object` return an
 OUTCOME sum — `inferred(result)` on success, `inference_failed(error)` on failure — rather than throwing a
@@ -79,7 +121,7 @@ agent solve(task: string) -> string with io {
   )
   ai.infer_with_tools(
     history = [types.turn(role = "user", text = task, files = [])],
-    tools = [ai.view_image],   // add your own tools here
+    tools = [ai.view_file],    // add your own tools here
     max_steps = 12,
   )
 }

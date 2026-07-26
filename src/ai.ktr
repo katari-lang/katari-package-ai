@@ -12,7 +12,9 @@
 // Files flow through the loop as blob handles: a tool result's `file` values are collected off the
 // result's wire form (`collect_result_files`) and ride the `tool_result`, so the provider can inline
 // their content for the model while the result is fresh — and the model can replay any handle it has
-// seen into a later tool call (`view_image` re-reads one on demand).
+// seen into a later tool call (`view_file` re-reads one on demand). WHICH content a provider can inline
+// is one decision over the file's recorded content type — the `file_kind` sum below, which every
+// provider dispatches over.
 
 import ai.types
 
@@ -161,11 +163,201 @@ agent ensure_unique_names(metas: array[reflection.agent_metadata]) -> array[refl
   metas
 }
 
-@"Tool: load an image file into your visual context. Pass the file's handle object — a bare
-{\"$katari_ref\": \"<id>\"} suffices (copy the id from the conversation); the image content arrives with
-this tool's result, so you can see it on your next step."
-agent view_image(image: file) -> file {
-  image
+// ── attached files: one dispatch over the recorded content type ───────────────
+//
+// How a file reaches a model follows from ONE datum: its recorded content type. `classify_file` turns
+// that string into the closed `file_kind` sum, and each provider MATCHES the sum — one arm per wire
+// shape its own API accepts (Anthropic's `document` block, Gemini's `inlineData` part, a text block, or
+// the note that says plainly the content cannot be read). The classification lives here, once, so the
+// three providers cannot drift on what counts as textual; the arms live in the providers, because only
+// a provider knows its own wire.
+//
+// The content type IS the data and it is taken as recorded: nothing here reads a file's bytes to guess a
+// better type. A sender that labels a .md as `application/octet-stream` therefore lands in
+// `opaque_file`, and the model is told it cannot read it — the fix belongs at the upload boundary that
+// recorded the type, not in a sniffer here that would sometimes be wrong about a file the model then
+// answers from.
+
+@"An image the model can look at (`image/*`). @content_type@ is the exact recorded type because that is
+what the wire's `media_type` / `mimeType` field must carry — the family decided the arm, the exact type
+rides along as its datum."
+data image_file(@"The file's recorded content type." content_type: string)
+
+@"A PDF (`application/pdf`): a document a model reads as pages — text, tables and figures alike — on a
+provider whose API has a document shape for it (Anthropic's `document` block, Gemini's `inlineData`)."
+data document_file(@"The file's recorded content type." content_type: string)
+
+@"A file whose bytes ARE text: any `text/*` (plain, markdown, csv, html, …), plus `application/json`,
+`application/xml` and `application/csv`. This arm needs no API support at all — the decoded text inlines
+as ordinary text (capped; see `file_text_note`), so every provider serves it."
+data text_file(@"The file's recorded content type." content_type: string)
+
+@"Audio (`audio/*`): inlinable on a provider whose model takes audio input, a note to the model on one
+that does not."
+data audio_file(@"The file's recorded content type." content_type: string)
+
+@"Video (`video/*`): inlinable on a provider whose model takes video input, a note to the model on one
+that does not."
+data video_file(@"The file's recorded content type." content_type: string)
+
+@"A file no arm above covers — an archive, an office document, a font, an unrecorded or gone handle.
+No provider can put its content in front of the model, so every provider reports it as unreadable
+instead of shipping a bare handle the model would answer from."
+data opaque_file(@"The file's recorded content type; \"\" when none was recorded." content_type: string)
+
+// How ONE attached file can reach a model, off its recorded content type. (Type synonyms take no docs.)
+type file_kind = image_file | document_file | text_file | audio_file | video_file | opaque_file
+
+@"The file's recorded content type, or \"\" when the handle is gone (freed, or an id that never named a
+live blob). A gone file has no content to inline — the model is told so — so `gone` folds to the same
+unreadable signal as an unrecorded type and never fails a whole step over one stale attachment."
+agent file_content_type(@"The file to read." attachment: file) -> string {
+  // `files.content_type` throws `files.gone` for a stale handle. Catch exactly that and recover with ""
+  // (an unrecorded type, hence `opaque_file`), so one stale attachment never fails a whole step.
+  use handler {
+    request prelude.throw(error: files.gone) -> never { break "" }
+  }
+  files.content_type(value = attachment)
+}
+
+@"@content_type@ in the one form both a dispatch and a wire field can use: the media type alone,
+lowercased, with any parameter dropped (\"Text/Plain; charset=utf-8\" becomes \"text/plain\"). RFC 2045
+makes a media type case-insensitive and lets a sender append parameters, and an HTTP download records
+exactly those forms — so the raw string is the wrong thing to compare (`application/pdf; version=1.7`
+would miss the PDF arm and read as unreadable) and the wrong thing to ship (a provider's `media_type`
+field takes the bare type)."
+agent normalized_content_type(@"The recorded content type." content_type: string) -> string {
+  let without_parameters = match (string.index_of(value = content_type, search = ";")) {
+    case null -> content_type
+    case index -> string.slice(value = content_type, start = 0, end = index)
+  }
+  string.to_lower(value = string.trim(value = without_parameters))
+}
+
+@"The content type's FAMILY — the token before the \"/\" (\"image\" for \"image/png\"), or the whole
+string when there is no slash. The family is the dispatch key: every `image/*` reaches a model the same
+way, so a provider needs one arm per family rather than one per media type."
+agent content_type_family(@"The recorded content type." content_type: string) -> string {
+  match (string.index_of(value = content_type, search = "/")) {
+    case null -> content_type
+    case index -> string.slice(value = content_type, start = 0, end = index)
+  }
+}
+
+@"How @attachment@ can reach a model, from its recorded content type alone — the `file_kind` sum every
+provider dispatches over. The `application/*` types that are not their own family are named exactly (a
+PDF is a document; JSON / XML / CSV are text), and everything else falls to its family. The type the
+verdict carries is the NORMALIZED one, so a provider ships a `media_type` its API accepts whatever form
+the sender recorded."
+agent classify_file(@"The file to classify." attachment: file) -> file_kind {
+  let content_type = normalized_content_type(content_type = file_content_type(attachment = attachment))
+  match (content_type) {
+    case "application/pdf" -> document_file(content_type = content_type)
+    case "application/json" -> text_file(content_type = content_type)
+    case "application/xml" -> text_file(content_type = content_type)
+    case "application/csv" -> text_file(content_type = content_type)
+    case _ -> classify_content_type_family(content_type = content_type)
+  }
+}
+
+@"The family half of `classify_file`: `image/*`, `text/*`, `audio/*`, `video/*` — and `opaque_file` for
+any other family, an unrecorded type included."
+agent classify_content_type_family(@"The recorded content type." content_type: string) -> file_kind {
+  match (content_type_family(content_type = content_type)) {
+    case "image" -> image_file(content_type = content_type)
+    case "text" -> text_file(content_type = content_type)
+    case "audio" -> audio_file(content_type = content_type)
+    case "video" -> video_file(content_type = content_type)
+    case _ -> opaque_file(content_type = content_type)
+  }
+}
+
+// The notes below name no OTHER package's tool, on purpose. This package cannot know which tools the app
+// handed the model, and a note promising one the holder lacks sends the model chasing a tool that is not
+// there — which is exactly how `send_files` stayed advertised here long after the chat packages deleted
+// it. State what the handle IS and let the model match it against the tool list it actually holds;
+// `view_file` is the one tool this package owns, so it is the one a note may name.
+
+@"A file as its `$katari_ref` handle note — the resting representation every provider shows for an
+attachment. The handle is the exact object a model replays into a tool call, so the note IS the
+affordance and not a description: any tool the model holds that takes a file accepts this value."
+agent file_handle_note(@"The file to note." attachment: file) -> string {
+  f"[attached file: ${json.stringify(value = attachment)}]"
+}
+
+@"How a content type reads inside a note: the type itself, or the statement that none was recorded (a
+bare \"\" tells a model nothing)."
+agent content_type_label(@"The recorded content type." content_type: string) -> string {
+  match (content_type) {
+    case "" -> "no recorded content type"
+    case recorded -> f"content type ${recorded}"
+  }
+}
+
+@"The note for a file this model connection cannot show: the handle, the content type, and the plain
+statement that the CONTENT is absent. Stating the limit is the whole point — handed a bare handle with
+no content and no explanation, a model answers from the file's look and invents the rest, so the note
+tells it to report the gap instead."
+agent unreadable_file_note(
+  @"The file to note." attachment: file,
+  @"Its recorded content type." content_type: string,
+) -> string {
+  f"[attached file: ${json.stringify(value = attachment)} — ${content_type_label(content_type = content_type)}. Its CONTENT is not available to you: this model connection cannot read that content type. Say so if you are asked about it; do not guess what it contains.]"
+}
+
+@"A textual file as text the model reads: a header naming the handle and the content type, then the
+decoded content, cut at @max_characters@ code points with an explicit marker when it overflows. The
+marker is not decoration — a model that cannot tell it is holding a FRAGMENT answers confidently from
+the fragment. The 24000-code-point default is ~6k tokens: half again the `web` package's page budget,
+because an attachment cannot be re-read at another offset the way a page can be re-fetched, and still
+small enough that several attachments fit one turn."
+agent file_text_note(
+  @"The file to inline." attachment: file,
+  @"Its recorded content type." content_type: string,
+  @"The truncation budget, in code points." max_characters: integer ?= 24000,
+) -> string {
+  let text = file_text(attachment = attachment)
+  let length = string.length(value = text)
+  let header = f"[attached file: ${json.stringify(value = attachment)} — ${content_type_label(content_type = content_type)}, ${length} characters. Its text follows.]"
+  if (length > max_characters) {
+    let head = string.slice(value = text, start = 0, end = max_characters)
+    f"${header}\n${head}\n[… TRUNCATED: the first ${max_characters} of ${length} characters are shown; the rest was not sent. Treat this as a fragment, and say so rather than answering as if you had the whole file.]"
+  } else {
+    f"${header}\n${text}"
+  }
+}
+
+@"A file's bytes decoded as UTF-8 text — the read behind `file_text_note`. The whole content transits the
+value plane because the runtime has no partial-read primitive; it is a PRIM read, recomputed on replay
+rather than recorded, so nothing durable grows by the file's size. A gone handle reads as \"\", the same
+recovery as `file_content_type` (classification already routes a gone handle to `opaque_file`, so this is
+totality for the vanishing case of a file freed between the two reads)."
+agent file_text(@"The file to read." attachment: file) -> string {
+  use handler {
+    request prelude.throw(error: files.gone) -> never { break "" }
+  }
+  string.from_base64(value = files.read_base64(value = attachment))
+}
+
+@"Tool: read a file that is in this conversation — an image, a PDF, or a text document. Pass the file's
+handle object; a bare {\"$katari_ref\": \"<id>\"} suffices (copy the id from the conversation).
+A text document (`text/*`, JSON, XML, CSV) comes back AS TEXT in this tool's result, cut at a cap with an
+explicit truncation marker when it is long. An image, a PDF, audio or video comes back as the file itself,
+which the model connection places in your context if its API accepts that type — so if the content does
+not appear, say you cannot see it rather than guessing. A content type nothing can read (an archive, an
+office document, an unrecorded type) comes back as a note saying exactly that, and reporting it is then
+the correct answer."
+agent view_file(@"The file to read: its handle object, as it appears in the conversation." attachment: file) -> file | string {
+  // The same content-type dispatch the providers run, at the one point where an arm can answer with a VALUE
+  // instead of a wire block — which is why two arms answer here rather than deferring: text needs no API
+  // support, so it reads identically on every provider, and an unreadable type is unreadable on all of them,
+  // so saying so beats handing back a bare handle the model would answer from. Every other kind returns the
+  // file for the provider to inline through whichever block its own API accepts.
+  match (classify_file(attachment = attachment)) {
+    case text_file(content_type => content_type) -> file_text_note(attachment = attachment, content_type = content_type)
+    case opaque_file(content_type => content_type) -> unreadable_file_note(attachment = attachment, content_type = content_type)
+    case _ -> attachment
+  }
 }
 
 @"Run the tool-using model loop, generic over the tools' shared effect @E@: derive each tool's schema
