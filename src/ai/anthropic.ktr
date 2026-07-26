@@ -184,19 +184,52 @@ agent anthropic_document_block(
   }
 }
 
+@"Whether the Messages API's image block accepts @media_type@. The documented set is exactly four —
+\"Claude supports JPEG, PNG, GIF, and WebP images (`image/jpeg`, `image/png`, `image/gif`,
+`image/webp`)\" — and any other image type is a 400 on the whole request. `image/*` is a wide family: a
+scanned fax arrives as `image/tiff` and a diagram as `image/svg+xml`, both now routinely, so the family
+alone cannot decide this arm."
+agent anthropic_image_media_type(@"The file's normalized content type." media_type: string) -> boolean {
+  match (media_type) {
+    case "image/jpeg" -> true
+    case "image/png" -> true
+    case "image/gif" -> true
+    case "image/webp" -> true
+    case _ -> false
+  }
+}
+
+@"An image file's blocks: the handle note and the `image` block when the API accepts the media type, and the
+unreadable note when it does not. A type outside the accepted four must NOT be shipped hopefully — the 400
+it earns fails the whole step, and a step that fails takes the turn with it, whereas the note costs the
+model one honest sentence and the conversation continues."
+agent anthropic_image_blocks(
+  @"The image file." attachment: file,
+  @"Its normalized content type." media_type: string,
+) -> array[unknown] {
+  if (anthropic_image_media_type(media_type = media_type)) {
+    [
+      anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
+      anthropic_image_block(attachment = attachment, media_type = media_type),
+    ]
+  } else {
+    [anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = media_type))]
+  }
+}
+
 @"ONE file as the content blocks it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
-the Messages API accepts. An image and a PDF inline as their own block, each preceded by its handle note so
-the model keeps the replay affordance; a textual file inlines as text (nothing on this wire carries it
-better); audio and video have no Messages API block at all, so they and every opaque type become the note
-that states the content is unreadable rather than a bare handle the model would guess from. The SAME set of
+the Messages API accepts. An image (of an accepted media type — see `anthropic_image_blocks`) and a PDF
+inline as their own block, each preceded by its handle note so the model keeps the replay affordance; a
+textual file inlines as text (nothing on this wire carries it better); audio and video have no Messages API
+block at all, so they and every opaque type become the note that states the content is unreadable rather
+than a bare handle the model would guess from. The document arm needs no media-type guard of its own:
+`ai.classify_file` reaches it only for exactly `application/pdf`, which is the only type the block takes.
+The SAME set of
 block types is legal in a turn's content and inside a tool_result's content, so one dispatch serves both
 positions — a file the user attached and a file a tool handed back reach the model identically."
 agent anthropic_file_blocks(@"One file, attached to a turn or returned by a tool." attachment: file) -> array[unknown] {
   match (ai.classify_file(attachment = attachment)) {
-    case ai.image_file(content_type => content_type) -> [
-      anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
-      anthropic_image_block(attachment = attachment, media_type = content_type),
-    ]
+    case ai.image_file(content_type => content_type) -> anthropic_image_blocks(attachment = attachment, media_type = content_type)
     case ai.document_file(content_type => content_type) -> [
       anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
       anthropic_document_block(attachment = attachment, media_type = content_type),

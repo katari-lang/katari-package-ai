@@ -184,13 +184,66 @@ agent gemini_handle_part(attachment: file) -> unknown {
   gemini_text_part(text = ai.file_handle_note(attachment = attachment))
 }
 
+@"Whether `generateContent` accepts @mime_type@ as an `inlineData` part: the union of the documented image,
+audio and video format lists, plus `application/pdf`. One match over all four families because the wire
+does not care which family a type belongs to — the part is the same shape — and one list is one place to
+check against the docs. A type outside it 400s the request, and `image/*`, `audio/*` and `video/*` are all
+wider than what the model actually decodes (`image/tiff`, `audio/opus`, `video/quicktime` versus `video/mov`)."
+agent gemini_inline_media_type(@"The file's normalized content type." mime_type: string) -> boolean {
+  match (mime_type) {
+    // Images: "Gemini supports the following image format MIME types" — PNG, JPEG, WebP, HEIC, HEIF.
+    case "image/png" -> true
+    case "image/jpeg" -> true
+    case "image/webp" -> true
+    case "image/heic" -> true
+    case "image/heif" -> true
+    // Documents: a PDF is read as pages, text and figures alike.
+    case "application/pdf" -> true
+    // Audio, as documented for inline audio input.
+    case "audio/wav" -> true
+    case "audio/mp3" -> true
+    case "audio/aiff" -> true
+    case "audio/aac" -> true
+    case "audio/ogg" -> true
+    case "audio/flac" -> true
+    // Video, as documented for inline video input.
+    case "video/mp4" -> true
+    case "video/mpeg" -> true
+    case "video/quicktime" -> true
+    case "video/avi" -> true
+    case "video/x-flv" -> true
+    case "video/mpg" -> true
+    case "video/webm" -> true
+    case "video/wmv" -> true
+    case "video/3gpp" -> true
+    case _ -> false
+  }
+}
+
+@"An inlinable file's parts: the handle note and the `inlineData` part when Gemini accepts the mime type, and
+the unreadable note when it does not. Shipping an unaccepted type hopefully is not the cheaper bet — it
+400s, and a 400 fails the step and takes the turn with it, where the note costs the model one honest
+sentence and the conversation goes on."
+agent gemini_media_parts(
+  @"The file to inline." attachment: file,
+  @"Its normalized content type." mime_type: string,
+) -> array[unknown] {
+  if (gemini_inline_media_type(mime_type = mime_type)) {
+    [
+      gemini_handle_part(attachment = attachment),
+      gemini_inline_part(attachment = attachment, mime_type = mime_type),
+    ]
+  } else {
+    [gemini_text_part(text = ai.unreadable_file_note(attachment = attachment, content_type = mime_type))]
+  }
+}
+
 @"ONE attached file as the parts it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
-`generateContent` accepts. An image, a PDF, audio and video all ride the SAME `inlineData` part keyed by
-their mime type (that one part is Gemini's whole multimodal surface), each preceded by its handle note so
-the model keeps the replay affordance; a textual file rides as text, capped; and a content type Gemini has
-no inline family for becomes the note that says the content is unreadable. That last arm is a NARROWING of
-the rule this replaced (\"inline anything with a recorded type\"), which shipped an archive or a font as an
-inlineData part and earned a 400 in the middle of a conversation."
+`generateContent` accepts. An image, a PDF, audio and video all reach `gemini_media_parts`, because that one
+`inlineData` part IS Gemini's whole multimodal surface and it is the accepted MEDIA TYPE, not the family,
+that decides whether the content can ride; a textual file rides as text, capped; an opaque type says it
+cannot be read. Together the two guards narrow the rule this replaced (\"inline anything with a recorded
+type\"), which handed an archive or a font to `inlineData` and earned a 400 in the middle of a conversation."
 agent gemini_file_parts_of(attachment: file, inline: boolean) -> array[unknown] {
   // An OLDER history element shows the handle alone, whatever the type: re-sending every attachment's
   // content on every step is what makes a long conversation's requests huge, and the model re-reads any
@@ -199,22 +252,10 @@ agent gemini_file_parts_of(attachment: file, inline: boolean) -> array[unknown] 
     [gemini_handle_part(attachment = attachment)]
   } else {
     match (ai.classify_file(attachment = attachment)) {
-      case ai.image_file(content_type => content_type) -> [
-        gemini_handle_part(attachment = attachment),
-        gemini_inline_part(attachment = attachment, mime_type = content_type),
-      ]
-      case ai.document_file(content_type => content_type) -> [
-        gemini_handle_part(attachment = attachment),
-        gemini_inline_part(attachment = attachment, mime_type = content_type),
-      ]
-      case ai.audio_file(content_type => content_type) -> [
-        gemini_handle_part(attachment = attachment),
-        gemini_inline_part(attachment = attachment, mime_type = content_type),
-      ]
-      case ai.video_file(content_type => content_type) -> [
-        gemini_handle_part(attachment = attachment),
-        gemini_inline_part(attachment = attachment, mime_type = content_type),
-      ]
+      case ai.image_file(content_type => content_type) -> gemini_media_parts(attachment = attachment, mime_type = content_type)
+      case ai.document_file(content_type => content_type) -> gemini_media_parts(attachment = attachment, mime_type = content_type)
+      case ai.audio_file(content_type => content_type) -> gemini_media_parts(attachment = attachment, mime_type = content_type)
+      case ai.video_file(content_type => content_type) -> gemini_media_parts(attachment = attachment, mime_type = content_type)
       case ai.text_file(content_type => content_type) -> [
         gemini_text_part(text = ai.file_text_note(attachment = attachment, content_type = content_type)),
       ]

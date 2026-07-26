@@ -26,8 +26,8 @@ module, not editing the loop.
   and providers speak only this; no wire-format detail leaks in.
 - `ai.gemini` — a provider over Google's `generateContent` API. `use gemini.provider(model = ...,
   api_key = ...)` serves `ai.infer_step` for the continuation. **Files: images, PDFs, audio, video and
-  text** — the binary kinds all ride the one `inlineData` part keyed by their mime type; text inlines as
-  text (freshest turn only, to keep the request small).
+  text** — the binary kinds all ride the one `inlineData` part keyed by their mime type, restricted to the
+  formats Gemini documents; text inlines as text (freshest turn only, to keep the request small).
 - `ai.openai` — a provider over the OpenAI Chat Completions API. `use openai.provider(model = ...,
   api_key = ...)` — swap it for `gemini.provider` (or vice versa) with no other change. **Files: text
   only** — a message's content here is a plain string, which text needs no wire shape to ride; an image or
@@ -36,8 +36,9 @@ module, not editing the loop.
 - `ai.anthropic` — a provider over the Anthropic Messages API. `use anthropic.provider(api_key =
   ...)` — `model` defaults to `claude-sonnet-5` and `max_tokens` (the per-step output cap the API
   requires) to 4096; swap it for either other provider with no other change. **Files: images, PDFs and
-  text** — an `image` content block, a `document` content block (base64 `application/pdf`), and inlined
-  text respectively; audio and video have no Messages API block, so they report as unreadable.
+  text** — an `image` content block (jpeg / png / gif / webp), a `document` content block (base64
+  `application/pdf`), and inlined text respectively; audio, video and any other image format have no
+  Messages API block, so they report as unreadable.
 
 Pure Katari — no FFI sidecar. The only network call is the prelude's HTTP client: the Gemini and
 Anthropic providers post an `http.json` value tree with `http.fetch` (so an inlined `file` leaves base64
@@ -52,11 +53,17 @@ that string into the closed `ai.file_kind` sum (`image_file`, `document_file`, `
 
 | content type | Anthropic | Gemini | OpenAI |
 | --- | --- | --- | --- |
-| `image/*` | `image` block | `inlineData` part | unreadable note |
+| `image/*` | `image` block — jpeg, png, gif, webp | `inlineData` part — png, jpeg, webp, heic, heif | unreadable note |
 | `application/pdf` | `document` block | `inlineData` part | unreadable note |
 | `text/*`, `application/json` / `xml` / `csv` | inlined text | inlined text | inlined text |
-| `audio/*`, `video/*` | unreadable note | `inlineData` part | unreadable note |
+| `audio/*`, `video/*` | unreadable note | `inlineData` part — the documented audio / video formats | unreadable note |
 | anything else (`application/octet-stream`, an archive, an unrecorded or freed handle) | unreadable note | unreadable note | unreadable note |
+
+A family is not a licence: each provider inlines only the MEDIA TYPES its own API documents, and a type
+inside the family but outside that list takes the unreadable note instead. `image/*` is the case that
+bites — a scanned fax arrives as `image/tiff`, a diagram as `image/svg+xml`, and no API here decodes
+either. Shipping one hopefully is a 400 that fails the step and takes the turn with it; the note costs the
+model one honest sentence and the conversation continues.
 
 Two rules make this honest rather than merely wide:
 
