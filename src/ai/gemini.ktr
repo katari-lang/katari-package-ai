@@ -354,13 +354,17 @@ agent gemini_function_declaration(meta: reflection.agent_metadata) -> unknown {
 instruction. Kept a `record` so each caller extends it — `gemini_request_body` with tools,
 `gemini_infer_object` with the structured-output generationConfig."
 agent gemini_base_body(client: connection, history: array[types.message]) -> record[unknown] {
-  // Only the FRESHEST history element inlines its files' content (the model just received them);
-  // older elements shrink to handle notes — the model re-reads any of those with `view_file`.
+  // Only the newest FILE-BEARING element inlines its files' content; older files shrink to handle notes,
+  // and the model re-reads any of them with `view_file`. The boundary comes from `ai.inline_from_index`,
+  // keyed to files rather than to position — the split this replaced was `count - 1`, which slid one step
+  // forward on every step and rewrote the previous element's rendering, so a tool loop re-sent a changed
+  // prefix every time and Gemini's implicit prefix cache could never read it.
   let count = array.length(target = history)
-  let older = for (let message in array.slice(target = history, start = 0, end = count - 1)) {
+  let boundary = ai.inline_from_index(history = history)
+  let older = for (let message in array.slice(target = history, start = 0, end = boundary)) {
     next gemini_content(message = message, inline = false)
   }
-  let freshest = for (let message in array.slice(target = history, start = count - 1, end = count)) {
+  let freshest = for (let message in array.slice(target = history, start = boundary, end = count)) {
     next gemini_content(message = message, inline = true)
   }
   let contents = array.concat(left = older, right = freshest)

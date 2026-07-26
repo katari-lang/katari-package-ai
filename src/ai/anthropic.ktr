@@ -5,8 +5,10 @@
 // (`anthropic_file_blocks` dispatches over `ai.file_kind`): an image as an `image` block, a PDF as a
 // `document` block, a textual file as text, and anything the API has no block for as a note that says so —
 // in a turn's content and inside a tool_result's content alike, since both positions take the same blocks.
-// The request body posts as an `http.json` value tree with `http.fetch`, so each inlined file's `data` slot
-// base64s at the send boundary, never on the value plane.
+// Only the newest FILE-BEARING element inlines its content (`ai.inline_from_index`); older files show their
+// handle note and the model re-reads one with `view_file`. The request body posts as an `http.json` value
+// tree with `http.fetch`, so each inlined file's `data` slot base64s at the send boundary, never on the
+// value plane.
 // Same agnostic vocabulary, different shaping — and the same one-line integration:
 // `use anthropic.provider(source = ...)`. Unlike the other two providers this one also has to ASK for
 // prompt caching, by marking `cache_control` breakpoints on the request it builds — see the
@@ -226,25 +228,36 @@ than a bare handle the model would guess from. The document arm needs no media-t
 `ai.classify_file` reaches it only for exactly `application/pdf`, which is the only type the block takes.
 The SAME set of block types is legal in a turn's content and inside a tool_result's content, so one serves both
 positions — a file the user attached and a file a tool handed back reach the model identically."
-agent anthropic_file_blocks(@"One file, attached to a turn or returned by a tool." attachment: file) -> array[unknown] {
-  match (ai.classify_file(attachment = attachment)) {
-    case ai.image_file(content_type => content_type) -> anthropic_image_blocks(attachment = attachment, media_type = content_type)
-    case ai.document_file(content_type => content_type) -> [
-      anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
-      anthropic_document_block(attachment = attachment, media_type = content_type),
-    ]
-    case ai.text_file(content_type => content_type) -> [
-      anthropic_text_block(text = ai.file_text_note(attachment = attachment, content_type = content_type)),
-    ]
-    case ai.audio_file(content_type => content_type) -> [
-      anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
-    ]
-    case ai.video_file(content_type => content_type) -> [
-      anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
-    ]
-    case ai.opaque_file(content_type => content_type) -> [
-      anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
-    ]
+agent anthropic_file_blocks(
+  @"One file, attached to a turn or returned by a tool." attachment: file,
+  @"Whether this element is inside the inline window (`ai.inline_from_index`)." inline: boolean,
+) -> array[unknown] {
+  // OUTSIDE the window the handle note rides alone, whatever the type: every step re-sends the whole
+  // conversation, so content that inlines forever is uploaded on every step (see ai's inline-window
+  // section). The model re-reads an older file with `view_file`, which answers the readability question
+  // authoritatively at the moment it asks — the arrival step already stated it once.
+  if (!inline) {
+    [anthropic_text_block(text = ai.file_handle_note(attachment = attachment))]
+  } else {
+    match (ai.classify_file(attachment = attachment)) {
+      case ai.image_file(content_type => content_type) -> anthropic_image_blocks(attachment = attachment, media_type = content_type)
+      case ai.document_file(content_type => content_type) -> [
+        anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
+        anthropic_document_block(attachment = attachment, media_type = content_type),
+      ]
+      case ai.text_file(content_type => content_type) -> [
+        anthropic_text_block(text = ai.file_text_note(attachment = attachment, content_type = content_type)),
+      ]
+      case ai.audio_file(content_type => content_type) -> [
+        anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+      ]
+      case ai.video_file(content_type => content_type) -> [
+        anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+      ]
+      case ai.opaque_file(content_type => content_type) -> [
+        anthropic_text_block(text = ai.unreadable_file_note(attachment = attachment, content_type = content_type)),
+      ]
+    }
   }
 }
 
@@ -252,9 +265,13 @@ agent anthropic_file_blocks(@"One file, attached to a turn or returned by a tool
 followed by each file's blocks (`anthropic_file_blocks`). A file-less turn keeps the string shape both
 because it says the same thing in fewer bytes and because those bytes are the prompt-cache prefix — a
 turn whose rendering never changes keeps reading its cached span."
-agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's files." files: array[file]) -> unknown {
+agent anthropic_turn_content(
+  @"The turn's text." text: string,
+  @"The turn's files." files: array[file],
+  @"Whether this turn is inside the inline window." inline: boolean,
+) -> unknown {
   let file_blocks = array.flatten(target = for (let attachment in files) {
-    next anthropic_file_blocks(attachment = attachment)
+    next anthropic_file_blocks(attachment = attachment, inline = inline)
   })
   if (array.length(target = file_blocks) == 0) {
     text
@@ -291,6 +308,10 @@ agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's file
 //
 // Caching is per-PROVIDER machinery: Gemini and OpenAI cache implicitly / automatically off the same
 // prefix and take no breakpoint at all, so this provider is the only one that marks anything.
+//
+// The inline window is built not to undo (2): it is keyed to FILE-BEARING elements, not to position, so a
+// step that appends a tool call or a tool result leaves every earlier rendered byte identical. A positional
+// window would degrade the previously inlined element on every step and rewrite the prefix each time.
 //
 // WHAT SILENTLY UNDOES (2): anything that changes at the FRONT of the messages every step.
 // `ai.with_context` prepends its freshly computed note as the first message, so a note carrying a
@@ -375,9 +396,12 @@ may only append TEXT after them (\"the tool_result blocks must come FIRST in the
 must come AFTER all tool results\"), so an image or document block beside them is not licensed; and the
 API's own guidance is to keep tool content — which comes from outside the app — inside the tool_result
 block rather than in a plain user text block, because that is what marks it untrusted."
-agent anthropic_result_block(@"One tool's output, keyed back to its call." result: types.tool_result) -> unknown {
+agent anthropic_result_block(
+  @"One tool's output, keyed back to its call." result: types.tool_result,
+  @"Whether this result batch is inside the inline window." inline: boolean,
+) -> unknown {
   let file_blocks = array.flatten(target = for (let attachment in result.files) {
-    next anthropic_file_blocks(attachment = attachment)
+    next anthropic_file_blocks(attachment = attachment, inline = inline)
   })
   if (array.length(target = file_blocks) == 0) {
     // A result with no file keeps the STRING content: it says the same thing in fewer bytes, and those
@@ -398,12 +422,16 @@ agent anthropic_result_block(@"One tool's output, keyed back to its call." resul
   }
 }
 
-agent anthropic_message(@"One history element." message: types.message, @"The step's wire-name map." map: ai.name_map) -> unknown {
+agent anthropic_message(
+  @"One history element." message: types.message,
+  @"The step's wire-name map." map: ai.name_map,
+  @"Whether this element is inside the inline window (`ai.inline_from_index`)." inline: boolean,
+) -> unknown {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {
       {
         role = anthropic_role(role = role),
-        content = anthropic_turn_content(text = text, files = files),
+        content = anthropic_turn_content(text = text, files = files, inline = inline),
       }
     }
     case types.call_turn(calls => calls) -> {
@@ -417,7 +445,7 @@ agent anthropic_message(@"One history element." message: types.message, @"The st
       // assistant turn against the tool_result blocks of the single next user message.
       {
         role = "user",
-        content = for (let result in results) { next anthropic_result_block(result = result) },
+        content = for (let result in results) { next anthropic_result_block(result = result, inline = inline) },
       }
     }
   }
@@ -434,13 +462,31 @@ agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metada
   }
 }
 
+@"The history rendered as Messages API messages, with the inline window applied: the elements before
+`ai.inline_from_index` show their files as handle notes and the newest file-bearing element inlines its
+content. Both request bodies render through this, so a step and a structured step re-send the same bytes for
+the same conversation — which is also what lets the prompt-cache prefix match across them."
+agent anthropic_messages(
+  @"The conversation so far." history: array[types.message],
+  @"The step's wire-name map." map: ai.name_map,
+) -> array[unknown] {
+  let boundary = ai.inline_from_index(history = history)
+  let older = for (let message in array.slice(target = history, start = 0, end = boundary)) {
+    next anthropic_message(message = message, map = map, inline = false)
+  }
+  let freshest = for (let message in array.slice(target = history, start = boundary, end = array.length(target = history))) {
+    next anthropic_message(message = message, map = map, inline = true)
+  }
+  array.concat(left = older, right = freshest)
+}
+
 agent anthropic_request_body(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
   @"The step's wire-name map." map: ai.name_map,
 ) -> unknown {
-  let rendered = for (let message in history) { next anthropic_message(message = message, map = map) }
+  let rendered = anthropic_messages(history = history, map = map)
   // The conversation breakpoint: the last block of the last message, so the NEXT step of this turn
   // reads the history this one sent instead of paying for it again (see the prompt-caching section).
   let messages = anthropic_cached_messages(messages = rendered)
@@ -499,7 +545,7 @@ agent anthropic_object_body(
   // The name map is empty — a replayed call turn in @history@ rides under its real name via the
   // fallback, fine for the rare structured step over a tool transcript.
   let map = ai.build_name_map(tool_metas = [])
-  let messages = for (let message in history) { next anthropic_message(message = message, map = map) }
+  let messages = anthropic_messages(history = history, map = map)
   let prefix_on_tools = client.system == ""
   let record_result = {
     name = "record_result",

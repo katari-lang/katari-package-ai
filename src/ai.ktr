@@ -339,6 +339,74 @@ agent file_text(@"The file to read." attachment: file) -> string {
   string.from_base64(value = files.read_base64(value = attachment))
 }
 
+// ── the inline window: how far back a file's CONTENT is re-sent ────────────────
+//
+// Every step re-sends the whole conversation, so a file that inlines forever is uploaded again on every
+// step: a 10 MB PDF in a thirty-step tool loop is 300 MB of request bodies and thirty upload waits, which a
+// human watching a chat channel feels as latency. Prompt caching does not help — it saves the model's
+// COMPUTE on a prefix it has seen, not the client's bytes on the wire.
+//
+// So only the newest @keep@ FILE-BEARING history elements inline their content; older files show their
+// handle note alone, and the model re-reads any of them on demand with `view_file`. That recovery path is
+// what makes the degradation honest, and it now exists on all three providers (a tool result's files reach
+// the model everywhere), which is what it took for this policy to be safe.
+//
+// KEYED TO FILES, NOT TO POSITION, and that is the whole design. A positional window ("the last element
+// inlines") slides on EVERY step: each tool call appends an element, the element that inlined a moment ago
+// degrades to a note, and the rendered prefix changes underneath a conversation that did not gain a single
+// file — which invalidates the prompt-cache prefix on every step of a tool loop, exactly the thing the
+// caching breakpoints were placed to protect. Keyed to files, the window moves only when a NEW file
+// arrives; an element without files renders identically inlined or not, so appending tool calls, tool
+// results and model turns leaves every earlier byte alone. A new attachment does rewrite the tail, at a
+// turn boundary the app was paying for anyway.
+
+@"How many files a history element carries — a turn's attachments, or every file across a result batch.
+The count is what makes an element FILE-BEARING; a call turn never carries one."
+agent message_file_count(@"The history element to weigh." message: types.message) -> integer {
+  match (message) {
+    case types.turn(role => _, text => _, files => files, author => _) -> array.length(target = files)
+    case types.call_turn(calls => _) -> 0
+    case types.result_turn(results => results) -> {
+      for (let result in results, var total: integer = 0) {
+        next with { total = total + array.length(target = result.files) }
+      } then (_results) { total }
+    }
+  }
+}
+
+@"The index of the OLDEST history element whose files still inline: the newest @keep@ FILE-BEARING elements
+inline their content, and everything before this index shows handle notes only. A history with no file at
+all answers its own length — there is nothing to inline, and the split is empty either way.
+Providers render `slice(0, index)` with inlining off and `slice(index, length)` with it on, so the whole
+policy is one integer and each provider keeps its own rendering."
+agent inline_from_index(
+  @"The conversation so far." history: array[types.message],
+  @"How many of the newest file-bearing elements keep their content inline." keep: integer ?= 1,
+) -> integer {
+  let bearing = for (let message in history, var count: integer = 0) {
+    if (message_file_count(message = message) == 0) {
+      next with { count = count }
+    } else {
+      next with { count = count + 1 }
+    }
+  } then (_messages) { count }
+  // One flag per element: an element inlines when it carries files AND is among the newest @keep@ of the
+  // file-bearing ones (`seen` counts those before it, so this one is the `seen + 1`-th).
+  let flags = for (let message in history, var seen: integer = 0) {
+    if (message_file_count(message = message) == 0) {
+      next false with { seen = seen }
+    } else {
+      next bearing - seen <= keep with { seen = seen + 1 }
+    }
+  } then (marks) { marks }
+  // The FIRST inlining element is the boundary; the elements after it that carry no file render the same
+  // either way, so one index describes the window exactly.
+  match (array.index_of(target = flags, value = true)) {
+    case null -> array.length(target = history)
+    case index -> index
+  }
+}
+
 @"Tool: read a file that is in this conversation — an image, a PDF, or a text document. Pass the file's
 handle object; a bare {\"$katari_ref\": \"<id>\"} suffices (copy the id from the conversation).
 A text document (`text/*`, JSON, XML, CSV) comes back AS TEXT in this tool's result, cut at a cap with an

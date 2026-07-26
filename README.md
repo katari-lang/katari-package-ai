@@ -92,6 +92,14 @@ The table holds for a file the user attached to a turn AND for a file a tool han
 - **OpenAI**'s tool message takes a string (its array form admits `text` parts only), so a result's files
   contribute their text or their unreadable note — the same two outcomes as its turn path.
 
+**Only the newest file-bearing element inlines.** Every step re-sends the whole conversation, so a file
+that inlined forever would be uploaded again on every step — a 10 MB PDF in a thirty-step tool loop is
+300 MB of request bodies, and prompt caching does not help (it spares the model's compute on a prefix, not
+the client's bytes). `ai.inline_from_index` keeps the newest file-bearing history element inline and
+degrades older files to their handle note, which `ai.view_file` re-reads on demand. The window is keyed to
+FILES, not to position: a step that appends a tool call or a tool result leaves every earlier rendered byte
+identical, so the prompt-cache prefix still matches; only a genuinely new attachment moves it.
+
 **The textual arm puts a file's content on the value plane, and privacy travels with it.** An inlined text
 file is read, decoded and placed in message text, so a `file of private` — a Gmail attachment fetched with
 an OAuth token, anything downloaded through a private request — makes that message text private too, where
