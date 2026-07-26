@@ -188,7 +188,9 @@ agent gemini_handle_part(attachment: file) -> unknown {
 audio and video format lists, plus `application/pdf`. One match over all four families because the wire
 does not care which family a type belongs to — the part is the same shape — and one list is one place to
 check against the docs. A type outside it 400s the request, and `image/*`, `audio/*` and `video/*` are all
-wider than what the model actually decodes (`image/tiff`, `audio/opus`, `video/quicktime` versus `video/mov`)."
+wider than what the model actually decodes — `image/tiff` and `audio/opus` are real labels this list must
+refuse. It can be spelled in the docs' own words because `ai.normalized_content_type` has already resolved
+the confirmed aliases (an `image/jpg` upload arrives here as `image/jpeg`)."
 agent gemini_inline_media_type(@"The file's normalized content type." mime_type: string) -> boolean {
   match (mime_type) {
     // Images: "Gemini supports the following image format MIME types" — PNG, JPEG, WebP, HEIC, HEIF.

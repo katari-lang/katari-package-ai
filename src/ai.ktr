@@ -221,17 +221,39 @@ agent file_content_type(@"The file to read." attachment: file) -> string {
 }
 
 @"@content_type@ in the one form both a dispatch and a wire field can use: the media type alone,
-lowercased, with any parameter dropped (\"Text/Plain; charset=utf-8\" becomes \"text/plain\"). RFC 2045
-makes a media type case-insensitive and lets a sender append parameters, and an HTTP download records
-exactly those forms — so the raw string is the wrong thing to compare (`application/pdf; version=1.7`
-would miss the PDF arm and read as unreadable) and the wrong thing to ship (a provider's `media_type`
-field takes the bare type)."
+lowercased, with any parameter dropped (\"Text/Plain; charset=utf-8\" becomes \"text/plain\"), and a
+confirmed alias resolved to the registered type (`canonical_content_type`). RFC 2045 makes a media type
+case-insensitive and lets a sender append parameters, and an HTTP download records exactly those forms — so
+the raw string is the wrong thing to compare (`application/pdf; version=1.7` would miss the PDF arm and read
+as unreadable) and the wrong thing to ship (a provider's `media_type` field takes the bare type)."
 agent normalized_content_type(@"The recorded content type." content_type: string) -> string {
   let without_parameters = match (string.index_of(value = content_type, search = ";")) {
     case null -> content_type
     case index -> string.slice(value = content_type, start = 0, end = index)
   }
-  string.to_lower(value = string.trim(value = without_parameters))
+  canonical_content_type(content_type = string.to_lower(value = string.trim(value = without_parameters)))
+}
+
+@"An ALIAS resolved to the registered media type for the same format — the second half of normalization,
+after case and parameters. A sender that derived its label from a file extension writes `image/jpg` for the
+JPEG it is sending, and the accepted-type lists (the providers' and IANA's alike) name only `image/jpeg`:
+without this the file takes the unreadable note although the API would have read it happily. Resolving the
+alias is strictly better than either alternative — it inlines, and nothing off-list is ever sent.
+Only labels CONFIRMED to name the identical format belong here. An unconfirmed guess turns a recoverable
+note into a 400, which is the trade this whole dispatch exists to avoid; deliberately absent, for that
+reason, are `image/pjpeg` (an IE-era label MDN's image-types guide does not equate to `image/jpeg`),
+`audio/mpeg` (RFC 3003 covers MPEG-1/2 layers I–III, so it is not necessarily the MP3 that Gemini's
+`audio/mp3` names) and `application/x-pdf` (no registry or vendor document equates it)."
+agent canonical_content_type(@"The lowercased, parameter-free content type." content_type: string) -> string {
+  match (content_type) {
+    // IANA registers `image/jpeg` ("jpeg,image/jpeg,[RFC2045][RFC2046]") and no `image/jpg`; MDN's
+    // image-types guide lists `.jpg` among JPEG's own extensions, so an `image/jpg` label is a JPEG.
+    case "image/jpg" -> "image/jpeg"
+    // IANA registers `video/quicktime` ("quicktime,video/quicktime,[RFC6381][Paul_Lindner]") and no
+    // `video/mov`; `.mov` IS the QuickTime container, so the two labels name one format.
+    case "video/mov" -> "video/quicktime"
+    case recorded -> recorded
+  }
 }
 
 @"The content type's FAMILY — the token before the \"/\" (\"image\" for \"image/png\"), or the whole

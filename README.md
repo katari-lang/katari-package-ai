@@ -77,9 +77,13 @@ Two rules make this honest rather than merely wide:
 
 The content type is taken as recorded; nothing here sniffs a file's bytes to guess a better type. A sender
 that labels a `.md` as `application/octet-stream` therefore gets the unreadable note, and the fix belongs
-at the upload boundary that recorded the type. What IS normalized is the label's own syntax — RFC 2045
-makes a media type case-insensitive and lets a sender append parameters, so `Text/Plain; charset=utf-8`
-reads as `text/plain` for both the dispatch and the provider's `media_type` field.
+at the upload boundary that recorded the type. What IS normalized is the label itself, never the bytes: RFC
+2045 makes a media type case-insensitive and lets a sender append parameters, so `Text/Plain; charset=utf-8`
+reads as `text/plain` for both the dispatch and the provider's `media_type` field — and a confirmed ALIAS
+resolves to the registered type for the same format (`image/jpg` → `image/jpeg`, `video/mov` →
+`video/quicktime`), so the commonest real-world mislabelings inline instead of taking the note. Only labels
+confirmed to name the identical format are in that table; a guess there would turn a recoverable note into
+a 400.
 
 The table holds for a file the user attached to a turn AND for a file a tool handed back (what
 `ai.view_file` returns) — one dispatch, both positions:
