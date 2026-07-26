@@ -74,12 +74,16 @@ at the upload boundary that recorded the type. What IS normalized is the label's
 makes a media type case-insensitive and lets a sender append parameters, so `Text/Plain; charset=utf-8`
 reads as `text/plain` for both the dispatch and the provider's `media_type` field.
 
-The table above is the TURN path (a file the user attached). A file arriving in a **tool result** — what
-`ai.view_file` hands back — inlines only on Gemini, because the Anthropic and OpenAI providers render a
-tool result as its text alone. That is why `ai.view_file` answers a text document and an unreadable type
-with a VALUE (the text, or the note) instead of leaving both to the provider: those two work on every
-provider. An image or a PDF re-read through the tool still depends on the provider, so the tool's `@doc`
-tells the model to say it cannot see the file rather than guess when no content appears.
+The table holds for a file the user attached to a turn AND for a file a tool handed back (what
+`ai.view_file` returns) — one dispatch, both positions:
+
+- **Anthropic** puts the result's file blocks INSIDE the `tool_result`'s own `content` array, which the
+  Messages API documents as taking `text`, `image`, `document` or `search_result` blocks. Inside rather
+  than beside, because a user message carrying tool results may only append *text* after them, and because
+  keeping tool output inside the `tool_result` block is what marks it untrusted.
+- **Gemini** renders a result's files as parts of the same user content, as it always did.
+- **OpenAI**'s tool message takes a string (its array form admits `text` parts only), so a result's files
+  contribute their text or their unreadable note — the same two outcomes as its turn path.
 
 **The seam is outcome-typed; providers never throw.** `ai.infer_step` / `ai.infer_object` return an
 OUTCOME sum — `inferred(result)` on success, `inference_failed(error)` on failure — rather than throwing a

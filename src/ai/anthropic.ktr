@@ -1,11 +1,12 @@
 // Anthropic provider: serves the `ai.infer_step` request over the Messages API. Where OpenAI ships
 // tool arguments as a JSON string, Anthropic keeps them as parsed JSON inside `tool_use` content
 // blocks, keyed by a block id (carried in tool_call.opaque / tool_result.call_id) that the next user
-// turn echoes back as `tool_result` blocks — one message for the whole batch. A turn's files inline by
-// CONTENT TYPE (`anthropic_file_blocks` dispatches over `ai.file_kind`): an image as an `image` block, a
-// PDF as a `document` block, a textual file as text, and anything the API has no block for as a note that
-// says so. The request body posts as an `http.json` value tree with `http.fetch`, so each inlined file's
-// `data` slot base64s at the send boundary, never on the value plane.
+// turn echoes back as `tool_result` blocks — one message for the whole batch. Files inline by CONTENT TYPE
+// (`anthropic_file_blocks` dispatches over `ai.file_kind`): an image as an `image` block, a PDF as a
+// `document` block, a textual file as text, and anything the API has no block for as a note that says so —
+// in a turn's content and inside a tool_result's content alike, since both positions take the same blocks.
+// The request body posts as an `http.json` value tree with `http.fetch`, so each inlined file's `data` slot
+// base64s at the send boundary, never on the value plane.
 // Same agnostic vocabulary, different shaping — and the same one-line integration:
 // `use anthropic.provider(source = ...)`. Unlike the other two providers this one also has to ASK for
 // prompt caching, by marking `cache_control` breakpoints on the request it builds — see the
@@ -183,12 +184,14 @@ agent anthropic_document_block(
   }
 }
 
-@"ONE attached file as the content blocks it becomes — the per-file dispatch over `ai.file_kind`, one arm
-per shape the Messages API accepts. An image and a PDF inline as their own block, each preceded by its
-handle note so the model keeps the replay affordance; a textual file inlines as text (nothing on this wire
-carries it better); audio and video have no Messages API block at all, so they and every opaque type
-become the note that states the content is unreadable rather than a bare handle the model would guess from."
-agent anthropic_file_blocks(@"One file attached to a turn." attachment: file) -> array[unknown] {
+@"ONE file as the content blocks it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
+the Messages API accepts. An image and a PDF inline as their own block, each preceded by its handle note so
+the model keeps the replay affordance; a textual file inlines as text (nothing on this wire carries it
+better); audio and video have no Messages API block at all, so they and every opaque type become the note
+that states the content is unreadable rather than a bare handle the model would guess from. The SAME set of
+block types is legal in a turn's content and inside a tool_result's content, so one dispatch serves both
+positions — a file the user attached and a file a tool handed back reach the model identically."
+agent anthropic_file_blocks(@"One file, attached to a turn or returned by a tool." attachment: file) -> array[unknown] {
   match (ai.classify_file(attachment = attachment)) {
     case ai.image_file(content_type => content_type) -> [
       anthropic_text_block(text = ai.file_handle_note(attachment = attachment)),
@@ -330,11 +333,36 @@ agent anthropic_call_block(@"One tool call of the model's batch." call: types.to
   }
 }
 
+@"One tool's output, keyed back to its call — with the result's FILES inlined INSIDE the tool_result's own
+content array, through the same `anthropic_file_blocks` dispatch the turn path uses. The Messages API
+documents that a tool_result's content blocks \"can use the `text`, `image`, `document`, or `search_result`
+types\", which is exactly the set that dispatch produces, so a file re-read with `ai.view_file` reaches the
+model here instead of being dropped (it was dropped for as long as this provider existed).
+INSIDE rather than beside the tool_result, for two documented reasons: a user message carrying tool results
+may only append TEXT after them (\"the tool_result blocks must come FIRST in the content array. Any text
+must come AFTER all tool results\"), so an image or document block beside them is not licensed; and the
+API's own guidance is to keep tool content — which comes from outside the app — inside the tool_result
+block rather than in a plain user text block, because that is what marks it untrusted."
 agent anthropic_result_block(@"One tool's output, keyed back to its call." result: types.tool_result) -> unknown {
-  {
-    "type" = "tool_result",
-    tool_use_id = result.call_id,
-    content = result.text,
+  let file_blocks = array.flatten(target = for (let attachment in result.files) {
+    next anthropic_file_blocks(attachment = attachment)
+  })
+  if (array.length(target = file_blocks) == 0) {
+    // A result with no file keeps the STRING content: it says the same thing in fewer bytes, and those
+    // bytes are prompt-cache prefix that a later step re-reads only if they do not change.
+    {
+      "type" = "tool_result",
+      tool_use_id = result.call_id,
+      content = result.text,
+    }
+  } else {
+    // An EMPTY text block is rejected by the API, so the result's own text rides only when it has some.
+    let text_blocks: array[unknown] = if (result.text == "") { [] } else { [anthropic_text_block(text = result.text)] }
+    {
+      "type" = "tool_result",
+      tool_use_id = result.call_id,
+      content = array.concat(left = text_blocks, right = file_blocks),
+    }
   }
 }
 

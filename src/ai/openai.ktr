@@ -189,8 +189,12 @@ agent openai_messages_of(message: types.message, map: ai.name_map) -> array[unkn
       for (let result in results) {
         next {
           role = "tool",
+          // A tool message's content is a STRING (its array form admits `text` parts only — no image, no
+          // file), so a file a tool handed back reaches the model here exactly as one attached to a turn
+          // does: its text when it is textual, the honest note when it is not. That is the whole shape this
+          // API licenses in this position, which is why nothing binary rides along.
           tool_call_id = result.call_id,
-          content = result.text,
+          content = f"${result.text}${openai_file_notes(files = result.files)}",
         }
       }
     }
