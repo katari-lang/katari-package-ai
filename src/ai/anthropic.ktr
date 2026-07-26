@@ -224,8 +224,7 @@ textual file inlines as text (nothing on this wire carries it better); audio and
 block at all, so they and every opaque type become the note that states the content is unreadable rather
 than a bare handle the model would guess from. The document arm needs no media-type guard of its own:
 `ai.classify_file` reaches it only for exactly `application/pdf`, which is the only type the block takes.
-The SAME set of
-block types is legal in a turn's content and inside a tool_result's content, so one dispatch serves both
+The SAME set of block types is legal in a turn's content and inside a tool_result's content, so one serves both
 positions — a file the user attached and a file a tool handed back reach the model identically."
 agent anthropic_file_blocks(@"One file, attached to a turn or returned by a tool." attachment: file) -> array[unknown] {
   match (ai.classify_file(attachment = attachment)) {
