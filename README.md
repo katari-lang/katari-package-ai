@@ -92,6 +92,16 @@ The table holds for a file the user attached to a turn AND for a file a tool han
 - **OpenAI**'s tool message takes a string (its array form admits `text` parts only), so a result's files
   contribute their text or their unreadable note — the same two outcomes as its turn path.
 
+**The textual arm puts a file's content on the value plane, and privacy travels with it.** An inlined text
+file is read, decoded and placed in message text, so a `file of private` — a Gmail attachment fetched with
+an OAuth token, anything downloaded through a private request — makes that message text private too, where
+the same file previously contributed only an opaque handle. Toward a provider this changes nothing (a
+model API is a private-capable boundary and always was). It matters where an app forwards tool results or
+history text onward: a channel post, a webhook reply, a run result read by a user. Those are public
+boundaries, so a private-tainted string is refused there — the same rule that already governed the file
+itself, now reaching the text it decodes to. An app that echoes raw tool results to a channel should echo
+its own summary instead, or keep the private file's content out of what it forwards.
+
 **The seam is outcome-typed; providers never throw.** `ai.infer_step` / `ai.infer_object` return an
 OUTCOME sum — `inferred(result)` on success, `inference_failed(error)` on failure — rather than throwing a
 `step_error`. Handing the failure back as a VALUE is what lets each loop decide at its own perform site: the
