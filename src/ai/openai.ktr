@@ -16,7 +16,10 @@ data connection(model: string, source: credentials.source, system: string, retry
 A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` OUTCOME, never
 thrown — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped connection) is first retried with
 exponential backoff (up to @retry_attempts@ attempts from @retry_base_ms@); only a fatal error or an
-exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw."
+exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw.
+Prompt caching is per-PROVIDER machinery and nothing here asks for it: OpenAI caches a repeated prefix
+AUTOMATICALLY, off the bytes it already receives. (Anthropic is the one that needs explicit
+`cache_control` breakpoints, which `anthropic.provider` places for you.)"
 agent provider[R, effect E](
   model: string,
   source: credentials.source,

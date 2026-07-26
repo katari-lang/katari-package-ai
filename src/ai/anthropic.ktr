@@ -5,7 +5,9 @@
 // inline as `image` content blocks: the request body posts as an `http.json` value tree with
 // `http.fetch`, so each image's `data` slot base64s at the send boundary, never on the value plane.
 // Same agnostic vocabulary, different shaping — and the same one-line integration:
-// `use anthropic.provider(source = ...)`.
+// `use anthropic.provider(source = ...)`. Unlike the other two providers this one also has to ASK for
+// prompt caching, by marking `cache_control` breakpoints on the request it builds — see the
+// prompt-caching section below.
 
 import ai
 import ai.types
@@ -27,7 +29,12 @@ data connection(
 A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` OUTCOME, never
 thrown — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped connection) is first retried with
 exponential backoff (up to @retry_attempts@ attempts from @retry_base_ms@); only a fatal error or an
-exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw."
+exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw.
+Prompt caching is ON and needs no argument: every step marks two `cache_control` breakpoints — one at
+the end of the tools+@system@ prefix, one at the end of the conversation — so a tool loop re-reads
+what it already sent at a tenth of the price. Caching is per-PROVIDER machinery (Gemini's is implicit,
+OpenAI's automatic); Anthropic's is the one that must be asked for. See the prompt-caching section for
+what silently undoes it."
 agent provider[R, effect E](
   @"The Claude model id." model: string ?= "claude-sonnet-5",
   @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
@@ -204,6 +211,91 @@ agent anthropic_turn_content(@"The turn's text." text: string, @"The turn's file
   }
 }
 
+// ── prompt caching ───────────────────────────────────────────────────────────
+//
+// Anthropic's cache is a PREFIX match over the rendered request, and the render order is
+// tools -> system -> messages: a `cache_control` breakpoint on a content block caches everything up
+// to and including that block, and a later request whose bytes agree that far reads the span at a
+// tenth of the price instead of paying for it again. One byte earlier in the prefix changes and
+// every breakpoint after it misses. TWO breakpoints carry the whole shape (the API allows four):
+//
+//   1. THE END OF THE PROMPT PREFIX — the system block, or the last tool when no system prompt was
+//      set. Tools render FIRST, so marking the system block caches the tool declarations with it,
+//      and that is where the mass is: a resident's thirty tools ship their derived schemas and their
+//      docs on every one of a turn's steps, unchanged every time.
+//   2. THE END OF THE CONVERSATION — the last content block of the last message. A turn's tool loop
+//      re-sends a history that only GROWS, so each step reads the span the previous step wrote; it
+//      also keeps consecutive requests within the API's 20-block lookback, which a long batch of
+//      tool_use / tool_result blocks would otherwise outrun.
+//
+// It is ON with no way to turn it off because the break-even is TWO uses: a five-minute write costs
+// 1.25x and a read 0.1x, so a prefix that is seen twice has already paid for itself (1.35x < 2x) and
+// every further step of a tool loop is nearly free. A prefix under the model's minimum (1024 tokens
+// on Sonnet, 4096 on Haiku) simply is not cached — no write, so no surcharge for marking it.
+//
+// Caching is per-PROVIDER machinery: Gemini and OpenAI cache implicitly / automatically off the same
+// prefix and take no breakpoint at all, so this provider is the only one that marks anything.
+//
+// WHAT SILENTLY UNDOES (2): anything that changes at the FRONT of the messages every step.
+// `ai.with_context` prepends its freshly computed note as the first message, so a note carrying a
+// per-step clock reading gives every step a new message prefix and breakpoint (2) never reads (it
+// still writes — the messages cost 1.25x rather than 1x). Keep an injected note byte-stable across
+// the steps of a turn (quantize a clock reading rather than restating the millisecond). The
+// tools+system half is unaffected either way.
+
+@"@block@ carrying a cache breakpoint: the same content block with `cache_control` added, the
+five-minute (default) TTL. A block that is not a record rides unchanged — the wire has no slot to
+mark on it."
+agent anthropic_cached_block(@"The content block to mark." block: unknown) -> unknown {
+  match (block) {
+    case record(fields) -> record.set(target = fields, key = "cache_control", value = { "type" = "ephemeral" })
+    case other -> other
+  }
+}
+
+@"@blocks@ with the breakpoint on its LAST element, and an empty array unchanged. The tail rides as a
+ONE-ELEMENT SLICE so the rewrite is total by construction — there is no index that could be out of
+bounds and no absent-element case to invent a value for."
+agent anthropic_cached_last(@"The blocks whose end carries the breakpoint." blocks: array[unknown]) -> array[unknown] {
+  let last_index = array.length(target = blocks) - 1
+  let tail: array[unknown] = for (let block in array.slice(target = blocks, start = last_index, end = last_index + 1)) {
+    next anthropic_cached_block(block = block)
+  }
+  array.concat(left = array.slice(target = blocks, start = 0, end = last_index), right = tail)
+}
+
+@"The `system` field as a BLOCK ARRAY carrying the prefix breakpoint. The Messages API takes a bare
+string or a block array there, and only a block can be marked — so the system prompt ships as one
+text block, and the tool declarations rendered before it cache along with it."
+agent anthropic_system_blocks(@"The system prompt; never the empty one, which sends no field at all." system: string) -> unknown {
+  [anthropic_cached_block(block = anthropic_text_block(text = system))]
+}
+
+@"A message's content with the breakpoint on its last block. A turn with no image carries its content
+as a plain STRING, which has no block to mark: it becomes the one-element block array that says
+exactly the same thing."
+agent anthropic_cached_content(@"The message's content — a string or an array of blocks." content: unknown) -> unknown {
+  match (content) {
+    case array(blocks) -> anthropic_cached_last(blocks = blocks)
+    case string(text) -> [anthropic_cached_block(block = anthropic_text_block(text = text))]
+    case other -> other
+  }
+}
+
+@"@messages@ with the conversation breakpoint on the last block of the LAST message, and an empty
+array unchanged — the same one-element-slice rewrite as `anthropic_cached_last`, one level up."
+agent anthropic_cached_messages(@"The rendered messages." messages: array[unknown]) -> array[unknown] {
+  let last_index = array.length(target = messages) - 1
+  let tail: array[unknown] = for (let message in array.slice(target = messages, start = last_index, end = last_index + 1)) {
+    next record.set(
+      target = json.entries(target = message),
+      key = "content",
+      value = anthropic_cached_content(content = json.field(target = message, key = "content")),
+    )
+  }
+  array.concat(left = array.slice(target = messages, start = 0, end = last_index), right = tail)
+}
+
 agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call, @"The step's wire-name map." map: ai.name_map) -> unknown {
   // Replay the model's tool_use verbatim: its block id + name + the original input. The name rides as
   // the WIRE name — the API validates the replayed history's tool_use name the same as the request's
@@ -267,7 +359,10 @@ agent anthropic_request_body(
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
   @"The step's wire-name map." map: ai.name_map,
 ) -> unknown {
-  let messages = for (let message in history) { next anthropic_message(message = message, map = map) }
+  let rendered = for (let message in history) { next anthropic_message(message = message, map = map) }
+  // The conversation breakpoint: the last block of the last message, so the NEXT step of this turn
+  // reads the history this one sent instead of paying for it again (see the prompt-caching section).
+  let messages = anthropic_cached_messages(messages = rendered)
   // Thinking stays OFF, explicitly: newer Claude models run adaptive thinking when the field is
   // omitted, and a thinking block must then be replayed VERBATIM (signature included) on the next
   // call turn — the agnostic vocabulary has no slot for one (Gemini's per-call thoughtSignature fits
@@ -280,10 +375,13 @@ agent anthropic_request_body(
     messages = messages,
     thinking = thinking,
   }
-  let with_system = if (client.system == "") {
+  // The prompt prefix ENDS at the system block when there is a system prompt, and at the tools when
+  // there is not — so exactly one of the two carries the prefix breakpoint (below).
+  let prefix_on_tools = client.system == ""
+  let with_system = if (prefix_on_tools) {
     base
   } else {
-    record.set(target = base, key = "system", value = client.system)
+    record.set(target = base, key = "system", value = anthropic_system_blocks(system = client.system))
   }
   // The newest user turn's opaque author tag becomes the abuse-attribution metadata — the field is
   // omitted entirely for an unattributed step (a monitor tick, a loop-synthesized close), keeping
@@ -300,7 +398,45 @@ agent anthropic_request_body(
     with_metadata
   } else {
     let tools = for (let meta in tool_metas) { next anthropic_tool(meta = meta, map = map) }
-    record.set(target = with_metadata, key = "tools", value = tools)
+    // With no system block to carry it, the prefix breakpoint rides the LAST TOOL: the declarations
+    // are the bulk of a resident's prefix, and leaving them unmarked would cache nothing at all.
+    let declared = if (prefix_on_tools) { anthropic_cached_last(blocks = tools) } else { tools }
+    record.set(target = with_metadata, key = "tools", value = declared)
+  }
+}
+
+@"The structured-output request body: @schema@ as the input schema of ONE synthetic tool with
+`tool_choice` pinned to it (see `anthropic_infer_object`). It takes the same prefix breakpoint as a
+step — the schema tool is usually the bulk of the prefix, and a repeated extraction re-sends it
+verbatim — but NO conversation breakpoint: an object step states its own context and is not re-sent
+with a growing history, so marking its messages would pay a cache write nothing ever reads."
+agent anthropic_object_body(
+  @"The provider connection." client: connection,
+  @"The conversation so far." history: array[types.message],
+  @"The JSON Schema the reply must conform to." schema: unknown,
+) -> unknown {
+  // The name map is empty — a replayed call turn in @history@ rides under its real name via the
+  // fallback, fine for the rare structured step over a tool transcript.
+  let map = ai.build_name_map(tool_metas = [])
+  let messages = for (let message in history) { next anthropic_message(message = message, map = map) }
+  let prefix_on_tools = client.system == ""
+  let record_result = {
+    name = "record_result",
+    description = "Record the final result in the required shape.",
+    input_schema = schema,
+  }
+  let base: record[unknown] = {
+    model = client.model,
+    max_tokens = client.max_tokens,
+    messages = messages,
+    thinking = { "type" = "disabled" },
+    tools = if (prefix_on_tools) { [anthropic_cached_block(block = record_result)] } else { [record_result] },
+    tool_choice = { "type" = "tool", name = "record_result" },
+  }
+  if (prefix_on_tools) {
+    base
+  } else {
+    record.set(target = base, key = "system", value = anthropic_system_blocks(system = client.system))
   }
 }
 
@@ -360,7 +496,9 @@ agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"T
 
 @"The step's token accounting off the response's `usage`. The context a step read splits across
 `input_tokens` and the cache counters (`cache_read_input_tokens` / `cache_creation_input_tokens`),
-so the occupancy is their sum; an absent field reads as 0."
+so the occupancy is their sum; an absent field reads as 0. The split is a LIVE one — the provider
+marks cache breakpoints (see the prompt-caching section), so a warm step reports most of its context
+under `cache_read_input_tokens`, which is also how a run trace shows the cache is working."
 agent anthropic_usage(@"The parsed response document." parsed: unknown) -> types.usage {
   let counts = json.field(target = parsed, key = "usage")
   types.usage(
@@ -398,38 +536,18 @@ agent anthropic_infer_step(
 }
 
 @"One Anthropic structured-output step, as a FORCED tool call: @schema@ rides as the input schema of
-one synthetic tool and `tool_choice` pins the model to it, so the decoded object arrives already
-parsed as the tool_use block's `input` — no special API surface, every Claude model. The name map is
-empty — a replayed call turn in @history@ rides under its real name via the fallback, fine for the
-rare structured step over a tool transcript. A reply with no tool_use block (a refusal) throws
-`json.parse_error` (∈ `ai.step_error`)."
+one synthetic tool and `tool_choice` pins the model to it (the body is `anthropic_object_body`), so
+the decoded object arrives already parsed as the tool_use block's `input` — no special API surface,
+every Claude model. A reply with no tool_use block (a refusal) throws `json.parse_error`
+(∈ `ai.step_error`)."
 agent anthropic_infer_object(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The JSON Schema the reply must conform to." schema: unknown,
 ) -> types.object_result {
-  let map = ai.build_name_map(tool_metas = [])
-  let messages = for (let message in history) { next anthropic_message(message = message, map = map) }
-  let base: record[unknown] = {
-    model = client.model,
-    max_tokens = client.max_tokens,
-    messages = messages,
-    thinking = { "type" = "disabled" },
-    tools = [{
-      name = "record_result",
-      description = "Record the final result in the required shape.",
-      input_schema = schema,
-    }],
-    tool_choice = { "type" = "tool", name = "record_result" },
-  }
-  let body = if (client.system == "") {
-    base
-  } else {
-    record.set(target = base, key = "system", value = client.system)
-  }
   let response = http.post_json(
     url = "https://api.anthropic.com/v1/messages",
-    body = body,
+    body = anthropic_object_body(client = client, history = history, schema = schema),
     headers = {
       "x-api-key" = credentials.resolve(source = client.source),
       "anthropic-version" = "2023-06-01",

@@ -23,7 +23,10 @@ handed back as an `ai.inference_failed` OUTCOME, never thrown — but a TRANSIEN
 5xx, a dropped connection) is first retried with exponential backoff (up to @retry_attempts@ attempts from
 @retry_base_ms@), so a passing rate limit no longer ends a long-lived loop; only a fatal error or an
 exhausted budget surfaces, and it surfaces as a value the loop handles at its own perform site, not a throw
-out of this deep handler."
+out of this deep handler.
+Prompt caching is per-PROVIDER machinery and nothing here asks for it: Gemini caches a repeated prefix
+IMPLICITLY, off the bytes it already receives. (Anthropic is the one that needs explicit `cache_control`
+breakpoints, which `anthropic.provider` places for you.)"
 agent provider[R, effect E](
   model: string,
   source: credentials.source,
