@@ -1,6 +1,7 @@
 // Anthropic provider: serves the `ai.infer_step` request over the Messages API. Where OpenAI ships
 // tool arguments as a JSON string, Anthropic keeps them as parsed JSON inside `tool_use` content
-// blocks, keyed by a block id (carried in tool_call.opaque / tool_result.call_id) that the next user
+// blocks, keyed by a block id (which is what this provider puts in `types.call_ref` — the agnostic
+// vocabulary's one opaque per-call token) that the next user
 // turn echoes back as `tool_result` blocks — one message for the whole batch. Files inline by CONTENT TYPE
 // (`anthropic_file_blocks` dispatches over `ai.file_kind`): an image as an `image` block, a PDF as a
 // `document` block, a textual file as text, and anything the API has no block for as a note that says so —
@@ -16,6 +17,7 @@
 
 import ai
 import ai.types
+import ai.wire_names
 
 @"An Anthropic connection: the model id, the API key, an optional system prompt, and the
 output-token cap the Messages API requires on every request. Provider handler state — built once per
@@ -107,7 +109,7 @@ agent anthropic_step_attempt(client: connection, history: array[types.message], 
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
+        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -126,7 +128,7 @@ agent anthropic_object_attempt(client: connection, history: array[types.message]
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
+        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -136,11 +138,12 @@ agent anthropic_object_attempt(client: connection, history: array[types.message]
 
 // ── request body ─────────────────────────────────────────────────────────────
 
-@"Map the vocabulary role onto the Messages API role: our \"model\" speaks as \"assistant\"."
-agent anthropic_role(@"The `ai.types` turn role (\"user\" / \"model\")." role: string) -> string {
+@"Map the agnostic role sum onto the Messages API's own token: the model's side speaks as
+\"assistant\" here."
+agent anthropic_role(@"Who spoke the turn." role: types.role) -> string {
   match (role) {
-    case "model" -> "assistant"
-    case _ -> "user"
+    case types.model_role(_) -> "assistant"
+    case types.user_role(_) -> "user"
   }
 }
 
@@ -373,15 +376,15 @@ agent anthropic_cached_messages(@"The rendered messages." messages: array[unknow
   array.concat(left = array.slice(target = messages, start = 0, end = last_index), right = tail)
 }
 
-agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call, @"The step's wire-name map." map: ai.name_map) -> unknown {
+agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call, @"The step's wire-name map." map: wire_names.name_map) -> unknown {
   // Replay the model's tool_use verbatim: its block id + name + the original input. The name rides as
   // the WIRE name — the API validates the replayed history's tool_use name the same as the request's
   // tool declarations, so the qualified name would 400 here too (the opaque block id stays as-is). The
   // input is the model's args document dropped straight into the value tree, so its keys survive as-is.
   {
     "type" = "tool_use",
-    id = call.opaque,
-    name = ai.wire_name_of(map = map, real = call.name),
+    id = call.ref.token,
+    name = wire_names.wire_name_of(map = map, real = call.name),
     input = call.args,
   }
 }
@@ -408,7 +411,7 @@ agent anthropic_result_block(
     // bytes are prompt-cache prefix that a later step re-reads only if they do not change.
     {
       "type" = "tool_result",
-      tool_use_id = result.call_id,
+      tool_use_id = result.ref.token,
       content = result.text,
     }
   } else {
@@ -416,7 +419,7 @@ agent anthropic_result_block(
     let text_blocks: array[unknown] = if (result.text == "") { [] } else { [anthropic_text_block(text = result.text)] }
     {
       "type" = "tool_result",
-      tool_use_id = result.call_id,
+      tool_use_id = result.ref.token,
       content = array.concat(left = text_blocks, right = file_blocks),
     }
   }
@@ -424,7 +427,7 @@ agent anthropic_result_block(
 
 agent anthropic_message(
   @"One history element." message: types.message,
-  @"The step's wire-name map." map: ai.name_map,
+  @"The step's wire-name map." map: wire_names.name_map,
   @"Whether this element is inside the inline window (`ai.inline_from_index`)." inline: boolean,
 ) -> unknown {
   match (message) {
@@ -451,12 +454,12 @@ agent anthropic_message(
   }
 }
 
-agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metadata, @"The step's wire-name map." map: ai.name_map) -> unknown {
+agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metadata, @"The step's wire-name map." map: wire_names.name_map) -> unknown {
   // The tool is declared under its WIRE name (the qualified name 400s the Messages API); the loop maps
   // the model's pick back to the real name when it dispatches. `meta.input` is already a document value
   // (`$ref` / `$defs` / `$schema` keys and all), so it drops straight into the value tree verbatim.
   {
-    name = ai.wire_name_of(map = map, real = meta.name),
+    name = wire_names.wire_name_of(map = map, real = meta.name),
     description = meta.description,
     input_schema = meta.input,
   }
@@ -468,7 +471,7 @@ content. Both request bodies render through this, so a step and a structured ste
 the same conversation — which is also what lets the prompt-cache prefix match across them."
 agent anthropic_messages(
   @"The conversation so far." history: array[types.message],
-  @"The step's wire-name map." map: ai.name_map,
+  @"The step's wire-name map." map: wire_names.name_map,
 ) -> array[unknown] {
   let boundary = ai.inline_from_index(history = history)
   let older = for (let message in array.slice(target = history, start = 0, end = boundary)) {
@@ -484,7 +487,7 @@ agent anthropic_request_body(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
-  @"The step's wire-name map." map: ai.name_map,
+  @"The step's wire-name map." map: wire_names.name_map,
 ) -> unknown {
   let rendered = anthropic_messages(history = history, map = map)
   // The conversation breakpoint: the last block of the last message, so the NEXT step of this turn
@@ -544,7 +547,7 @@ agent anthropic_object_body(
 ) -> unknown {
   // The name map is empty — a replayed call turn in @history@ rides under its real name via the
   // fallback, fine for the rare structured step over a tool transcript.
-  let map = ai.build_name_map(tool_metas = [])
+  let map = wire_names.build_name_map(tool_metas = [])
   let messages = anthropic_messages(history = history, map = map)
   let prefix_on_tools = client.system == ""
   let record_result = {
@@ -583,17 +586,17 @@ agent anthropic_block_kind(@"One response content block." block: unknown) -> str
   }
 }
 
-agent anthropic_tool_call(@"A `tool_use` response block." block: unknown, @"The step's wire-name map." map: ai.name_map) -> types.tool_call {
+agent anthropic_tool_call(@"A `tool_use` response block." block: unknown, @"The step's wire-name map." map: wire_names.name_map) -> types.tool_call {
   types.tool_call(
     // Reverse the wire name back to the real qualified name: the loop dispatches by matching this
     // against tool metadata, so it must be the real name, not the shortened one the model saw.
-    name = ai.real_name_of(map = map, wire = json.text(target = json.field(target = block, key = "name"))),
-    opaque = json.text(target = json.field(target = block, key = "id")),
+    name = wire_names.real_name_of(map = map, wire = json.text(target = json.field(target = block, key = "name"))),
+    ref = types.call_ref(token = json.text(target = json.field(target = block, key = "id"))),
     args = json.field(target = block, key = "input"),
   )
 }
 
-agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"The step's wire-name map." map: ai.name_map) -> types.step {
+agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"The step's wire-name map." map: wire_names.name_map) -> types.step {
   let blocks = anthropic_blocks(parsed = parsed)
   let calls = for (let block in blocks, var acc: array[types.tool_call] = []) {
     if (anthropic_block_kind(block = block) == "tool_use") {
@@ -646,7 +649,7 @@ agent anthropic_infer_step(
 ) -> types.step_result {
   // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
-  let map = ai.build_name_map(tool_metas = tool_metas)
+  let map = wire_names.build_name_map(tool_metas = tool_metas)
   let body = anthropic_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
   // `post_json` serialises the value tree as application/json (each inlined `file` leaf read from the blob
   // store and base64'd only at the send boundary), checks the status (a non-2xx is `http.status_error`),

@@ -1,6 +1,7 @@
 // OpenAI provider: serves the `ai.infer_step` request over the Chat Completions API. Where Gemini
-// keys tool calls by name + a thought signature, OpenAI keys them by a tool-call `id` (carried in
-// tool_call.opaque / tool_result.call_id) and ships the arguments as a JSON *string*. Same agnostic
+// keys tool calls by name + a thought signature, OpenAI keys them by a tool-call `id` (which is what
+// this provider puts in `types.call_ref`, the agnostic vocabulary's one opaque per-call token) and
+// ships the arguments as a JSON *string*. Same agnostic
 // vocabulary, different shaping — and the same one-line integration:
 // `use openai.provider(model = ..., source = ...)`.
 // Files: a message's content here is a plain STRING, so a TEXTUAL attachment inlines as text (capped) and
@@ -9,6 +10,7 @@
 
 import ai
 import ai.types
+import ai.wire_names
 
 @"An OpenAI connection: the model id, the API key, an optional system prompt, and the transient-retry
 budget (@retry_attempts@ / @retry_base_ms@). Provider handler state — built once per `use openai.provider(...)`."
@@ -89,7 +91,7 @@ agent openai_step_attempt(client: connection, history: array[types.message], too
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
+        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -108,7 +110,7 @@ agent openai_object_attempt(client: connection, history: array[types.message], s
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
+        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -118,22 +120,24 @@ agent openai_object_attempt(client: connection, history: array[types.message], s
 
 // ── request body ─────────────────────────────────────────────────────────────
 
-agent openai_role(role: string) -> string {
+@"Map the agnostic role sum onto the Chat Completions message role: the model's side speaks as
+\"assistant\" here."
+agent openai_role(@"Who spoke the turn." role: types.role) -> string {
   match (role) {
-    case "model" -> "assistant"
-    case _ -> "user"
+    case types.model_role(_) -> "assistant"
+    case types.user_role(_) -> "user"
   }
 }
 
-agent openai_call_entry(call: types.tool_call, map: ai.name_map) -> unknown {
+agent openai_call_entry(call: types.tool_call, map: wire_names.name_map) -> unknown {
   // The replayed call ships the WIRE name — the API validates a history tool_call name the same as the
   // request's tool declarations (the qualified name's dot is rejected); the opaque call id stays as-is.
   // OpenAI carries the arguments as a JSON *string*, so the model's args document is stringified back.
   {
-    id = call.opaque,
+    id = call.ref.token,
     "type" = "function",
     function = {
-      name = ai.wire_name_of(map = map, real = call.name),
+      name = wire_names.wire_name_of(map = map, real = call.name),
       arguments = json.stringify(value = call.args),
     },
   }
@@ -171,7 +175,7 @@ agent openai_file_notes(files: array[file]) -> string {
 // away from (docs/2026-07-18-http-file-body.md). So the binary kinds report honestly here instead, and the
 // wire shape stays a plain string. Text is different in kind, not degree: its content IS a string, so it
 // inlines with no data URI and no slot at all.
-agent openai_messages_of(message: types.message, map: ai.name_map) -> array[unknown] {
+agent openai_messages_of(message: types.message, map: wire_names.name_map) -> array[unknown] {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {
       [{
@@ -193,7 +197,7 @@ agent openai_messages_of(message: types.message, map: ai.name_map) -> array[unkn
           // file), so a file a tool handed back reaches the model here exactly as one attached to a turn
           // does: its text when it is textual, the honest note when it is not. That is the whole shape this
           // API licenses in this position, which is why nothing binary rides along.
-          tool_call_id = result.call_id,
+          tool_call_id = result.ref.token,
           content = f"${result.text}${openai_file_notes(files = result.files)}",
         }
       }
@@ -201,7 +205,7 @@ agent openai_messages_of(message: types.message, map: ai.name_map) -> array[unkn
   }
 }
 
-agent openai_messages(client: connection, history: array[types.message], map: ai.name_map) -> array[unknown] {
+agent openai_messages(client: connection, history: array[types.message], map: wire_names.name_map) -> array[unknown] {
   let base = for (let message in history, var accumulator: array[unknown] = []) {
     next with { accumulator = array.concat(left = accumulator, right = openai_messages_of(message = message, map = map)) }
   } then (_messages) { accumulator }
@@ -216,14 +220,14 @@ agent openai_messages(client: connection, history: array[types.message], map: ai
   }
 }
 
-agent openai_function_tool(meta: reflection.agent_metadata, map: ai.name_map) -> unknown {
+agent openai_function_tool(meta: reflection.agent_metadata, map: wire_names.name_map) -> unknown {
   // The tool is declared under its WIRE name (the qualified name's dot is rejected); the loop maps the
   // model's pick back to the real name when it dispatches. `meta.input` is already a document value, so
   // its JSON-Schema keys drop straight into the tree.
   {
     "type" = "function",
     function = {
-      name = ai.wire_name_of(map = map, real = meta.name),
+      name = wire_names.wire_name_of(map = map, real = meta.name),
       description = meta.description,
       parameters = meta.input,
     },
@@ -232,7 +236,7 @@ agent openai_function_tool(meta: reflection.agent_metadata, map: ai.name_map) ->
 
 // The request body as a raw value tree — `post_json` serialises it (there are no `file` leaves here;
 // OpenAI stays handle-only).
-agent openai_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata], map: ai.name_map) -> unknown {
+agent openai_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata], map: wire_names.name_map) -> unknown {
   let messages = openai_messages(client = client, history = history, map = map)
   let base: record[unknown] = {
     model = client.model,
@@ -258,19 +262,19 @@ agent openai_message(parsed: unknown) -> unknown {
   json.field(target = json.element(target = json.field(target = parsed, key = "choices"), index = 0), key = "message")
 }
 
-agent openai_tool_call_of(tool_call: unknown, map: ai.name_map) -> types.tool_call with prelude.throw[json.parse_error] {
+agent openai_tool_call_of(tool_call: unknown, map: wire_names.name_map) -> types.tool_call with prelude.throw[json.parse_error] {
   let function = json.field(target = tool_call, key = "function")
   types.tool_call(
     // Reverse the wire name back to the real qualified name: the loop dispatches by matching this
     // against tool metadata, so it must be the real name, not the shortened one the model saw.
-    name = ai.real_name_of(map = map, wire = json.text(target = json.field(target = function, key = "name"))),
-    opaque = json.text(target = json.field(target = tool_call, key = "id")),
+    name = wire_names.real_name_of(map = map, wire = json.text(target = json.field(target = function, key = "name"))),
+    ref = types.call_ref(token = json.text(target = json.field(target = tool_call, key = "id"))),
     // OpenAI ships the arguments as a JSON *string*; parse it back to the plain args document.
     args = json.parse(text = json.text(target = json.field(target = function, key = "arguments"))),
   )
 }
 
-agent openai_parse_step(response: unknown, map: ai.name_map) -> types.step with prelude.throw[json.parse_error] {
+agent openai_parse_step(response: unknown, map: wire_names.name_map) -> types.step with prelude.throw[json.parse_error] {
   let message = openai_message(parsed = response)
   match (json.field(target = message, key = "tool_calls")) {
     case array(tool_calls) -> {
@@ -300,7 +304,7 @@ parsed by `post_json`, in Katari; only the POST leaves the runtime)."
 agent openai_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result {
   // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
   // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
-  let map = ai.build_name_map(tool_metas = tool_metas)
+  let map = wire_names.build_name_map(tool_metas = tool_metas)
   let body = openai_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
   let response = http.post_json(
     url = "https://api.openai.com/v1/chat/completions",
@@ -316,7 +320,7 @@ rides under its real name via the fallback, fine for the rare structured step ov
 transcript. The reply content parses back to the decoded object; a non-JSON reply throws
 `json.parse_error` (∈ `ai.step_error`)."
 agent openai_infer_object(client: connection, history: array[types.message], schema: unknown) -> types.object_result {
-  let map = ai.build_name_map(tool_metas = [])
+  let map = wire_names.build_name_map(tool_metas = [])
   let body = {
     model = client.model,
     messages = openai_messages(client = client, history = history, map = map),

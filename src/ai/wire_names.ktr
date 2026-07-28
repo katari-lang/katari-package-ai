@@ -1,0 +1,108 @@
+// The PROVIDER LAYER's tool-name reshaping: a deterministic two-way map between a tool's real
+// (qualified) Katari name and the shortened name a narrow wire vocabulary accepts.
+//
+// It lives HERE, below `ai` and beside the providers, because it is not a fact about tool calling — it
+// is a fact about certain APIs. Katari enforces namespaces, so a tool's derived name is ALWAYS
+// qualified (`katari_verify.count_letters`). Some model APIs validate every tool name — on the
+// request's tool declarations AND on the call records replayed in history — against an alphabet like
+// `^[a-zA-Z0-9_-]{1,64}$`, which forbids the dot, so a qualified name is a 400 there; others accept the
+// qualified name as it stands and never need any of this. Keeping the machinery in the neutral layer
+// made one group's constraint look like a property of tool calling, which it is not: a provider whose
+// vocabulary is wide simply does not import this module.
+//
+// The one contract that DOES belong upstairs is a single line, stated in `ai`'s tool-name note:
+// whatever a provider sends, `types.tool_call.name` must come back as the REAL qualified name, because
+// that is what the loop's dispatch matches. This module is one way to keep that promise; a provider is
+// free to keep it another way.
+//
+// The map is a pure function of the step's `tool_metas` (their order included), so every step rebuilds
+// the identical map from the same tools and no durable state is needed to keep request and response
+// agreeing on a name.
+
+@"A deterministic two-way mapping between a tool's real (qualified) name and the shortened name a
+provider sends on the wire. @real_to_wire@ is keyed by the qualified name (used when encoding a tool
+declaration or replaying a call turn), @wire_to_real@ by the wire name (used to reverse the model's
+pick); both are total over one step's tools — see @build_name_map@."
+data name_map(
+  @"Qualified tool name → wire name." real_to_wire: record[string],
+  @"Wire name → qualified tool name." wire_to_real: record[string],
+)
+
+@"Fold a wire name onto a qualified name: every character outside the `[a-zA-Z0-9_-]` name alphabet
+these APIs share (the dot of a qualified name, above all) folds to `_`, then the result is capped at
+their 64-character limit."
+agent sanitize_name(@"The qualified tool name." name: string) -> string {
+  let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+  let mapped = for (let character in string.split(value = name, separator = "")) {
+    if (string.contains(value = allowed, search = character)) {
+      next character
+    } else {
+      next "_"
+    }
+  }
+  string.slice(value = string.join(parts = mapped, separator = ""), start = 0, end = 64)
+}
+
+@"Disambiguate a colliding wire name with an ordinal suffix (`_2`, `_3`, …), reserving room so the
+result still fits the 64-character cap."
+agent suffixed_name(@"The colliding base wire name." base: string, @"The 1-based ordinal." index: integer) -> string {
+  let suffix = f"_${string.to_string(value = index)}"
+  let room = 64 - string.length(value = suffix)
+  f"${string.slice(value = base, start = 0, end = room)}${suffix}"
+}
+
+@"Choose a free wire name for @real@ given the wire names already @taken@: its sanitized form, or —
+when sanitizing collapsed two distinct qualified names onto one token, or truncation shared a prefix —
+the first free ordinal-suffixed form. The suffix is decided by @taken@'s size (processing order), so
+the choice is deterministic."
+agent assign_wire_name(@"The wire names already assigned this step." taken: record[string], @"The qualified name to place." real: string) -> string {
+  let base = sanitize_name(name = real)
+  let count = record.size(target = taken)
+  // Indices 1..count+1 yield count+1 DISTINCT candidates (base, then `base_2`, `base_3`, …); at most
+  // `count` names are taken, so at least one candidate is free and the loop always breaks. `chosen`
+  // stays `base` only in the unreachable no-break case.
+  for (let index in array.range(start = 1, end = count + 2), var chosen: string = base) {
+    let candidate = if (index == 1) { base } else { suffixed_name(base = base, index = index) }
+    if (record.has(target = taken, key = candidate)) {
+      next with { chosen = chosen }
+    } else {
+      break candidate
+    }
+  } then (_indices) { chosen }
+}
+
+@"Build the deterministic wire-name @name_map@ for one step's tools. Walking @tool_metas@ in order,
+each tool's qualified name is assigned a free wire name against the names already placed, so the same
+tool list always yields the same map — which is why the map needs no durable state (see the module
+note). A provider whose wire vocabulary admits the qualified name never imports this module at all."
+agent build_name_map(@"The step's tools, in order." tool_metas: array[reflection.agent_metadata]) -> name_map {
+  for (let meta in tool_metas, var acc: name_map = name_map(real_to_wire = record.empty(), wire_to_real = record.empty())) {
+    let wire = assign_wire_name(taken = acc.wire_to_real, real = meta.name)
+    next with {
+      acc = name_map(
+        real_to_wire = record.set(target = acc.real_to_wire, key = meta.name, value = wire),
+        wire_to_real = record.set(target = acc.wire_to_real, key = wire, value = meta.name),
+      )
+    }
+  } then (_metas) { acc }
+}
+
+@"The wire name for a qualified tool name — used to encode a tool declaration and to re-encode a
+replayed call turn. Falls back to the qualified name for a tool absent from the map (never happens for
+a map built from the same step's tools)."
+agent wire_name_of(@"The step's name map." map: name_map, @"The qualified tool name." real: string) -> string {
+  match (record.get(target = map.real_to_wire, key = real)) {
+    case null -> real
+    case wire -> wire
+  }
+}
+
+@"The qualified tool name for a wire name — used to reverse the model's pick so the loop dispatches by
+the real name. Falls back to the wire name itself for an unknown name (a hallucinated tool), which the
+loop then reports as an unknown tool."
+agent real_name_of(@"The step's name map." map: name_map, @"The wire name the model returned." wire: string) -> string {
+  match (record.get(target = map.wire_to_real, key = wire)) {
+    case null -> wire
+    case real -> real
+  }
+}

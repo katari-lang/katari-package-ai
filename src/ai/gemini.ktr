@@ -6,9 +6,12 @@
 // `inlineData` part whose `data` slot base64s at the send boundary, never on the value plane. Swapping
 // providers means swapping this one `use` line; nothing else in the app or the `ai` layer knows
 // Gemini exists.
-// Attribution: `generateContent` has NO end-user metadata field (unlike Anthropic's
-// `metadata.user_id` / OpenAI's `safety_identifier`), so `types.turn.author` is deliberately not
-// read here — the tag simply does not reach the Gemini wire.
+// Attribution: `generateContent` has NO end-user metadata field of the kind other APIs offer, so
+// `types.turn.author` is deliberately not read here — the tag simply does not reach the Gemini wire.
+// Correlation: this wire keys a tool RESPONSE by the function NAME, and demands the model's per-call
+// thought signature echoed back on the call — so the one opaque token of `types.call_ref` carries the
+// SIGNATURE here, and `types.tool_result.name` is what the response is keyed by. A provider decides
+// what its own token holds; nothing above this module reads it.
 
 import ai
 import ai.types
@@ -98,7 +101,7 @@ agent gemini_step_attempt(client: connection, history: array[types.message], too
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
+        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -117,7 +120,7 @@ agent gemini_object_attempt(client: connection, history: array[types.message], s
         case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
         case http.status_error(status => status, body => body) -> { break ai.attempt_err(error = http.status_error(status = status, body = body)) }
         case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.empty_reply(finish_reason => reason) -> { break ai.attempt_err(error = ai.empty_reply(finish_reason = reason)) }
+        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
         case rest -> { prelude.throw(error = rest) }
       }
     }
@@ -127,10 +130,14 @@ agent gemini_object_attempt(client: connection, history: array[types.message], s
 
 // ── request body (built directly as a raw value tree) ─────────────────────────
 
-agent gemini_role(role: string) -> string {
+@"Map the agnostic role sum onto the `generateContent` content role. It happens to spell the model's
+side \"model\", which is why this is written out as a match like every other provider's rather than
+passed through: the vocabulary is the sum, and a wire token that resembles it is a coincidence, not an
+identity."
+agent gemini_role(@"Who spoke the turn." role: types.role) -> string {
   match (role) {
-    case "model" -> "model"
-    case _ -> "user"
+    case types.model_role(_) -> "model"
+    case types.user_role(_) -> "user"
   }
 }
 
@@ -146,7 +153,7 @@ agent gemini_call_part(call: types.tool_call) -> unknown {
       name = call.name,
       args = call.args,
     },
-    thoughtSignature = call.opaque,
+    thoughtSignature = call.ref.token,
   }
 }
 
@@ -438,8 +445,31 @@ agent gemini_tool_call(part: unknown) -> types.tool_call {
   let call = json.field(target = part, key = "functionCall")
   types.tool_call(
     name = json.text(target = json.field(target = call, key = "name")),
-    opaque = json.text(target = json.field(target = part, key = "thoughtSignature")),
+    ref = types.call_ref(token = json.text(target = json.field(target = part, key = "thoughtSignature"))),
     args = json.field(target = call, key = "args"),
+  )
+}
+
+@"THIS provider's own step failure: `generateContent` finished a step WITHOUT an answer — no function
+call and no reply text — with a finish reason other than a normal stop (an output-token truncation that
+ate the whole answer, a safety block). @finish_reason@ is the wire's own token (\"MAX_TOKENS\",
+\"SAFETY\", …).
+
+It lives HERE and not in `ai` because it is not a fact about model steps: it is a fact about what this
+API reports and how. It reaches an app as the `detail` of an `ai.provider_error`, which is the arm the
+neutral error surface keeps for exactly this — so an app that wants to dispatch on the finish reason
+matches this datum out of the detail, and one that does not still sees a message and a transience
+verdict."
+data empty_reply(@"The wire-reported finish reason, e.g. \"MAX_TOKENS\"." finish_reason: string)
+
+@"An `empty_reply` as the neutral `ai.step_error` the seam carries. NOT transient, deliberately: the
+same context replays into the same truncation, so a retry would burn the budget on a certainty."
+agent empty_reply_error(@"The wire-reported finish reason." finish_reason: string) -> ai.step_error {
+  ai.provider_error(
+    source = "ai.gemini",
+    message = f"the model finished with \"${finish_reason}\" and produced no answer",
+    transient = false,
+    detail = empty_reply(finish_reason = finish_reason),
   )
 }
 
@@ -487,12 +517,11 @@ agent gemini_parse_step(parsed: unknown) -> types.step {
     let joined = string.join(parts = texts, separator = "")
     let finish = gemini_finish_reason(parsed = parsed)
     // An EMPTY final with an abnormal finish is not an answer — the thought parts (stripped above)
-    // or a truncation ate it. Surface the typed `ai.empty_reply` so the app sees a real failure
-    // instead of a silent empty string. A NORMAL stop with empty text stays a legitimate quiet
-    // reply (`step_final("")`) — the region loop's monitors answer exactly that when there is
-    // nothing to report.
+    // or a truncation ate it. Surface it as a real failure instead of a silent empty string. A
+    // NORMAL stop with empty text stays a legitimate quiet reply (`step_final("")`) — a resident
+    // loop's watchers answer exactly that when there is nothing to report.
     if (joined == "" && finish != "STOP" && finish != "") {
-      prelude.throw(error = ai.empty_reply(finish_reason = finish))
+      prelude.throw(error = empty_reply_error(finish_reason = finish))
     } else {
       types.step_final(text = joined)
     }

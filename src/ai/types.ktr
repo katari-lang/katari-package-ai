@@ -2,29 +2,60 @@
 // step's outcome. Each provider module maps these to/from its own wire format; the orchestration
 // (`ai`) and apps speak only this vocabulary. No provider details leak in here — that is
 // the whole point of the abstraction.
+//
+// EVERY vocabulary element here is a CLOSED KATARI TYPE, never a wire token. That rule is what this
+// module is for: a `role` spelled as a string carries whichever provider's token was typed first, and
+// the provider whose token it happens to be then maps it with the identity function while the others
+// translate — so the abstraction quietly becomes that provider's wire model and the next provider
+// inherits a vocabulary shaped for someone else's API. A sum has no such favourite: every provider
+// matches it, every provider writes its own tokens, and a token a provider invents cannot appear here
+// because there is nowhere to put it.
 
-@"One turn in a conversation: who spoke (\"user\" / \"model\"), what they said, and any files attached
-to it (a Discord attachment, a generated image). Files ride as blob handles; each provider decides
+@"Whose turn this is: the CALLER's side of the conversation — a person's message, a system framing
+turn, a background report, a turn the loop synthesized. Every provider has a token for it; none of
+them is this datum."
+data user_role()
+
+@"Whose turn this is: the MODEL's own — text it produced on an earlier step and that is replayed to it
+as its own words. The wire token differs per provider (\"assistant\" on some APIs, \"model\" on others);
+which one goes out is the provider adapter's decision, made by matching this sum."
+data model_role()
+
+// WHO spoke one turn — a closed sum, so a provider adapter must map it and an app cannot invent a
+// third value. (Type synonyms take no docs.)
+type role = user_role | model_role
+
+@"One turn in a conversation: who spoke (`user_role` / `model_role`), what they said, and any files
+attached to it (a chat attachment, a generated image). Files ride as blob handles; each provider decides
 when to inline their content for the model (see the providers' inline policy). @author@ is the
 OPTIONAL opaque end-user tag of a user turn (e.g. a hashed chat-user id) — never shown to the model;
-providers lift the newest user turn's author into their abuse-attribution request metadata
+a provider whose API has an abuse-attribution field lifts the newest user turn's author into it
 (`ai.attribution`). `null` (the default) means the turn is not attributable to an end user: a system
 framing turn, a monitor notification, a loop-synthesized turn."
-data turn(role: string, text: string, files: array[file] ?= [], author: string | null ?= null)
+data turn(role: role, text: string, files: array[file] ?= [], author: string | null ?= null)
 
-@"One tool the model wants to invoke this step — @name@ is its function name (the dispatch key and
-the model-facing call/response record), @opaque@ is any provider token that must be replayed
-verbatim on the call turn (Gemini's thought signature, OpenAI's call id), @args@ is the model's
+@"THE correlation handle of one tool call: a single OPAQUE token, minted by the provider that parsed
+the model's pick and replayed verbatim on the call turn AND on the result that answers it. WHAT it
+holds is the provider's own business — an id its wire keys a result by, or a token its wire demands
+echoed back on the call — and nothing above the provider ever reads it. It exists so a result and its
+call correlate by carrying the SAME value, which is one channel rather than a choice between two
+mutually exclusive keys."
+data call_ref(@"The provider's opaque per-call token, replayed verbatim." token: string)
+
+@"One tool the model wants to invoke this step — @name@ is its function name (the dispatch key and the
+model-facing call/response record), @ref@ is the call's opaque correlation handle, @args@ is the model's
 argument object as a parsed value (replayed verbatim into the call turn, and dispatched straight
 through `reflection.call_agent`, whose delegation boundary unconditionally turns any `$katari_ref` the
 model replayed into the `file` it denotes)."
-data tool_call(name: string, opaque: string, args: unknown)
+data tool_call(name: string, ref: call_ref, args: unknown)
 
-@"A tool's output for the model, keyed by the tool @name@ / @call_id@ so it round-trips as a function
-response. @files@ are the `file` values found in the result (a screenshot an MCP tool returned, an
-edited image): @text@ already shows their `$katari_ref` handles (the result's wire form), and the provider
-additionally inlines their content for the model while the result is fresh."
-data tool_result(name: string, call_id: string, text: string, files: array[file])
+@"A tool's output for the model, carrying the @ref@ of the call it answers so it round-trips as a
+function response, and that call's tool @name@ so the record stays readable (and so a wire that keys
+its responses by name has the name to hand). @files@ are the `file` values found in the result (a
+screenshot an MCP tool returned, an edited image): @text@ already shows their `$katari_ref` handles
+(the result's wire form), and a provider that can additionally inline their content does so while the
+result is fresh."
+data tool_result(name: string, ref: call_ref, text: string, files: array[file])
 
 @"A conversation turn recording the model's tool-call batch — replayed so the next step shows the model what it already asked for."
 data call_turn(calls: array[tool_call])
@@ -32,9 +63,8 @@ data call_turn(calls: array[tool_call])
 @"A conversation turn carrying the results of a tool-call batch."
 data result_turn(results: array[tool_result])
 
-// One conversation-history element. Each provider maps it to its content parts (Gemini text /
-// functionCall / functionResponse; OpenAI user|assistant|tool messages), so the function-calling
-// loop closes. (Type synonyms take no docs.)
+// One conversation-history element. Each provider maps it to whatever its API calls content, so the
+// function-calling loop closes. (Type synonyms take no docs.)
 type message = turn | call_turn | result_turn
 
 @"One inference step's decision: a final reply text for the user."
