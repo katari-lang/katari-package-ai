@@ -47,17 +47,28 @@ its own context, never INTO the loop's, so the resume value is the only channel 
 request infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> step_outcome
 
 // The error surface of one model step. Three arms describe a REQUEST/REPLY transport, because that is
-// what a hosted model API is and what every classification above this line wants to read: a non-2xx
-// status (`http.status_error` — the arm an app dispatches on to tell "check your credit balance" from
-// "wait it out"), a transport failure (`http.fetch_error`), and a malformed reply (`json.parse_error`).
+// what a hosted model API is and what every classification above this line wants to read: a rejected
+// call CLASSIFIED into the shared vocabulary (`http.api_failure` — `auth_error` when the credential is
+// what failed, `api_error` for everything else, both CARRYING the status an app dispatches on to tell
+// "check your credit balance" from "wait it out"), a transport failure (`http.fetch_error`), and a
+// malformed reply (`json.parse_error`).
 // The FOURTH arm is what keeps those three from being a specification: `provider_error` carries a
 // failure only the provider can name — a reply that finished with no answer, a refusal an SDK reports
 // out of band, a local model's own error — as the provider's own value, so a provider whose failures
 // are not HTTP-shaped has somewhere to put them and no provider has to invent an arm here.
 // A provider no longer THROWS this — it hands it back as `inference_failed(error)` (see `infer_step`),
-// so the failure surfaces at the loop's perform site, not the provider's deep use site. (Type
-// synonyms take no docs.)
-type step_error = json.parse_error | http.status_error | http.fetch_error | provider_error
+// so the failure surfaces at the loop's perform site, not the provider's deep use site.
+//
+// WHY THE CLASSIFIED PAIR AND NOT THE RAW `http.status_error` IT USED TO BE: an app root sees the
+// failures of every package it composes, and this one was the last package spelling a rejected call its
+// own way — so a 401 from Google wore `http.auth_error` while a 401 from a model API wore
+// `http.status_error(401)`, and the one-converter story ("re-resolve the credential and replay") had to
+// be written twice to cover both. Nothing is lost by classifying here, because the classification KEEPS
+// the status: `is_transient` reads `api_error.status` exactly as it read `status_error.status`, and
+// `auth_error` is simply the arm where no status is worth retrying. The raw fact stays raw where it is
+// raw — `http.post_json` still throws `status_error`, and `post_step` is the one place this package
+// turns it into the vocabulary. (Type synonyms take no docs.)
+type step_error = json.parse_error | http.api_failure | http.fetch_error | provider_error
 
 @"A step failure only the PROVIDER can name — the arm that keeps `step_error` from being a list of
 transport shapes and lets a provider carry its own failure as a value. @source@ says who produced it
@@ -124,39 +135,50 @@ agent infer_structured[T](history: array[types.message]) -> T {
   }
 }
 
-// ── transient retry: the provider layer's resilience ──────────────────────────
+// ── the provider kit: one POST, one classification, one retry loop ────────────
 //
 // A provider's `infer_step` / `infer_object` handler runs at the app root (its `use` site), ABOVE the
 // loop — so a step failure (`step_error`) surfaces THERE and the tool loop cannot catch it (the loop is the
 // handler's continuation, not an enclosing handler). A transient failure — a 429 rate limit, a 5xx, a
 // dropped connection — would therefore end a long-lived bot. The fix lives where the error IS catchable:
 // inside the provider's own handler body, whose effect row is CONCRETE, so a `prelude.throw[step_error]`
-// handler discharges it (the same shape as an app's resilient `try_send`). Each provider retries a
-// transient step with exponential backoff; these two pure helpers make the decision, and the retry loop
-// itself lives in each handler body — a callback-wrapped `retry(task)` would commonise the whole thing,
-// which is not the point (the decision is the shared part, not the control flow).
+// handler discharges it (the same shape as an app's resilient `try_send`).
+//
+// EVERYTHING A PROVIDER SHARES ABOUT THAT LIVES HERE — DECISION AND CONTROL FLOW ALIKE. The note that
+// stood in this place argued the other way: that the shared part was the DECISION (`is_transient`, the
+// backoff) and the loop itself could be written out per provider. Six byte-identical copies of that loop
+// are what the argument bought — three providers times two seams, each with its own `attempt + 1 >=
+// attempts` to keep in step, each with its own not-attempted fallback. The rule that replaced it is the
+// one `google_common` was founded on: ANYTHING THAT CAN DRIFT LIVES IN ONE PLACE, and a control flow six
+// hands must edit together drifts exactly as readily as a threshold does. So `with_retries` owns the
+// loop and `post_step` owns the non-2xx classification; what stays per provider is the one thing that
+// genuinely differs — the ATTEMPT AGENT, which catches its own wire's failures into an `attempt` verdict.
 
 @"Whether a step error is TRANSIENT — worth a backoff and a retry — as opposed to fatal. A transport
 failure (`http.fetch_error`: DNS, a refused connection, a timeout, a mid-flight restart) is always
-transient; a status error is transient for 408 (request timeout), 429 (rate limit) and any 5xx
-(server-side), and fatal for every other status (401/403/404 … — a retry will not fix them); a
-`json.parse_error` is fatal (a malformed body will not parse on a retry). A `provider_error` answers
+transient; an `http.api_error` is transient for 408 (request timeout), 429 (rate limit) and any 5xx
+(server-side), and fatal for every other status (400/404 … — a retry will not fix them); an
+`http.auth_error` is ALWAYS fatal, which is the whole reason that arm exists: 401 and 403 say the
+CREDENTIAL is what failed, and re-sending the same credential is a retry ladder spent on a certainty
+(the recovery is a fresh resolution of it, which is an app-level `replay` decision, not a backoff).
+A `json.parse_error` is fatal (a malformed body will not parse on a retry). A `provider_error` answers
 with the verdict its PRODUCER wrote into it: this function cannot classify a failure it has never
 seen, and guessing on the producer's behalf is how a deterministic failure earns a retry ladder."
 agent is_transient(error: step_error) -> boolean {
   match (error) {
     case http.fetch_error(message => _) -> true
-    case http.status_error(status => status, body => _) -> status == 408 || status == 429 || status >= 500
+    case http.auth_error(status => _, context => _, message => _) -> false
+    case http.api_error(status => status, context => _, message => _) -> status == 408 || status == 429 || status >= 500
     case json.parse_error(message => _) -> false
     case provider_error(source => _, message => _, transient => transient, detail => _) -> transient
   }
 }
 
-@"The backoff delay in milliseconds before retry @attempt@ (0-based): @base_ms@ doubled per attempt (base,
-2×base, 4×base, …) and capped at one minute, so a long outage does not sleep unboundedly between the final
-tries."
-agent backoff_ms(attempt: integer, base_ms: number) -> number {
-  let grown = for (let _step in array.range(start = 0, end = attempt), var delay: number = base_ms) {
+@"The backoff delay in milliseconds before retry @attempt@ (0-based): @base_milliseconds@ doubled per
+attempt (base, 2×base, 4×base, …) and capped at one minute, so a long outage does not sleep unboundedly
+between the final tries."
+agent backoff_milliseconds(attempt: integer, base_milliseconds: number) -> number {
+  let grown = for (let _step in array.range(start = 0, end = attempt), var delay: number = base_milliseconds) {
     next with { delay = delay * 2.0 }
   } then (_steps) { delay }
   math.min(left = grown, right = 60000.0)
@@ -172,6 +194,82 @@ data attempt_err(error: step_error)
 
 // A step attempt's verdict: the result, or the caught error to classify and maybe retry. (Type synonyms take no docs.)
 type attempt[T] = attempt_ok[T] | attempt_err
+
+@"THE provider layer's POST: `http.post_json`, with the one thing every provider then has to do folded
+in — a non-2xx CLASSIFIED into the shared vocabulary (`http.classify_status`) instead of surfacing as
+the raw `http.status_error` the transport threw. @context@ is the caller's own name for the call
+(\"anthropic.infer_step\"), which rides onto whichever variant comes out and is what a human reads
+first.
+
+It exists so `status_error` has exactly ONE crossing point into `step_error`, rather than one per
+provider per seam: the raw fact belongs to the transport, the classified pair belongs to the app root
+that composes this package with every other, and a provider should not have to know where the line
+between them goes. A transport failure and a malformed 2xx body pass through untouched — they are
+already the vocabulary's own arms."
+agent post_step(
+  @"The endpoint to POST to; public by type." url: string,
+  @"The request body as a value tree (a `file` leaf base64s at the send boundary)." body: unknown of private,
+  @"The request headers; each value may be a secret." headers: record[string of private],
+  @"Which call this is, in the provider's own words — e.g. \"gemini.infer_step\"." context: string,
+) -> unknown with io | prelude.throw[step_error] {
+  // The other two arms are rebuilt rather than passed through: a `prelude.throw` handler catches EVERY
+  // throw beneath it, so the clause must name the whole row `post_json` can raise, and a residual
+  // `case rest` would still carry `status_error` in its type — the very arm this exists to remove.
+  use handler {
+    request prelude.throw(error: http.status_error | http.fetch_error | json.parse_error) -> never {
+      match (error) {
+        case http.status_error(status => status, body => text) -> {
+          prelude.throw(error = http.classify_status(status = status, context = context, message = text))
+        }
+        case http.fetch_error(message => message) -> { prelude.throw(error = http.fetch_error(message = message)) }
+        case json.parse_error(message => message) -> { prelude.throw(error = json.parse_error(message = message)) }
+      }
+    }
+  }
+  http.post_json(url = url, body = body, headers = headers)
+}
+
+@"ONE bounded retry loop over one @attempt@ agent — the control flow all providers share, so an
+off-by-one is fixed once instead of six times. Run @attempt@ up to @attempts@ times: a verdict of
+`attempt_ok` answers `inferred(result)` immediately; an `attempt_err` is classified by `is_transient`
+and, while there is budget left, slept off for `backoff_milliseconds(attempt, base_milliseconds)` and
+tried again. A FATAL error, or a transient one past the budget, answers `inference_failed(error)` — a
+VALUE, never a throw, because that is what the seam promises its caller (see `infer_step`).
+
+The DECISIONS stay exactly where they were: `is_transient` says what is worth repeating and
+`backoff_milliseconds` says how long to wait, and a provider that disagrees with either overrides
+nothing here — it hands back a `provider_error` carrying its own `transient` verdict. What this owns is
+only the loop. @attempts@ below 1 is a configuration defect, and it answers as one: a
+`provider_error` from this middleware naming the knob, marked NOT transient, because no amount of
+waiting turns a zero budget into a call."
+agent with_retries[T](
+  @"How many attempts the budget allows; below 1 is a configuration defect (see above)." attempts: integer,
+  @"The first backoff delay in milliseconds, doubled per retry." base_milliseconds: number,
+  @"One attempt at the seam call, folding its own wire's failures into an `attempt` verdict." attempt: agent (value: null) -> attempt[T] with io | prelude.throw[env.missing_secret | oauth.server_error],
+) -> inferred[T] | inference_failed with io | prelude.throw[env.missing_secret | oauth.server_error] {
+  for (let index in array.range(start = 0, end = attempts), var pending: null = null) {
+    match (attempt(value = null)) {
+      case attempt_ok(result => result) -> { break inferred(result = result) }
+      case attempt_err(error => error) -> {
+        if (!is_transient(error = error) || index + 1 >= attempts) {
+          break inference_failed(error = error)
+        } else {
+          time.sleep(milliseconds = backoff_milliseconds(attempt = index, base_milliseconds = base_milliseconds))
+          next with { pending = null }
+        }
+      }
+    }
+  } then (_attempts) {
+    // Only reachable when @attempts@ < 1 (the loop never ran). It is this middleware's own verdict, not
+    // the wire's, so it says so and rides `provider_error` rather than dressing up as a transport failure.
+    inference_failed(error = provider_error(
+      source = "ai.with_retries",
+      message = "the model was not called: the retry budget was empty (retry_attempts must be >= 1)",
+      transient = false,
+      detail = null,
+    ))
+  }
+}
 
 @"Two tools in one loop's tool list share a metadata name, so the model's pick could not be routed
 unambiguously (dispatch matches by name — the first match would silently win, and the other tool
@@ -605,7 +703,9 @@ any replayed `$katari_ref` into the `file` it denotes). Every way a call can go 
 model as an error result it reads and corrects on its next step: a hallucinated name (nothing matches), a
 tool that panics, a tool's own typed `throw`, malformed args (a `reflection.call_error` from the
 boundary), and a call that outruns @budget_milliseconds@ (raced via `time.with_deadline`, the late
-call cancelled) alike — none of them reaches the app root. Each of those also yields a `tool_event`, so
+call cancelled) alike — none of them reaches the app root. A thrown payload carrying a string `message`
+field is shown to the model AS THAT LINE — a tool that wrote a sentence for a reader wrote it for this
+reader — and anything else falls back to the payload's JSON. Each of those also yields a `tool_event`, so
 what the model was told is not the ONLY record of it. The result's `file` values are collected off the
 result tree so the provider can show them to the model (their `$katari_ref` handles are already visible in
 the result text)."
@@ -633,7 +733,13 @@ agent dispatch_one[effect E lacks time.race_settled](tools: array[agent never ->
   }
   use handler {
     request prelude.throw(error: unknown) -> never {
-      let rendered = json.stringify(value = error)
+      // A tool that threw a payload with a `message` STRING wrote that line for a reader, so it is the
+      // line the model reads; anything else falls back to the raw JSON, which at least shows the shape.
+      // The two are ONE string, not two: what the model is told and what the app is told must not be
+      // able to disagree (`dispatched`), and a tool's own sentence is worth more to both than
+      // `{"$katari_constructor":"sandbox_unavailable","message":"…"}` is to either.
+      let stated = json.text_at(target = error, key = "message")
+      let rendered = if (stated == "") { json.stringify(value = error) } else { stated }
       break refused(text = f"(tool failed: ${rendered})", outcome = tool_failed(message = rendered))
     }
   }
@@ -988,7 +1094,15 @@ measured occupancy is classified against @threshold_tokens@: over it, the conver
 (`compact`) under @compact_prompt@, keeping the last @keep_recent@ elements verbatim. The ambient
 provider (the `use <some provider>.provider(...)` line) and any @E@ handlers are installed by the caller, exactly as
 for `infer_with_tools`; the continuation bridges its transport into `session_message` and typically
-never returns (a `watch_messages` loop)."
+never returns (a `watch_messages` loop).
+
+IT HAS NO BACKLOG, deliberately and unlike a DESK. A provider failure RE-RAISES at the perform site
+(this is one-shot per message), and at that moment the arriving message is in neither the conversation
+nor any held queue — it exists only as the argument of the `session_message` call that is unwinding, so
+a bridge that does not catch and re-deliver LOSES it. That is the right trade for a chat session, where
+the sender is present and can say it again; it is the wrong one for a resident nobody is watching, which
+is what `advance_desk` (a bounded backlog, a dropped marker, the shed) exists for. Reach for the desk the
+moment the arrivals stop having a human behind them."
 agent serve_session[R, effect E lacks time.race_settled](
   @"The conversation the model starts from (PRIOR TURNS only — standing instructions belong in the
 provider's `system` parameter, which every provider takes and compaction never touches; anything put
@@ -1133,15 +1247,37 @@ agent new_desk() -> desk {
   desk(conversation = [], used_tokens = 0, held = empty_backlog())
 }
 
-@"ONE thing that arrived for a desk — the same text + files + author split as `types.turn`, plus
-@source@, which labels the injected turn so the model can tell a chat message from a cron tick from
-another agent's mail."
+@"ONE thing that arrived for a desk — the same text + files + author split as `types.turn`, plus the
+PROVENANCE pair every multi-agent program ended up needing: @source@, which labels the injected turn so
+the model can tell a chat message from a cron tick from another agent's mail, and @hop@, how many
+agent-to-agent relays it has already made."
 data arrival(
   @"Who is reporting (e.g. \"discord:<channel>\", \"cron:morning\"); labels the injected turn." source: string,
   @"The message body." content: string,
+  @"How many agent-to-agent hops this message has already made: 0 for anything that is not mail between
+agents (a chat message, a cron tick, a watch report, a session's own startup line), 1 for a first-hop
+send, 2 for the reply to one. It is a fact about the MESSAGE, so it is carried and not guessed — a
+program that damps replies (\"a reply that asks nothing needs no answer\") cannot state that rule at all
+while every sender stamps the same constant." hop: integer,
   @"Files riding the message." files: array[file] ?= [],
   @"The opaque end-user tag of the human behind it, or `null` for a system report." author: string | null ?= null,
 )
+
+@"THE PROVENANCE OF THE ARRIVAL THIS DESK IS SERVING RIGHT NOW: @origin@ is the arrival's `source`
+verbatim and @hop@ is its `hop`. Served by `advance_desk` for the extent of ONE dispatch — the desk is
+the only frame holding the arrival, and a desk's tool set is assembled once for the whole session, so a
+tool cannot close over the message it is answering.
+
+TOOLS READ THIS INSTEAD OF PARSING THE LABEL. The injected turn opens with prose (\"Message from
+<source>:\"), and a tool that wanted the sender or the hop used to recover it by pattern-matching that
+sentence — which makes a display string load-bearing and puts the hop rule at the mercy of a reworded
+line. Here both halves are the values the caller put in the `arrival`. The label stays what it is, a
+label for the model to read.
+
+A program with no desk serving it (a hand-rolled `take_turn`) simply has no handler for this, and a tool
+that performs it says so in its own effect row — so the capability is visible in the type rather than
+assumed."
+request inbound_provenance() -> { origin: string, hop: integer }
 
 @"What a turn's final text is for: DELIVERY. A non-blank reply goes to the desk's @deliver_to@ — the
 ordinary chat shape, where the conversation owes one answer per message."
@@ -1347,11 +1483,18 @@ is not renudged (silence is a legitimate answer for a resident). Then, by outcom
   that recovers reads it.
 
 Tools and @persona@ are ordinary parameters, so a program with several desks passes a different set
-and a different voice per desk without holding either in the desk's state."
+and a different voice per desk without holding either in the desk's state.
+
+FOR THE EXTENT OF THE DISPATCH IT SERVES `inbound_provenance`, answering with this arrival's `source`
+and `hop`. A desk's tool set is assembled once for the session, so a tool cannot close over the message
+it is answering — and the desk is the one frame that holds it. A tool that relays mail therefore stamps
+the NEXT hop from what actually arrived, and reads the sender as a value instead of parsing it back out
+of the injected turn's prose."
 agent advance_desk[effect E lacks time.race_settled](
   @"The desk as it stands." state: desk,
   @"What arrived." arrival: arrival,
-  @"This desk's tool set — the whole of what this conversation can do." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"This desk's tool set — the whole of what this conversation can do. A tool may perform
+`inbound_provenance`; this agent serves it for the dispatch." tools: array[agent never -> unknown with {...E, inbound_provenance, prelude.throw[unknown]}],
   @"Computes this desk's persona note, fresh at every model step (`with_context`). Return \"\" for none." persona: agent (value: null) -> string with {...E, infer_step},
   @"Where a delivered reply goes. Never called under `announce_discarded_reply`." deliver_to: agent (reply: string) -> null with E,
   @"The desk's policy; `null` (the default) is `default_desk_policy`." policy: desk_policy | null ?= null,
@@ -1361,8 +1504,8 @@ agent advance_desk[effect E lacks time.race_settled](
     case given -> given
   }
   let injected = array.append(target = pending_conversation(state = state), value = arrival_turn(arrival = arrival, note = ""))
-  agent one_turn(value: null) -> turn_result with {...E, infer_step, prelude.throw[duplicate_tool]} | io {
-    take_turn[E](
+  agent one_turn(value: null) -> turn_result with {...E, infer_step, inbound_provenance, prelude.throw[duplicate_tool]} | io {
+    take_turn[{...E, inbound_provenance}](
       conversation = injected,
       tools = tools,
       max_steps = rules.max_steps,
@@ -1370,6 +1513,14 @@ agent advance_desk[effect E lacks time.race_settled](
       unbounded_tool_names = rules.unbounded_tool_names,
       nudge_empty_reply = false,
     )
+  }
+  // The provenance, for the extent of this dispatch: installed ABOVE the turn so a tool the model calls
+  // finds it, and answering from the `arrival` value rather than from the label the turn was rendered
+  // with — the string is for the model to read, not for a tool to parse back apart.
+  use handler {
+    request inbound_provenance() {
+      next { origin = arrival.source, hop = arrival.hop }
+    }
   }
   match (with_context(inject = persona, continuation = one_turn)) {
     case failed_turn(conversation => _, error => error, tool_events => events) -> {
@@ -1435,7 +1586,8 @@ deliver nothing, and the turn that recovers delivers one line back. Per-turn not
 turned a delivery backlog plus a standing outage into sixteen identical messages in seconds; the
 transition test is the fix, and installing `with_breaker` additionally stops the doomed calls."
 agent serve_observations[R, effect E lacks time.race_settled](
-  @"The tools of every turn's loop." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"The tools of every turn's loop. A tool may perform `inbound_provenance`; the desk beneath this
+serves it, always with `hop = 0` (an observation is a report, never a relay)." tools: array[agent never -> unknown with {...E, inbound_provenance, prelude.throw[unknown]}],
   @"The per-observation step budget." max_steps: integer,
   @"Where a turn's non-empty reply (and the two outage lines) is delivered." deliver_to: agent (reply: string) -> null with E,
   @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
@@ -1460,7 +1612,11 @@ agent serve_observations[R, effect E lacks time.race_settled](
     request observation(source: string, content: string, files: array[file], author: string | null) {
       let advanced = advance_desk[E](
         state = state,
-        arrival = arrival(source = source, content = content, files = files, author = author),
+        // HOP 0: an `observation` is a fiber REPORTING — a chat watcher, a cron tick, a source — and
+        // never one agent relaying another's message, which is the only thing a hop counts. A program
+        // that does relay mail between desks holds its desks itself and calls `advance_desk` with the
+        // hop the sender stamped.
+        arrival = arrival(source = source, content = content, hop = 0, files = files, author = author),
         tools = tools,
         persona = no_persona,
         deliver_to = deliver_to,
@@ -1479,8 +1635,10 @@ agent serve_observations[R, effect E lacks time.race_settled](
           next null with { state = advanced.state, announced = announced }
         }
         case answered(reply => _) -> {
+          // The wording is `recovery_line`'s, not a literal of its own: the breaker says the same
+          // sentence on the same event, and two spellings of one line is one of them going stale.
           if (announced) {
-            deliver_to(reply = "(the model is answering again — picking up from where it stopped.)")
+            deliver_to(reply = recovery_line())
           } else {
             null
           }
@@ -1600,7 +1758,8 @@ agent advance_in_table[effect E lacks time.race_settled](
   @"The key whose desk this arrival is for (a worker name — already normalized by the app)." key: string,
   @"The arrival's launch generation, minted by the app's roster at admit and read at dispatch." generation: integer,
   @"What arrived." arrival: arrival,
-  @"This key's tool set for this turn — the whole of what this conversation can do." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"This key's tool set for this turn — the whole of what this conversation can do. A tool may perform
+`inbound_provenance`; the desk this dispatch reaches serves it." tools: array[agent never -> unknown with {...E, inbound_provenance, prelude.throw[unknown]}],
   @"Computes this key's persona note, fresh at every model step (`with_context`). Return \"\" for none." persona: agent (value: null) -> string with {...E, infer_step},
   @"Where a delivered reply goes. Never called under `announce_discarded_reply`." deliver_to: agent (reply: string) -> null with E,
   @"The desk's policy; `null` (the default) is `default_desk_policy`." policy: desk_policy | null ?= null,
@@ -1638,7 +1797,7 @@ agent serve_in_table[effect E lacks time.race_settled](
   @"The generation to stamp the stored cell with." generation: integer,
   @"The desk the arrival runs against (the key's own, or a fresh one)." base: desk,
   @"What arrived." arrival: arrival,
-  @"This key's tool set for this turn." tools: array[agent never -> unknown with {...E, prelude.throw[unknown]}],
+  @"This key's tool set for this turn." tools: array[agent never -> unknown with {...E, inbound_provenance, prelude.throw[unknown]}],
   @"Computes this key's persona note, fresh at every model step." persona: agent (value: null) -> string with {...E, infer_step},
   @"Where a delivered reply goes." deliver_to: agent (reply: string) -> null with E,
   @"The desk's policy; `null` is `default_desk_policy`." policy: desk_policy | null ?= null,
@@ -1706,8 +1865,8 @@ type restart_event = first_failure | repeated_failure
 
 @"Supervise a restartable @session@ FOREVER: run one attempt, and when it ends by RETURNING a
 recoverable `crash_reason`, call @on_restart@, wait the current backoff, and start a fresh attempt. The
-backoff starts at @initial_delay_ms@ and grows by @factor@ each time the reason's KIND repeats (a
-sustained outage), capped at @max_delay_ms@; a changed kind resets it to the floor. @on_restart@ hears
+backoff starts at @initial_delay_milliseconds@ and grows by @factor@ each time the reason's KIND repeats
+(a sustained outage), capped at @max_delay_milliseconds@; a changed kind resets it to the floor. @on_restart@ hears
 a `restart_event`, so a repeat is a distinguishable value carrying its streak rather than a boolean
 flag beside a string. Fatal-vs-restartable is the SESSION's decision, not this loop's: a session that
 hits an unrecoverable error re-raises it, and it propagates through `supervise` UNTOUCHED to a handler
@@ -1717,13 +1876,13 @@ unwinds past it."
 agent supervise[effect E](
   @"One attempt: run the resident until it ends recoverably and RETURN the crash reason to restart from. A fatal error re-raises past `supervise` instead of returning." session: agent (value: null) -> crash_reason with E,
   @"The restart-notice sink, called once per restart. A `repeated_failure` carries its streak, so a repeat can be shortened or dropped." on_restart: agent (event: restart_event) -> null with E,
-  @"The backoff floor in milliseconds — the first wait, and the wait a changed kind resets to. Default 30s." initial_delay_ms: number ?= 30000.0,
+  @"The backoff floor in milliseconds — the first wait, and the wait a changed kind resets to. Default 30s." initial_delay_milliseconds: number ?= 30000.0,
   @"The factor the backoff grows by while the same kind repeats. Default 2." factor: number ?= 2.0,
-  @"The backoff ceiling in milliseconds — the growing delay never exceeds it. Default 15 minutes." max_delay_ms: number ?= 900000.0,
+  @"The backoff ceiling in milliseconds — the growing delay never exceeds it. Default 15 minutes." max_delay_milliseconds: number ?= 900000.0,
 ) -> never with E | io {
   // `streak` doubles as the have-we-run-before marker: 0 means no previous attempt, so the very first
   // crash is a `first_failure` whatever its kind is (including the empty one).
-  forever (var delay: number = initial_delay_ms, var last_kind: string = "", var streak: integer = 0) {
+  forever (var delay: number = initial_delay_milliseconds, var last_kind: string = "", var streak: integer = 0) {
     let reason = session(value = null)
     let repeated = streak > 0 && reason.kind == last_kind
     let run = if (repeated) { streak + 1 } else { 1 }
@@ -1731,22 +1890,49 @@ agent supervise[effect E](
     on_restart(event = event)
     time.sleep(milliseconds = delay)
     // Grow the delay while the kind repeats (a sustained outage); reset to the floor when it changes.
-    let next_delay = if (repeated) { math.min(left = delay * factor, right = max_delay_ms) } else { initial_delay_ms }
+    let next_delay = if (repeated) { math.min(left = delay * factor, right = max_delay_milliseconds) } else { initial_delay_milliseconds }
     next with { delay = next_delay, last_kind = reason.kind, streak = run }
   }
 }
 
 // ── ambient-context middleware ────────────────────────────────────────────────
 
-@"Middleware over the seam: EVERY `infer_step`, prepend @inject@'s freshly computed text as a user
-turn and re-perform outward to the ambient provider — the generalization of the bot-side pattern
-that re-injects the current time and a memory index each turn. Install it INSIDE the provider (the
-provider's `use` first, then `use ai.with_context(inject = ...)`), so the re-performed step
-reaches the model. An EMPTY injection skips the extra turn; the injected turn is never part of the
-conversation a loop persists (it is derived fresh each step, so persisting it would double it).
-`infer_object` passes through un-injected — structured extraction states its own context."
+@"The index of the NEWEST plain `turn` spoken by the user — where an ambient note is injected so that
+the bytes BEFORE it never move (see `with_context`). A history with no user turn at all answers 0, so
+the note lands at the front: the degenerate case keeps the only position that is always valid."
+agent newest_user_index(@"The conversation so far." history: array[types.message]) -> integer {
+  for (let message in history, var found: integer = 0, var index: integer = 0) {
+    match (message) {
+      case types.turn(role => role, text => _, files => _, author => _) -> {
+        match (role) {
+          case types.user_role(_) -> { next with { found = index, index = index + 1 } }
+          case types.model_role(_) -> { next with { found = found, index = index + 1 } }
+        }
+      }
+      case _ -> { next with { found = found, index = index + 1 } }
+    }
+  } then (_messages) { found }
+}
+
+@"Middleware over the seam: EVERY `infer_step`, insert @inject@'s freshly computed text as a user turn
+JUST BEFORE the newest user turn, and re-perform outward to the ambient provider — the generalization
+of the bot-side pattern that re-injects the current time and a memory index each turn. Install it
+INSIDE the provider (the provider's `use` first, then `use ai.with_context(inject = ...)`), so the
+re-performed step reaches the model. An EMPTY injection skips the extra turn; the injected turn is
+never part of the conversation a loop persists (it is derived fresh each step, so persisting it would
+double it). `infer_object` passes through un-injected — structured extraction states its own context.
+
+WHY BEFORE THE NEWEST USER TURN AND NOT AT THE FRONT, which is where this used to put it: every model
+API reuses a repeated request prefix only while it stays BYTE-IDENTICAL, and an ambient note is by
+definition the part that CHANGES — a clock reading, a memory index that just gained an entry. At the
+front, one changed character invalidated the whole conversation on every step, so a note carrying the
+time cost a tool loop its entire prefix at every step of every turn. Here the changing bytes sit at the
+END of the stable region: the newest user turn is the turn that triggered this model turn, and a turn's
+tool loop only APPENDS after it, so everything from element 0 up to the injection is identical across
+the steps of a turn and across turns. Recency helps too — a note the model is meant to act on now reads
+better next to the message it applies to than twenty exchanges earlier."
 agent with_context[R, effect E](
-  @"Computes the note to prepend this step — ambient state (the time, a memory index), fresh each step." inject: agent (value: null) -> string with {...E, infer_step},
+  @"Computes the note to inject this step — ambient state (the time, a memory index), fresh each step." inject: agent (value: null) -> string with {...E, infer_step},
   @"The program to run with the injection installed." continuation: agent (value: null) -> R with {...E, infer_step},
 ) -> R with E | infer_step {
   use handler {
@@ -1755,7 +1941,11 @@ agent with_context[R, effect E](
       let injected = if (note == "") {
         history
       } else {
-        array.concat(left = [types.turn(role = types.user_role(), text = note, files = [])], right = history)
+        let cut = newest_user_index(history = history)
+        array.concat(
+          left = array.append(target = array.slice(target = history, start = 0, end = cut), value = types.turn(role = types.user_role(), text = note, files = [])),
+          right = array.slice(target = history, start = cut, end = array.length(target = history)),
+        )
       }
       // Re-performing escalates PAST this handler to the ambient provider — the outward re-perform
       // semantics a rethrown request uses.
@@ -1806,18 +1996,25 @@ data waits_out()
 // What a failed step says about who can end the outage. (Type synonyms take no docs.)
 type outage_kind = needs_operator | waits_out
 
-@"Classify a failed step by WHO CAN END IT. The statuses a person must act on are matched as LITERALS,
-so the rule reads as the list it is; everything else waits. A `json.parse_error` and a `provider_error`
-land in `waits_out` deliberately: they are not transient either, but there is no lever to hand an
-operator for them, and sending someone to check a balance that is fine is worse than saying nothing
-specific."
+@"Classify a failed step by WHO CAN END IT. The statuses a person must act on are matched as LITERALS
+off the error's own `status`, so the rule reads as the list it is; everything else waits. An
+`http.auth_error` is ALWAYS a person's job — 401 and 403 are the two statuses that arm exists for, and
+both name a credential nobody but an operator can replace — while an `http.api_error` needs the status
+read, because that arm holds a 400 (act) beside a 429 (wait). A `json.parse_error` and a
+`provider_error` land in `waits_out` deliberately: they are not transient either, but there is no lever
+to hand an operator for them, and sending someone to check a balance that is fine is worse than saying
+nothing specific."
 agent classify_outage(@"The failed step's error." error: step_error) -> outage_kind {
   match (error) {
-    case http.status_error(status => status, body => _) -> {
+    case http.auth_error(status => status, context => _, message => _) -> {
+      match (status) {
+        case 403 -> needs_operator(remedy = "the provider refused the API key's permissions — check the key's plan and model access")
+        case _ -> needs_operator(remedy = "the provider refused the API key — it is wrong, revoked or expired")
+      }
+    }
+    case http.api_error(status => status, context => _, message => _) -> {
       match (status) {
         case 400 -> needs_operator(remedy = "the provider is rejecting the request outright — check the API credit balance first, then whether the configured model name still exists")
-        case 401 -> needs_operator(remedy = "the provider refused the API key — it is wrong, revoked or expired")
-        case 403 -> needs_operator(remedy = "the provider refused the API key's permissions — check the key's plan and model access")
         case 404 -> needs_operator(remedy = "the provider does not know the configured model — check the model name")
         case _ -> waits_out()
       }

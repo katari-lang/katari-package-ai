@@ -37,22 +37,29 @@ module, not editing the loop.
 - `ai.wire_names` — the PROVIDER LAYER's tool-name reshaping, for the providers whose APIs validate
   tool names against an alphabet that forbids the qualified name's dot. It is not in `ai` because it
   is not a fact about tool calling; a provider whose wire admits the qualified name never imports it.
-- `ai.gemini` — a provider over Google's `generateContent` API. `use gemini.provider(model = ...,
-  source = credentials.env(key = "GEMINI_API_KEY"))` serves `ai.infer_step` for the continuation.
-  **Files: images, PDFs, audio, video and text** — the binary kinds all ride the one `inlineData`
-  part keyed by their mime type, restricted to the formats Gemini documents; text inlines as text
-  (freshest turn only, to keep the request small).
-- `ai.openai` — a provider over the OpenAI Chat Completions API. `use openai.provider(model = ...,
-  source = ...)` — swap it for `gemini.provider` (or vice versa) with no other change. **Files: text
-  only** — a message's content here is a plain string, which text needs no wire shape to ride; an
-  image or a PDF would need a `data:` URI (base64 inside a string), which the `http.json` slot
-  contract cannot build, so those report to the model as unreadable rather than being faked.
+- `ai.gemini` — a provider over Google's `generateContent` API. `use gemini.provider(source =
+  credentials.env(key = "GEMINI_API_KEY"))` serves `ai.infer_step` for the continuation; `model`
+  defaults to `gemini-3.5-flash`. **Files: images, PDFs, audio, video and text** — the binary kinds
+  all ride the one `inlineData` part keyed by their mime type, restricted to the formats Gemini
+  documents; text inlines as text (freshest turn only, to keep the request small).
+- `ai.openai` — a provider over the OpenAI Chat Completions API. `use openai.provider(source = ...)`
+  — swap it for `gemini.provider` (or vice versa) with no other change; `model` defaults to
+  `gpt-4o-mini`. **Files: text only** — a message's content here is a plain string, which text needs
+  no wire shape to ride; an image or a PDF would need a `data:` URI (base64 inside a string), which
+  the `http.json` slot contract cannot build, so those report to the model as unreadable rather than
+  being faked.
 - `ai.anthropic` — a provider over the Anthropic Messages API. `use anthropic.provider(source =
-  ...)` — `model` defaults to `claude-sonnet-5` and `max_tokens` (the per-step output cap the API
-  requires) to 4096; swap it for either other provider with no other change. **Files: images, PDFs
-  and text** — an `image` content block (jpeg / png / gif / webp), a `document` content block
-  (base64 `application/pdf`), and inlined text respectively; audio, video and any other image format
-  have no Messages API block, so they report as unreadable.
+  ...)` — `model` defaults to `claude-sonnet-5`; swap it for either other provider with no other
+  change. **Files: images, PDFs and text** — an `image` content block (jpeg / png / gif / webp), a
+  `document` content block (base64 `application/pdf`), and inlined text respectively; audio, video
+  and any other image format have no Messages API block, so they report as unreadable.
+
+**The three providers take the same knobs.** `model` (each defaults to its series' general-purpose
+model — a default is what runs when nobody chose), `source`, `system: string | null ?= null`,
+`max_output_tokens: integer | null ?= null`, `retry_attempts`, `retry_base_milliseconds`. Anthropic's
+Messages API *requires* an output cap on every request, so `null` there means "send this provider's
+stand-in" (4096) rather than "send none"; on the other two `null` sends nothing and the model's own
+default stands. Gemini keeps one knob the others have no counterpart for, `thinking_budget`.
 
 Pure Katari — no FFI sidecar. The only network call is the prelude's HTTP client; every request body
 is built and every response parsed as `json` values in Katari, and an inlined `file` leaves base64 at
@@ -68,16 +75,25 @@ conversation however it likes (a handler var, a `record[desk]` keyed by name) an
 message into one call:
 
 ```katari
-let advanced = ai.advance_desk(
-  state = core,                                     // the desk as it stands
-  arrival = ai.arrival(source = source, content = content),
-  tools = core_tools,                               // per turn, as data
-  persona = core_persona,                           // re-derived at every model step
-  deliver_to = to_operator,
-  policy = ai.default_desk_policy(),
-)
-// advanced.state is the new desk; advanced.outcome is `answered` / `filed` / `step_failed`;
-// advanced.tool_events says which tools ran and how each ended.
+import ai
+
+@"Where this desk's replies go." request post(channel: string, text: string) -> null
+agent to_operator(reply: string) -> null with post { post(channel = "control", text = reply) }
+agent core_persona(value: null) -> string { "You are the operator's assistant." }
+
+agent one_arrival(core: ai.desk, source: string, content: string) -> ai.desk_turn with io | ai.infer_step | post | prelude.throw[ai.duplicate_tool] {
+  let advanced = ai.advance_desk(
+    state = core,                                   // the desk as it stands
+    arrival = ai.arrival(source = source, content = content, hop = 0),
+    tools = [ai.view_file],                         // per turn, as data
+    persona = core_persona,                         // re-derived at every model step
+    deliver_to = to_operator,
+    policy = ai.default_desk_policy(),
+  )
+  // advanced.state is the new desk; advanced.outcome is `answered` / `filed` / `step_failed`;
+  // advanced.tool_events says which tools ran and how each ended.
+  advanced
+}
 ```
 
 Four behaviours are built in, each of them paid for by an outage somewhere:
@@ -99,6 +115,29 @@ Four behaviours are built in, each of them paid for by an outage somewhere:
 `ai.desk_policy` is one datum holding every knob (step budget, per-call deadline, exemptions,
 compaction, retention, what a reply is for), so a program states its policy once — or a different one
 per desk; it is data.
+
+**Provenance: `source` and `hop`, as values.** An arrival carries both halves of where it came from —
+`source` (the label the injected turn shows the model) and `hop`, how many agent-to-agent relays it has
+already made: 0 for anything that is not mail between agents, 1 for a first-hop send, 2 for the reply
+to one. For the extent of a dispatch, `advance_desk` serves `ai.inbound_provenance() -> {origin, hop}`,
+so a **tool reads them instead of parsing the label**:
+
+```katari
+import ai
+
+@"The app's mail bridge — where one agent's message to another is queued." request queue_mail(to: string, source: string, content: string, hop: integer) -> string
+
+agent send_to(to: string, content: string) -> string with ai.inbound_provenance | queue_mail {
+  let whence = ai.inbound_provenance()
+  queue_mail(to = to, source = whence.origin, content = content, hop = whence.hop + 1)
+}
+```
+
+A desk's tool set is assembled once for the session, so a tool cannot close over the message it is
+answering, and the desk is the one frame that holds it. Before this the only channel was the rendered
+sentence ("Message from &lt;source&gt;:"), which made a display string load-bearing and left a
+hop-damping rule ("a reply that asks nothing needs no answer") at the mercy of a reworded line. The
+label stays exactly what it is — a label for the model to read.
 
 ## Keyed desk tables
 
@@ -133,7 +172,7 @@ import ai.types
 
 @"The current launch generation for a worker name — `null` if it has been dismissed. Served by the app's
 roster, the SoT that mints a fresh higher number at every admit." request roster_generation(name: string) -> integer | null
-@"One worker's inbound message, dispatched by the mail bridge." request worker_message(to: string, source: string, content: string) -> null
+@"One worker's inbound message, dispatched by the mail bridge." request worker_message(to: string, source: string, content: string, hop: integer) -> null
 @"Where a worker's undeliverable mail bounces." request bounce_to_core(content: string) -> null
 
 @"A worker has no channel, so its reply text goes nowhere." agent discard(reply: string) -> null { null }
@@ -142,7 +181,7 @@ roster, the SoT that mints a fresh higher number at every admit." request roster
 // this agent at the app root, exactly as in the one-shot and resident examples further up.
 agent serve_worker_table(value: null) -> null with io | ai.infer_step | roster_generation | bounce_to_core | prelude.throw[ai.duplicate_tool] {
   use handler (var table: ai.desk_table = ai.new_desk_table()) {
-    request worker_message(to: string, source: string, content: string) {
+    request worker_message(to: string, source: string, content: string, hop: integer) {
       match (roster_generation(name = to)) {
         // Dismissed (or never admitted): bounce, and forget any desk still held under the name.
         case null -> {
@@ -155,7 +194,9 @@ agent serve_worker_table(value: null) -> null with io | ai.infer_step | roster_g
             table = table,
             key = to,
             generation = generation,
-            arrival = ai.arrival(source = source, content = content),
+            // The hop the mail bridge stamped rides through, so a worker's own relay tool can read
+            // it back with `ai.inbound_provenance()` and stamp the next one.
+            arrival = ai.arrival(source = source, content = content, hop = hop),
             tools = [ai.view_file],
             persona = ai.no_persona,
             deliver_to = discard,
@@ -167,7 +208,7 @@ agent serve_worker_table(value: null) -> null with io | ai.infer_step | roster_g
       }
     }
   }
-  worker_message(to = "scribe", source = "mail:core", content = "start")
+  worker_message(to = "scribe", source = "mail:core", content = "start", hop = 1)
 }
 ```
 
@@ -185,8 +226,25 @@ desk, session and hand-rolled `take_turn` in the program passes through the one 
 scope.
 
 ```katari
-use gemini.provider(model = "gemini-3.5-flash", source = credentials.env(key = "GEMINI_API_KEY"))
-use ai.with_breaker(on_transition = announce)
+import ai
+import ai.types
+import ai.gemini
+
+@"Where the two lines per outage go." request post(channel: string, text: string) -> null
+
+agent announce(event: ai.breaker_event) -> null with post {
+  match (event) {
+    case ai.breaker_opened(kind => kind) -> post(channel = "control", text = ai.outage_line(kind = kind))
+    case ai.breaker_closed(kind => _) -> post(channel = "control", text = ai.recovery_line())
+  }
+}
+
+agent under_one_breaker(task: string) -> string with io | post | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+  use gemini.provider(model = "gemini-3.5-flash", source = credentials.env(key = "GEMINI_API_KEY"))
+  use ai.with_breaker(on_transition = announce)
+  // Every desk, session and hand-rolled `take_turn` below this line shares the one breaker.
+  ai.reply(history = [types.turn(role = types.user_role(), text = task, files = [])])
+}
 ```
 
 Three consecutive failed steps open it (`breaker_policy` is data); while open, `infer_step` answers
@@ -282,27 +340,80 @@ cannot end a resident), while the one-shot loops (`reply`, `infer_with_tools`, `
 provider handler can only throw OUT of its own context, never INTO the loop's — the resume value is the
 only channel that reaches the loop.
 
-**`step_error` has three transport arms and one open one.** A non-2xx status (`http.status_error`), a
-transport failure (`http.fetch_error`) and a malformed reply (`json.parse_error`) are what an app
-dispatches on to tell "check your credit balance" from "wait it out". The fourth arm,
-`ai.provider_error(source, message, transient, detail)`, is what keeps those three from being a
+**`step_error` speaks the stdlib's vocabulary.** A rejected call is `http.api_failure` — `auth_error`
+when the credential is what failed (401 / 403), `api_error` for everything else — and both CARRY the
+status, which is what an app dispatches on to tell "check your credit balance" from "wait it out". Beside
+them: a transport failure (`http.fetch_error`) and a malformed reply (`json.parse_error`). This is the
+same pair `gmail`, `google_calendar` and every other authenticated integration here throws, so one
+`replay` converter matching `http.auth_error` now covers a model API too; before, a 401 from Google and a
+401 from a model API wore different types and the story had to be written twice. The raw fact stays raw
+where it is raw — `http.post_json` still throws `status_error`, and `ai.post_step` is the one place this
+package turns it into the vocabulary.
+
+The fourth arm, `ai.provider_error(source, message, transient, detail)`, is what keeps those from being a
 specification: a provider carries a failure only it can name — a reply that finished with no answer, a
 refusal reported out of band, a local model's own error — as its own value in `detail`, states whether a
 retry could help in `transient`, and needs no arm of its own here. `ai.gemini.empty_reply` is exactly
 that: it lives in the provider that reports it, not in the neutral layer.
 
-**Transient retry.** Before surfacing a failure, each provider first retries a transient one — a 429 rate
-limit, a 5xx, a dropped connection — with exponential backoff. `retry_attempts` (default 6) and
-`retry_base_ms` (default 2000, doubled per retry and capped at one minute) tune it. A fatal error (a
-non-retryable 4xx, malformed JSON) or an exhausted budget is what becomes the `inference_failed` outcome.
-That ladder is how hard ONE call tries; `with_breaker` is whether to start a call at all, and the two are
-deliberately separate.
+**Transient retry, in one loop.** Before surfacing a failure, each provider first retries a transient one
+— a 429 rate limit, a 5xx, a dropped connection — with exponential backoff. `retry_attempts` (default 6)
+and `retry_base_milliseconds` (default 2000, doubled per retry and capped at one minute) tune it. A fatal
+error (an `auth_error`, a 400, malformed JSON) or an exhausted budget is what becomes the
+`inference_failed` outcome. `ai.is_transient` makes the verdict and `ai.with_retries` runs the loop —
+ONE loop, shared by all three providers and both seams, where there used to be six byte-identical copies
+of it; a provider contributes only its own attempt agent. That ladder is how hard ONE call tries;
+`with_breaker` is whether to start a call at all, and the two are deliberately separate.
 
 **Tool failures are observable.** A failing tool never fails the conversation — a panic, a typed throw,
 malformed arguments, a deadline, a hallucinated name all fold back to the model as a result it reads and
 corrects from. That is right for the model and blind for the app, so a turn also carries
 `tool_events: array[tool_event]` out: one per call, with `tool_succeeded` / `tool_failed` /
 `tool_timed_out` / `tool_not_found`. Nothing in the loop branches on them; what to do with them is yours.
+
+## Breaking changes in 0.4.0
+
+Five, and each of them is a thing that could only be said by changing a shape. Stated in the order a
+compiler will hit them.
+
+**1. `step_error` no longer carries `http.status_error`.** It carries `http.api_failure` —
+`http.auth_error(status, context, message)` and `http.api_error(status, context, message)` — because a
+rejected call should wear the same type here as it does in every other package (see **Failures**). A
+converter, a ceiling row or a `classify_crash` that matched `http.status_error` matches those two arms
+instead; the status it read is still there, on both.
+
+**2. Every millisecond knob is spelled `_milliseconds`.** The package had three spellings of one word.
+
+| was | is |
+| --- | --- |
+| `<provider>.provider(retry_base_ms = …)` | `retry_base_milliseconds` |
+| `ai.backoff_ms(attempt, base_ms)` | `ai.backoff_milliseconds(attempt, base_milliseconds)` |
+| `ai.supervise(initial_delay_ms = …, max_delay_ms = …)` | `initial_delay_milliseconds`, `max_delay_milliseconds` |
+
+(`tool_budget_milliseconds`, `probe_backoff_floor_milliseconds` and the rest were already spelled out.)
+
+**3. `ai.arrival` takes a required `hop: integer`.** Provenance is a pair, and half of it used to be
+guessed from a rendered label — see **Desks**. `hop = 0` is right for anything that is not one agent
+relaying another's message; construction sites are few, so it is required rather than defaulted, because
+a default here would silently be wrong for exactly the mail the field exists for.
+
+**4. The provider knobs are level.** All three take `model ?= <the series' general-purpose model>`,
+`system: string | null ?= null` and `max_output_tokens: integer | null ?= null`. Two consequences:
+`system = ""` is no longer how you say "no system prompt" — it now sends an empty one, and `null` is the
+absence (Anthropic rejects an empty text block outright); and Anthropic's `max_tokens ?= 4096` is now
+`max_output_tokens ?= null`, which sends 4096 because that API requires the field.
+
+**5. `ai.with_context` injects before the newest user turn, not at the front.** Nothing in the signature
+moved, but WHERE the note lands did — and with it, whether a conversation's prompt cache survives an
+ambient injection at all. An ambient note is by definition the part that changes; at the front, one
+changed character invalidated every message on every step. Injected before the newest user turn, the
+bytes from message 0 up to the injection are identical across the steps of a turn. A program that had
+carefully quantized its clock reading to keep the note byte-stable no longer has to (it is still worth
+doing for the tail, but it is no longer the difference between a cached conversation and an uncached one).
+
+Also new, and not breaking: `ai.inbound_provenance()` (served by `advance_desk`), `ai.with_retries`,
+`ai.post_step`, and `dispatch_one` now shows the model a thrown tool payload's `message` field when it has
+one, instead of the raw JSON.
 
 ## Secrets / env
 
@@ -366,7 +477,7 @@ agent resident(value: null) -> string with io | post | prelude.throw[ai.duplicat
     request assistant_message(source: string, content: string) {
       let advanced = ai.advance_desk(
         state = assistant,
-        arrival = ai.arrival(source = source, content = content),
+        arrival = ai.arrival(source = source, content = content, hop = 0),
         tools = [ai.view_file],
         persona = voice,
         deliver_to = to_operator,
