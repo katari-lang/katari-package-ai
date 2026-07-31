@@ -1703,7 +1703,7 @@ data keyed_desk(@"The generation this cell's conversation belongs to." generatio
 
 @"A TABLE of keyed resident desks: for each key, the desk and the generation it belongs to, in one
 value. OPAQUE by contract — a program builds it with `new_desk_table`, advances a key through
-`advance_in_table`, drops one with `forget_desk`, reads a key's generation with `desk_generation`, and
+`advance_in_table` and drops one with `forget_desk`, and
 reaches into @cells@ for nothing else. Durable by construction wherever the app keeps it (a handler var
 survives a runtime restart like any run state); a program holds one per collection of dynamically keyed
 conversations."
@@ -1822,82 +1822,6 @@ agent forget_desk(@"The table." table: desk_table, @"The key to drop." key: stri
   desk_table(cells = record.remove(target = table.cells, key = key))
 }
 
-@"The generation the table holds for @key@ — the incarnation its stored conversation belongs to — or
-`null` when the table holds no desk for the key. A reader for observation and tests: the generation an
-arrival is COMPARED against is the app's to mint and lives in its roster, and this reports what the table
-last STORED, not what the roster now says. (The table offers no way to SET a generation for this reason —
-the roster is the one source of truth for which incarnation a name is on.)"
-agent desk_generation(@"The table." table: desk_table, @"The key to read." key: string) -> integer | null {
-  match (record.get(target = table.cells, key = key)) {
-    case null -> null
-    case keyed_desk(generation => generation, desk => _) -> generation
-  }
-}
-
-// ── the supervisor: a restart loop with backoff and same-reason suppression ────
-//
-// A resident that must OUTLIVE its own crashes needs a supervisor: run one session, and when it ends
-// with a recoverable reason, wait a backoff and start a fresh one. The mechanism is generic — the
-// session body, the restart-notice sink, and the backoff numbers are all DATA — so an app keeps every
-// specific it owns: WHICH crashes are fatal (its session re-raises those PAST `supervise`, which only
-// ever sees a RETURNED recoverable reason), WHAT a restart notice says, and WHERE it goes. This is the
-// lifetime sibling of `serve_observations`: that one keeps a resident alive across a failed STEP; this
-// one keeps it alive across a failed SESSION.
-
-@"WHY one supervised attempt ended, split into the part that is COMPARED and the part that is READ.
-@kind@ is the reason's stable identity — a short tag the app picks for the failure's shape (\"panic\",
-\"discord-source-died\", a thrown error's constructor name) — and it is the only thing the backoff
-looks at. @detail@ is the line a human reads and may carry anything: an id, a timestamp, a quoted
-message. Splitting them is the point: comparing whole prose, which is what this replaced, means a
-message carrying an id or a timestamp NEVER equals the previous one, so a sustained outage looks like
-a fresh failure every time, the backoff resets to its floor on every restart, and the notice that was
-meant to go quiet shouts identically forever. The set of an app's crash kinds is the app's own, which
-is why @kind@ is a string here and not a sum this package could not have written."
-data crash_reason(@"The reason's stable identity — the only thing compared." kind: string, @"The human line — free to vary." detail: string)
-
-@"A restart whose reason is NEW: the previous attempt ended for a different reason, or this is the
-first restart. The backoff is back at its floor and the notice is worth stating in full."
-data first_failure(@"Why this attempt ended." reason: crash_reason)
-
-@"A restart REPEATING the previous reason: the same @kind@ again, @streak@ times in a row now (2 on the
-first repeat). The backoff is growing, and the sink can shorten this to one quiet line — or drop it —
-because nobody needs the same sentence every thirty seconds."
-data repeated_failure(@"Why this attempt ended." reason: crash_reason, @"How many attempts in a row have ended this way, counting this one." streak: integer)
-
-// One restart, as the sink hears about it. (Type synonyms take no docs.)
-type restart_event = first_failure | repeated_failure
-
-@"Supervise a restartable @session@ FOREVER: run one attempt, and when it ends by RETURNING a
-recoverable `crash_reason`, call @on_restart@, wait the current backoff, and start a fresh attempt. The
-backoff starts at @initial_delay_milliseconds@ and grows by @factor@ each time the reason's KIND repeats
-(a sustained outage), capped at @max_delay_milliseconds@; a changed kind resets it to the floor. @on_restart@ hears
-a `restart_event`, so a repeat is a distinguishable value carrying its streak rather than a boolean
-flag beside a string. Fatal-vs-restartable is the SESSION's decision, not this loop's: a session that
-hits an unrecoverable error re-raises it, and it propagates through `supervise` UNTOUCHED to a handler
-the app installed above; `supervise` only ever sees the reason a session hands back by RETURNING, and
-every such return is a restart. Returns `never` — the loop ends only when a session's fatal re-raise
-unwinds past it."
-agent supervise[effect E](
-  @"One attempt: run the resident until it ends recoverably and RETURN the crash reason to restart from. A fatal error re-raises past `supervise` instead of returning." session: agent (value: null) -> crash_reason with E,
-  @"The restart-notice sink, called once per restart. A `repeated_failure` carries its streak, so a repeat can be shortened or dropped." on_restart: agent (event: restart_event) -> null with E,
-  @"The backoff floor in milliseconds — the first wait, and the wait a changed kind resets to. Default 30s." initial_delay_milliseconds: number ?= 30000.0,
-  @"The factor the backoff grows by while the same kind repeats. Default 2." factor: number ?= 2.0,
-  @"The backoff ceiling in milliseconds — the growing delay never exceeds it. Default 15 minutes." max_delay_milliseconds: number ?= 900000.0,
-) -> never with E | io {
-  // `streak` doubles as the have-we-run-before marker: 0 means no previous attempt, so the very first
-  // crash is a `first_failure` whatever its kind is (including the empty one).
-  forever (var delay: number = initial_delay_milliseconds, var last_kind: string = "", var streak: integer = 0) {
-    let reason = session(value = null)
-    let repeated = streak > 0 && reason.kind == last_kind
-    let run = if (repeated) { streak + 1 } else { 1 }
-    let event = if (repeated) { repeated_failure(reason = reason, streak = run) } else { first_failure(reason = reason) }
-    on_restart(event = event)
-    time.sleep(milliseconds = delay)
-    // Grow the delay while the kind repeats (a sustained outage); reset to the floor when it changes.
-    let next_delay = if (repeated) { math.min(left = delay * factor, right = max_delay_milliseconds) } else { initial_delay_milliseconds }
-    next with { delay = next_delay, last_kind = reason.kind, streak = run }
-  }
-}
 
 // ── ambient-context middleware ────────────────────────────────────────────────
 

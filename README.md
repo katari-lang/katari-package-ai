@@ -217,7 +217,7 @@ agent serve_worker_table(value: null) -> null with io | ai.infer_step | roster_g
 
 `ai.advance_in_table` returns a `table_turn`: `.table` to write back, `.outcome` (`advanced(desk_turn)`
 when a desk took the turn, or `stale` when a straggler was dropped), and `.tool_events`. `ai.forget_desk`
-drops a key (the retire move) and `ai.desk_generation` reads the generation a key is on. **This is for
+drops a key (the retire move). **This is for
 dynamic keys only** — a program's fixed desks (a core, a herald) stay their own vars; wrapping a
 one-and-two set in a table would buy nothing and cost a generation nobody reuses.
 
