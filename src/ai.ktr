@@ -1258,7 +1258,11 @@ data arrival(
 agents (a chat message, a cron tick, a watch report, a session's own startup line), 1 for a first-hop
 send, 2 for the reply to one. It is a fact about the MESSAGE, so it is carried and not guessed — a
 program that damps replies (\"a reply that asks nothing needs no answer\") cannot state that rule at all
-while every sender stamps the same constant." hop: integer,
+while every sender stamps the same constant. WRITE IT EVERY TIME — there is deliberately no default:
+0 is right for everything a person or a clock sent and wrong for exactly the mail this field exists for,
+so a default would be a silent 0 on the one arrival whose hop decides anything. `hop = 0` for a chat
+message, a cron tick, a watch report or a startup line; `inbound_provenance().hop + 1` in a tool that
+relays." hop: integer,
   @"Files riding the message." files: array[file] ?= [],
   @"The opaque end-user tag of the human behind it, or `null` for a system report." author: string | null ?= null,
 )

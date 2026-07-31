@@ -119,8 +119,11 @@ per desk; it is data.
 **Provenance: `source` and `hop`, as values.** An arrival carries both halves of where it came from —
 `source` (the label the injected turn shows the model) and `hop`, how many agent-to-agent relays it has
 already made: 0 for anything that is not mail between agents, 1 for a first-hop send, 2 for the reply
-to one. For the extent of a dispatch, `advance_desk` serves `ai.inbound_provenance() -> {origin, hop}`,
-so a **tool reads them instead of parsing the label**:
+to one. **Both are required; `hop` has no default**, and that is a decision rather than an omission —
+0 is right for every arrival a person or a clock sent and wrong for exactly the mail the field exists
+for, so a default would be a silent 0 on the one arrival whose hop decides anything. For the extent of a
+dispatch, `advance_desk` serves `ai.inbound_provenance() -> {origin, hop}`, so a **tool reads them
+instead of parsing the label**:
 
 ```katari
 import ai
@@ -345,7 +348,7 @@ when the credential is what failed (401 / 403), `api_error` for everything else 
 status, which is what an app dispatches on to tell "check your credit balance" from "wait it out". Beside
 them: a transport failure (`http.fetch_error`) and a malformed reply (`json.parse_error`). This is the
 same pair `gmail`, `google_calendar` and every other authenticated integration here throws, so one
-`replay` converter matching `http.auth_error` now covers a model API too; before, a 401 from Google and a
+`supervise` converter matching `http.auth_error` now covers a model API too; before, a 401 from Google and a
 401 from a model API wore different types and the story had to be written twice. The raw fact stays raw
 where it is raw — `http.post_json` still throws `status_error`, and `ai.post_step` is the one place this
 package turns it into the vocabulary.
