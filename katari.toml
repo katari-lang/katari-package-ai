@@ -1,7 +1,7 @@
 [package]
 name = "ai"
-version = "0.4.1"
-description = "Provider-agnostic AI tool-calling loop for Katari: one request seam (ai.infer_step) with interchangeable Gemini, OpenAI, and Anthropic providers."
+version = "0.6.1"
+description = "Provider-agnostic AI for Katari: one request seam (ai.infer_step) with interchangeable Gemini, OpenAI and Anthropic providers, one turn loop (ai.take_turn), one serving mechanism (ai.serve_observations) — and, over them, the route: `use ai.route()` opens the nursery the AIs live in, `ai.spawn` hires one per line, `ai.mail` carries a report from any of them into another's mailbox, and `ai.dismiss` lets one go. Several AIs run genuinely concurrently: the provider and the breaker serve the seam from parallel handlers, and the breaker's state lives in the store rather than in a queue."
 
 [runtime]
 url = "http://localhost:3000"

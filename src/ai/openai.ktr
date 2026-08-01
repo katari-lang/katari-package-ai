@@ -1,20 +1,14 @@
-// OpenAI provider: serves the `ai.infer_step` request over the Chat Completions API. Where Gemini
-// keys tool calls by name + a thought signature, OpenAI keys them by a tool-call `id` (which is what
-// this provider puts in `types.call_ref`, the agnostic vocabulary's one opaque per-call token) and
-// ships the arguments as a JSON *string*. Same agnostic
-// vocabulary, different shaping — and the same one-line integration:
-// `use openai.provider(model = ..., source = ...)`.
-// Files: a message's content here is a plain STRING, so a TEXTUAL attachment inlines as text (capped) and
-// every other kind rides a note that tells the model plainly it cannot read that content type — see the
-// comment above `openai_messages_of` for why an image or a PDF cannot inline on this wire.
+// OpenAI provider: serves `ai.infer_step` and `ai.infer_object` over the Chat Completions API. This wire
+// keys tool calls by a tool-call `id` (this provider's `types.call_ref`) and ships the arguments as a
+// JSON string. A message's content here is a plain string, so a textual attachment inlines as text
+// (capped) and every other kind rides a note stating the content cannot be read.
 
 import ai
 import ai.types
 import ai.wire_names
 
-@"An OpenAI connection: the model id, the API key, an optional system prompt, the optional output cap,
-and the transient-retry budget (@retry_attempts@ / @retry_base_milliseconds@). Provider handler state —
-built once per `use openai.provider(...)`."
+@"An OpenAI connection: the model id, the API key, an optional system prompt, the optional output cap, and
+the transient-retry budget. Built once per `use openai.provider(...)`."
 data connection(
   @"The Chat Completions model id." model: string,
   @"Where the API key lives (env key or oauth name); resolved at each request." source: credentials.source,
@@ -26,18 +20,13 @@ data connection(
 
 @"Serve `ai.infer_step` over OpenAI for the extent of the continuation:
 `use openai.provider(source = credentials.env(key = \"OPENAI_API_KEY\"))`.
-A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` OUTCOME, never
-thrown — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped connection) is first retried with
-exponential backoff (up to @retry_attempts@ attempts from @retry_base_milliseconds@); only a fatal error
-or an exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw.
-Prompt caching is per-PROVIDER machinery and nothing here asks for it: OpenAI caches a repeated prefix
-AUTOMATICALLY, off the bytes it already receives. (Anthropic is the one that needs explicit
-`cache_control` breakpoints, which `anthropic.provider` places for you.)"
+A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` outcome; a
+transient one (a 429, a 5xx, a dropped connection) is first retried with exponential backoff, up to
+@retry_attempts@ attempts from @retry_base_milliseconds@. OpenAI caches a repeated prefix automatically,
+so nothing here asks for caching."
 agent provider[R, effect E](
-  @"The Chat Completions model id. Defaults to `gpt-4o-mini`: it is the general-purpose workhorse of the
-series this module is written against, it is reachable by every key that can reach the endpoint at all,
-and a DEFAULT is what runs when nobody chose — so the cheapest capable model is the honest one to put
-there, exactly as `gemini.provider` defaults to a flash model. A program with an opinion passes it." model: string ?= "gpt-4o-mini",
+  @"The Chat Completions model id. Defaults to `gpt-4o-mini`: the general-purpose workhorse of the series
+this module is written against, reachable by every key that can reach the endpoint at all." model: string ?= "gpt-4o-mini",
   @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
   @"An optional system prompt, sent as a leading `system` message; `null` (the default) sends none. \"\" is NOT the way to say none — it sends an empty system message." system: string | null ?= null,
   @"`max_completion_tokens` — the per-step output cap; `null` (the default) sends none and lets the model's own default stand." max_output_tokens: integer | null ?= null,
@@ -45,70 +34,26 @@ there, exactly as `gemini.provider` defaults to a flash model. A program with an
   @"The first backoff delay in milliseconds, doubled per retry (capped at one minute)." retry_base_milliseconds: number ?= 2000.0,
   @"The computation to run with `ai.infer_step` / `ai.infer_object` served." continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler (var client = connection(model = model, source = source, system = system, max_output_tokens = max_output_tokens, retry_attempts = retry_attempts, retry_base_milliseconds = retry_base_milliseconds)) {
+  // The connection is a value and not handler state: nothing ever writes it back. The handler is
+  // `parallel`, so several AIs' model calls stay concurrent instead of queueing at one FIFO.
+  let client = connection(model = model, source = source, system = system, max_output_tokens = max_output_tokens, retry_attempts = retry_attempts, retry_base_milliseconds = retry_base_milliseconds)
+  use parallel handler {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
-      // The retry LOOP is `ai.with_retries` — one copy for every provider and both seams, so an
-      // off-by-one is fixed once. What stays here is the one thing a provider owns: the attempt, wrapped
-      // in a thunk because the loop takes an agent and these three arguments cannot ride a partial
-      // application of one.
-      let connected = client
-      agent once(value: null) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-        openai_step_attempt(client = connected, history = history, tool_metas = tool_metas)
+      // The retry loop and the catching are both `ai.with_retries`; what stays here is the call, wrapped
+      // in a thunk because these arguments cannot ride a partial application of one.
+      agent once(value: null) -> types.step_result with io | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+        openai_infer_step(client = client, history = history, tool_metas = tool_metas)
       }
-      next ai.with_retries[types.step_result](attempts = connected.retry_attempts, base_milliseconds = connected.retry_base_milliseconds, attempt = once)
+      next ai.with_retries[types.step_result](attempts = client.retry_attempts, base_milliseconds = client.retry_base_milliseconds, attempt = once)
     }
     request ai.infer_object(history: array[types.message], schema: unknown) {
-      let connected = client
-      agent once(value: null) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-        openai_object_attempt(client = connected, history = history, schema = schema)
+      agent once(value: null) -> types.object_result with io | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+        openai_infer_object(client = client, history = history, schema = schema)
       }
-      next ai.with_retries[types.object_result](attempts = connected.retry_attempts, base_milliseconds = connected.retry_base_milliseconds, attempt = once)
+      next ai.with_retries[types.object_result](attempts = client.retry_attempts, base_milliseconds = client.retry_base_milliseconds, attempt = once)
     }
   }
   continuation(value = null)
-}
-
-@"ONE OpenAI step attempt, catching any `step_error` into an `ai.attempt` verdict so the provider's retry
-loop can classify it — the catching handler lives here, at the agent top, so the retry loop never nests one."
-agent openai_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler {
-    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
-      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
-      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
-      // rethrows it toward the root, where the app's supervisor decides. Each arm rebuilds its own value
-      // because `match` does not narrow a union: the residual `rest` still has the whole row's type, so
-      // there is no arm that could hand the caught error on without naming it.
-      match (error) {
-        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
-        case http.auth_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.auth_error(status = status, context = context, message = message)) }
-        case http.api_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.api_error(status = status, context = context, message = message)) }
-        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  ai.attempt_ok(result = openai_infer_step(client = client, history = history, tool_metas = tool_metas))
-}
-
-@"ONE OpenAI structured-output attempt, the `openai_step_attempt` twin for `infer_object`."
-agent openai_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler {
-    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
-      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
-      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
-      // rethrows it toward the root, where the app's supervisor decides.
-      match (error) {
-        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
-        case http.auth_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.auth_error(status = status, context = context, message = message)) }
-        case http.api_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.api_error(status = status, context = context, message = message)) }
-        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  ai.attempt_ok(result = openai_infer_object(client = client, history = history, schema = schema))
 }
 
 // ── request body ─────────────────────────────────────────────────────────────
@@ -123,9 +68,8 @@ agent openai_role(@"Who spoke the turn." role: types.role) -> string {
 }
 
 agent openai_call_entry(call: types.tool_call, map: wire_names.name_map) -> unknown {
-  // The replayed call ships the WIRE name — the API validates a history tool_call name the same as the
-  // request's tool declarations (the qualified name's dot is rejected); the opaque call id stays as-is.
-  // OpenAI carries the arguments as a JSON *string*, so the model's args document is stringified back.
+  // The replayed call ships the wire name, because the API validates a history tool_call name like a tool
+  // declaration; the opaque call id stays as-is, and the args document is stringified back.
   {
     id = call.ref.token,
     "type" = "function",
@@ -136,13 +80,11 @@ agent openai_call_entry(call: types.tool_call, map: wire_names.name_map) -> unkn
   }
 }
 
-@"ONE attached file as the text it contributes to a message's content — the per-file dispatch over
-`ai.file_kind`, over the two outcomes this wire can offer. A TEXTUAL file inlines its decoded text
-(capped): the Chat Completions content is a plain string, so text needs no wire shape at all and this
-provider reads a .md / .csv / .json as well as either other one does. Every other kind gets the note that
-states the content is unreadable — see `openai_messages_of` for why the binary kinds cannot inline here.
-The arms are spelled out rather than collapsed into a catch-all so that a NEW `file_kind` fails to compile
-here and this provider has to decide about it, instead of silently degrading to a note."
+@"One attached file as the text it contributes to a message's content — the per-file dispatch over
+`ai.file_kind`, over the two outcomes this wire can offer. A textual file inlines its decoded text
+(capped), since the content is a plain string and text needs no wire shape at all; every other kind gets
+the note stating the content is unreadable. The arms are spelled out rather than collapsed into a
+catch-all, so a new `file_kind` has to be decided about here."
 agent openai_file_note(attachment: file) -> string {
   match (ai.classify_file(attachment = attachment)) {
     case ai.text_file(content_type => content_type) -> ai.file_text_note(attachment = attachment, content_type = content_type)
@@ -160,14 +102,10 @@ agent openai_file_notes(files: array[file]) -> string {
   string.join(parts = notes, separator = "")
 }
 
-// WHY a binary attachment cannot inline on this provider, when the API itself would take it: Chat
-// Completions carries an image as `image_url.url` and a PDF as `file.file_data`, and both are DATA URIs —
-// a string with the base64 INSIDE it. `http.json`'s slot contract replaces a whole slot with a file's
-// base64; it cannot build `"data:application/pdf;base64," ++ <the bytes>`. Producing that string means
-// `files.read_base64` onto the value plane, which is exactly what this codebase moved the AI providers
-// away from (docs/2026-07-18-http-file-body.md). So the binary kinds report honestly here instead, and the
-// wire shape stays a plain string. Text is different in kind, not degree: its content IS a string, so it
-// inlines with no data URI and no slot at all.
+// A binary attachment cannot inline on this wire, though the API itself would take it: Chat Completions
+// carries an image as `image_url.url` and a PDF as `file.file_data`, both data URIs with the base64
+// inside a string, and `http.json`'s slot contract replaces a whole slot rather than building such a
+// string. Text is different in kind: its content is already a string, so it inlines with no slot at all.
 agent openai_messages_of(message: types.message, map: wire_names.name_map) -> array[unknown] {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {
@@ -186,10 +124,8 @@ agent openai_messages_of(message: types.message, map: wire_names.name_map) -> ar
       for (let result in results) {
         next {
           role = "tool",
-          // A tool message's content is a STRING (its array form admits `text` parts only — no image, no
-          // file), so a file a tool handed back reaches the model here exactly as one attached to a turn
-          // does: its text when it is textual, the honest note when it is not. That is the whole shape this
-          // API licenses in this position, which is why nothing binary rides along.
+          // A tool message's content is a string (its array form admits `text` parts only), so a file a
+          // tool handed back reaches the model exactly as one attached to a turn does.
           tool_call_id = result.ref.token,
           content = f"${result.text}${openai_file_notes(files = result.files)}",
         }
@@ -203,7 +139,7 @@ agent openai_messages(client: connection, history: array[types.message], map: wi
     next with { accumulator = array.concat(left = accumulator, right = openai_messages_of(message = message, map = map)) }
   } then (_messages) { accumulator }
   // `null` is the absence, and the only absence: an empty string is a system message that says nothing,
-  // which is a thing a caller may legitimately want to send and no longer a way to opt out.
+  // which a caller may legitimately want to send.
   match (client.system) {
     case null -> base
     case standing -> array.concat(left = [{ role = "system", content = standing }], right = base)
@@ -211,9 +147,8 @@ agent openai_messages(client: connection, history: array[types.message], map: wi
 }
 
 agent openai_function_tool(meta: reflection.agent_metadata, map: wire_names.name_map) -> unknown {
-  // The tool is declared under its WIRE name (the qualified name's dot is rejected); the loop maps the
-  // model's pick back to the real name when it dispatches. `meta.input` is already a document value, so
-  // its JSON-Schema keys drop straight into the tree.
+  // The tool is declared under its wire name; the loop maps the model's pick back to the real name when
+  // it dispatches. `meta.input` is already a document value, so its JSON-Schema keys drop straight in.
   {
     "type" = "function",
     function = {
@@ -232,15 +167,14 @@ agent openai_request_body(client: connection, history: array[types.message], too
     model = client.model,
     messages = messages,
   }
-  // The newest user turn's opaque author tag rides `safety_identifier` (the successor of the
-  // deprecated `user` field) for abuse attribution; the field is omitted when no author flows.
+  // The newest user turn's opaque author tag rides `safety_identifier` for abuse attribution; the field
+  // is omitted when no author flows.
   let with_attribution = match (ai.attribution(history = history)) {
     case null -> base
     case author -> record.set(target = base, key = "safety_identifier", value = author)
   }
-  // `max_completion_tokens`, not the deprecated `max_tokens`: it is the field Chat Completions
-  // documents for the output cap now, and the one every current model accepts. A `null` knob sends
-  // nothing, so the wire is unchanged by default.
+  // `max_completion_tokens`, not the deprecated `max_tokens`: it is the field Chat Completions documents
+  // for the output cap now. A `null` knob sends nothing.
   let with_cap = record.set_if[unknown](target = with_attribution, key = "max_completion_tokens", value = client.max_output_tokens)
   if (array.length(target = tool_metas) == 0) {
     with_cap
@@ -283,8 +217,8 @@ agent openai_parse_step(response: unknown, map: wire_names.name_map) -> types.st
   }
 }
 
-@"The step's token accounting off the response's `usage`: prompt tokens are the whole context the
-step read, completion tokens what the model generated (an absent field reads as 0)."
+@"The step's token accounting off the response's `usage`: prompt tokens are the whole context the step
+read, completion tokens what the model generated (an absent field reads as 0)."
 agent openai_usage(parsed: unknown) -> types.usage {
   let counts = json.field(target = parsed, key = "usage")
   types.usage(
@@ -293,17 +227,16 @@ agent openai_usage(parsed: unknown) -> types.usage {
   )
 }
 
-@"One OpenAI model step over the history + tool schemas (the body built as a value tree and the reply
-parsed by `post_json`, in Katari; only the POST leaves the runtime)."
+@"One OpenAI model step over the history + tool schemas: the body is built as a value tree and the reply
+parsed by `post_json` in Katari, so only the POST leaves the runtime."
 agent openai_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result {
-  // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
-  // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
+  // One wire-name map per step, rebuilt deterministically from the tools, so the request's tool names and
+  // the response's reversal agree without durable state.
   let map = wire_names.build_name_map(tool_metas = tool_metas)
   let body = openai_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
-  // `ai.post_step` is `post_json` with the non-2xx already classified into the shared vocabulary
-  // (`http.auth_error` / `http.api_error`, both carrying the status), so no raw `status_error` reaches
+  // `http.post_json` classifies a non-2xx itself, so what it throws is already an arm of
   // `ai.step_error`.
-  let response = ai.post_step(
+  let response = http.post_json(
     url = "https://api.openai.com/v1/chat/completions",
     body = body,
     headers = { "Authorization" = "Bearer " ++ credentials.resolve(source = client.source) },
@@ -312,11 +245,9 @@ agent openai_infer_step(client: connection, history: array[types.message], tool_
   types.step_result(step = openai_parse_step(response = response, map = map), usage = openai_usage(parsed = response))
 }
 
-@"One OpenAI structured-output step: the tool-less message list plus `response_format` pinning the
-reply to JSON conforming to @schema@. The name map is empty — a replayed call turn in @history@
-rides under its real name via the fallback, fine for the rare structured step over a tool
-transcript. The reply content parses back to the decoded object; a non-JSON reply throws
-`json.parse_error` (∈ `ai.step_error`)."
+@"One OpenAI structured-output step: the tool-less message list plus `response_format` pinning the reply
+to JSON conforming to @schema@. The reply content parses back to the decoded object; a non-JSON reply
+throws `json.parse_error`."
 agent openai_infer_object(client: connection, history: array[types.message], schema: unknown) -> types.object_result {
   let map = wire_names.build_name_map(tool_metas = [])
   let base: record[unknown] = {
@@ -328,7 +259,7 @@ agent openai_infer_object(client: connection, history: array[types.message], sch
     },
   }
   let body = record.set_if[unknown](target = base, key = "max_completion_tokens", value = client.max_output_tokens)
-  let response = ai.post_step(
+  let response = http.post_json(
     url = "https://api.openai.com/v1/chat/completions",
     body = body,
     headers = { "Authorization" = "Bearer " ++ credentials.resolve(source = client.source) },

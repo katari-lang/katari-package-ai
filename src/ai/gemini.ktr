@@ -1,24 +1,15 @@
-// Gemini provider: serves the `ai.infer_step` request over the generativelanguage generateContent
-// API. `use gemini.provider(model = ..., source = ...)` at the app root is the whole integration —
-// the request body is built as a value tree and the response parsed from `json`, entirely in Katari;
-// the only network call is the prelude's `http.fetch` with an `http.json` body, so a turn's inlinable
-// `file` (an image, a PDF, audio, video — `gemini_file_parts_of` dispatches over `ai.file_kind`) rides an
-// `inlineData` part whose `data` slot base64s at the send boundary, never on the value plane. Swapping
-// providers means swapping this one `use` line; nothing else in the app or the `ai` layer knows
-// Gemini exists.
-// Attribution: `generateContent` has NO end-user metadata field of the kind other APIs offer, so
-// `types.turn.author` is deliberately not read here — the tag simply does not reach the Gemini wire.
-// Correlation: this wire keys a tool RESPONSE by the function NAME, and demands the model's per-call
-// thought signature echoed back on the call — so the one opaque token of `types.call_ref` carries the
-// SIGNATURE here, and `types.tool_result.name` is what the response is keyed by. A provider decides
-// what its own token holds; nothing above this module reads it.
+// Gemini provider: serves `ai.infer_step` and `ai.infer_object` over the generativelanguage
+// generateContent API. The request body is built as a value tree and the response parsed from `json`,
+// entirely in Katari; an inlinable file rides an `inlineData` part whose `data` slot base64s at the send
+// boundary. This wire keys a tool response by the function name and demands the model's per-call thought
+// signature echoed back, so `types.call_ref` carries the signature here; it has no end-user metadata
+// field, so `types.turn.author` is not read.
 
 import ai
 import ai.types
 
 @"A Gemini connection: the model id, the API key, an optional system instruction, the optional generation
-knobs, and the transient-retry budget (@retry_attempts@ / @retry_base_milliseconds@). Provider handler
-state — built once per `use gemini.provider(...)`."
+knobs, and the transient-retry budget. Built once per `use gemini.provider(...)`."
 data connection(
   @"The generateContent model id." model: string,
   @"Where the API key lives (env key or oauth name); resolved at each request." source: credentials.source,
@@ -31,20 +22,14 @@ data connection(
 
 @"Serve `ai.infer_step` over Gemini for the extent of the continuation:
 `use gemini.provider(source = credentials.env(key = \"GEMINI_API_KEY\"))`.
-A step's provider failure (malformed JSON, a rejected call, a transport failure — `ai.step_error`) is
-handed back as an `ai.inference_failed` OUTCOME, never thrown — but a TRANSIENT one (a 429 rate limit, a
-5xx, a dropped connection) is first retried with exponential backoff (up to @retry_attempts@ attempts from
-@retry_base_milliseconds@), so a passing rate limit no longer ends a long-lived loop; only a fatal error or
-an exhausted budget surfaces, and it surfaces as a value the loop handles at its own perform site, not a
-throw out of this deep handler.
-Prompt caching is per-PROVIDER machinery and nothing here asks for it: Gemini caches a repeated prefix
-IMPLICITLY, off the bytes it already receives. (Anthropic is the one that needs explicit `cache_control`
-breakpoints, which `anthropic.provider` places for you.)"
+A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` outcome; a
+transient one (a 429, a 5xx, a dropped connection) is first retried with exponential backoff, up to
+@retry_attempts@ attempts from @retry_base_milliseconds@. Gemini caches a repeated prefix implicitly, so
+nothing here asks for caching."
 agent provider[R, effect E](
   @"The generateContent model id. Defaults to `gemini-3.5-flash`: the flash tier is the general-purpose
-workhorse of the series this module is written against — the model every example, guide and integration
-test in this ecosystem already names — and a DEFAULT is what runs when nobody chose, so it should be the
-model a program can afford to run at every step. A program with an opinion passes it." model: string ?= "gemini-3.5-flash",
+workhorse of the series this module is written against, and a default should be the model a program can
+afford to run at every step." model: string ?= "gemini-3.5-flash",
   @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
   @"An optional system instruction, sent as `systemInstruction`; `null` (the default) sends none. \"\" is NOT the way to say none — it sends an empty instruction." system: string | null ?= null,
   @"How many times a transient step (a 429 / 5xx / dropped connection) is attempted before its error becomes an `inference_failed` outcome." retry_attempts: integer ?= 6,
@@ -53,78 +38,32 @@ model a program can afford to run at every step. A program with an opinion passe
   @"generationConfig.thinkingConfig.thinkingBudget — bounds the thought tokens a thinking model may burn before the answer; `null` (the default) sends none." thinking_budget: integer | null ?= null,
   @"The computation to run with `ai.infer_step` / `ai.infer_object` served." continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler (var client = connection(model = model, source = source, system = system, retry_attempts = retry_attempts, retry_base_milliseconds = retry_base_milliseconds, max_output_tokens = max_output_tokens, thinking_budget = thinking_budget)) {
+  // The connection is a value and not handler state: nothing ever writes it back. The handler is
+  // `parallel`, so several AIs' model calls stay concurrent instead of queueing at one FIFO.
+  let client = connection(model = model, source = source, system = system, retry_attempts = retry_attempts, retry_base_milliseconds = retry_base_milliseconds, max_output_tokens = max_output_tokens, thinking_budget = thinking_budget)
+  use parallel handler {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
-      // The retry LOOP is `ai.with_retries` — one copy for every provider and both seams. What stays
-      // here is the one thing a provider owns: the attempt, wrapped in a thunk because the loop takes an
-      // agent and these three arguments cannot ride a partial application of one.
-      let connected = client
-      agent once(value: null) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-        gemini_step_attempt(client = connected, history = history, tool_metas = tool_metas)
+      // The retry loop and the catching are both `ai.with_retries`; what stays here is the call, wrapped
+      // in a thunk because these arguments cannot ride a partial application of one.
+      agent once(value: null) -> types.step_result with io | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+        gemini_infer_step(client = client, history = history, tool_metas = tool_metas)
       }
-      next ai.with_retries[types.step_result](attempts = connected.retry_attempts, base_milliseconds = connected.retry_base_milliseconds, attempt = once)
+      next ai.with_retries[types.step_result](attempts = client.retry_attempts, base_milliseconds = client.retry_base_milliseconds, attempt = once)
     }
     request ai.infer_object(history: array[types.message], schema: unknown) {
-      let connected = client
-      agent once(value: null) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-        gemini_object_attempt(client = connected, history = history, schema = schema)
+      agent once(value: null) -> types.object_result with io | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+        gemini_infer_object(client = client, history = history, schema = schema)
       }
-      next ai.with_retries[types.object_result](attempts = connected.retry_attempts, base_milliseconds = connected.retry_base_milliseconds, attempt = once)
+      next ai.with_retries[types.object_result](attempts = client.retry_attempts, base_milliseconds = client.retry_base_milliseconds, attempt = once)
     }
   }
   continuation(value = null)
 }
 
-@"ONE Gemini step attempt, catching any `step_error` into an `ai.attempt` verdict so the provider's retry
-loop can classify it and decide to back off / retry or propagate — the handler that catches it lives here,
-at the agent top, so the loop that drives retries never nests a handler."
-agent gemini_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler {
-    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
-      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
-      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
-      // rethrows it toward the root, where the app's supervisor decides. Each arm rebuilds its own value
-      // because `match` does not narrow a union: the residual `rest` still has the whole row's type, so
-      // there is no arm that could hand the caught error on without naming it.
-      match (error) {
-        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
-        case http.auth_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.auth_error(status = status, context = context, message = message)) }
-        case http.api_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.api_error(status = status, context = context, message = message)) }
-        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  ai.attempt_ok(result = gemini_infer_step(client = client, history = history, tool_metas = tool_metas))
-}
-
-@"ONE Gemini structured-output attempt, the `gemini_step_attempt` twin for `infer_object`."
-agent gemini_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler {
-    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
-      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
-      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
-      // rethrows it toward the root, where the app's supervisor decides.
-      match (error) {
-        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
-        case http.auth_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.auth_error(status = status, context = context, message = message)) }
-        case http.api_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.api_error(status = status, context = context, message = message)) }
-        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  ai.attempt_ok(result = gemini_infer_object(client = client, history = history, schema = schema))
-}
-
 // ── request body (built directly as a raw value tree) ─────────────────────────
 
-@"Map the agnostic role sum onto the `generateContent` content role. It happens to spell the model's
-side \"model\", which is why this is written out as a match like every other provider's rather than
-passed through: the vocabulary is the sum, and a wire token that resembles it is a coincidence, not an
-identity."
+@"Map the agnostic role sum onto the `generateContent` content role. The wire happens to spell the
+model's side \"model\"; the vocabulary is the sum, so this adapter matches it like every other."
 agent gemini_role(@"Who spoke the turn." role: types.role) -> string {
   match (role) {
     case types.model_role(_) -> "model"
@@ -137,8 +76,8 @@ agent gemini_text_part(text: string) -> unknown {
 }
 
 agent gemini_call_part(call: types.tool_call) -> unknown {
-  // Replay the model's functionCall verbatim: name + the original args (the model's args document
-  // dropped straight into the value tree) + the thought signature Gemini requires echoed.
+  // Replay the model's functionCall verbatim: name, the original args, and the thought signature Gemini
+  // requires echoed.
   {
     functionCall = {
       name = call.name,
@@ -157,16 +96,13 @@ agent gemini_result_part(result: types.tool_result) -> unknown {
   }
 }
 
-@"A file's content as an inlineData part — what lets the model actually SEE the file. The `data` slot
-holds the file VALUE placed DIRECTLY into the tree; `http.json` reads its bytes and base64s them in
-place only at the send boundary, so the content never rides the value plane. Only the freshest history
-element inlines, which keeps the WIRE request small (see gemini_content's @inline@)."
+@"A file's content as an inlineData part — what lets the model actually see the file. The `data` slot
+holds the file value placed directly into the tree; `http.json` reads its bytes and base64s them in place
+only at the send boundary, so the content never rides the value plane."
 agent gemini_inline_part(
   @"The file to inline." attachment: file,
   @"Its recorded content type, which `generateContent` takes as the part's `mimeType`." mime_type: string,
 ) -> unknown {
-  // The file rides as its handle in the `data` slot; `http.json` base64s it at the send boundary (no
-  // `read_base64`).
   {
     inlineData = {
       mimeType = mime_type,
@@ -176,22 +112,18 @@ agent gemini_inline_part(
 }
 
 @"A file as its `$katari_ref` handle note part — the resting representation, and the affordance the model
-replays into any tool it holds that takes a file (`ai.file_handle_note` states the note once for all
-three providers)."
+replays into any tool it holds that takes a file."
 agent gemini_handle_part(attachment: file) -> unknown {
   gemini_text_part(text = ai.file_handle_note(attachment = attachment))
 }
 
-@"Whether `generateContent` accepts @mime_type@ as an `inlineData` part: the union of the documented image,
-audio and video format lists, plus `application/pdf`. One match over all four families because the wire
-does not care which family a type belongs to — the part is the same shape — and one list is one place to
-check against the docs. A type outside it 400s the request, and `image/*`, `audio/*` and `video/*` are all
-wider than what the model actually decodes — `image/tiff` and `audio/opus` are real labels this list must
-refuse. It can be spelled in the docs' own words because `ai.normalized_content_type` has already resolved
-the confirmed aliases (an `image/jpg` upload arrives here as `image/jpeg`)."
+@"Whether `generateContent` accepts @mime_type@ as an `inlineData` part: the union of the documented
+image, audio and video format lists, plus `application/pdf`. One match over all four families, because the
+part is the same shape whichever family a type belongs to, and each family is wider than what the model
+decodes. `ai.normalized_content_type` has already resolved the confirmed aliases."
 agent gemini_inline_media_type(@"The file's normalized content type." mime_type: string) -> boolean {
   match (mime_type) {
-    // Images: "Gemini supports the following image format MIME types" — PNG, JPEG, WebP, HEIC, HEIF.
+    // Images, as documented: PNG, JPEG, WebP, HEIC, HEIF.
     case "image/png" -> true
     case "image/jpeg" -> true
     case "image/webp" -> true
@@ -220,10 +152,9 @@ agent gemini_inline_media_type(@"The file's normalized content type." mime_type:
   }
 }
 
-@"An inlinable file's parts: the handle note and the `inlineData` part when Gemini accepts the mime type, and
-the unreadable note when it does not. Shipping an unaccepted type hopefully is not the cheaper bet — it
-400s, and a 400 fails the step and takes the turn with it, where the note costs the model one honest
-sentence and the conversation goes on."
+@"An inlinable file's parts: the handle note and the `inlineData` part when Gemini accepts the mime type,
+and the unreadable note when it does not. An unaccepted type 400s the step and takes the turn with it,
+where the note costs the model one honest sentence and the conversation goes on."
 agent gemini_media_parts(
   @"The file to inline." attachment: file,
   @"Its normalized content type." mime_type: string,
@@ -238,16 +169,13 @@ agent gemini_media_parts(
   }
 }
 
-@"ONE attached file as the parts it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
-`generateContent` accepts. An image, a PDF, audio and video all reach `gemini_media_parts`, because that one
-`inlineData` part IS Gemini's whole multimodal surface and it is the accepted MEDIA TYPE, not the family,
-that decides whether the content can ride; a textual file rides as text, capped; an opaque type says it
-cannot be read. Together the two guards narrow the rule this replaced (\"inline anything with a recorded
-type\"), which handed an archive or a font to `inlineData` and earned a 400 in the middle of a conversation."
+@"One attached file as the parts it becomes — the per-file dispatch over `ai.file_kind`. An image, a PDF,
+audio and video all reach `gemini_media_parts`, because that one `inlineData` part is Gemini's whole
+multimodal surface and it is the accepted media type, not the family, that decides whether the content can
+ride; a textual file rides as text, capped; an opaque type says it cannot be read."
 agent gemini_file_parts_of(attachment: file, inline: boolean) -> array[unknown] {
-  // An OLDER history element shows the handle alone, whatever the type: re-sending every attachment's
-  // content on every step is what makes a long conversation's requests huge, and the model re-reads any
-  // older file on demand with `view_file`.
+  // An older history element shows the handle alone, whatever the type; the model re-reads any older file
+  // on demand with `view_file`.
   if (!inline) {
     [gemini_handle_part(attachment = attachment)]
   } else {
@@ -266,17 +194,16 @@ agent gemini_file_parts_of(attachment: file, inline: boolean) -> array[unknown] 
   }
 }
 
-@"Render a turn's / result's files: each file's parts by content type while fresh (@inline@), the handle
-note alone once older."
+@"Render a turn's or a result's files: each file's parts by content type while fresh (@inline@), the
+handle note alone once older."
 agent gemini_file_parts(files: array[file], inline: boolean) -> array[unknown] {
   array.flatten(target = for (let attachment in files) {
     next gemini_file_parts_of(attachment = attachment, inline = inline)
   })
 }
 
-@"One history element as a Gemini content. @inline@ marks the freshest element — the only one whose
-files inline their content (older elements show handles only, keeping the request small; the model
-re-reads any older file with `view_file`)."
+@"One history element as a Gemini content. @inline@ marks an element inside the inline window — the only
+ones whose files inline their content."
 agent gemini_content(message: types.message, inline: boolean) -> unknown {
   match (message) {
     case types.turn(role => role, text => text, files => files) -> {
@@ -320,12 +247,11 @@ agent gemini_drop_schema_key(key: string) -> boolean {
   }
 }
 
-// The recursive group needs an explicit effect row; `pure` is the empty effect — sanitizing the
-// schema tree performs no requests and no io.
+// The recursive group needs an explicit effect row; sanitizing the schema tree performs nothing.
 agent gemini_sanitize(node: unknown) -> unknown with pure {
   match (node) {
     case record(entries) -> {
-      for (let key in record.keys(target = entries), var accumulator: record[unknown] = record.empty()) {
+      for (let key in record.keys(target = entries), var accumulator: record[unknown] = {}) {
         if (gemini_drop_schema_key(key = key)) {
           next with { accumulator = accumulator }
         } else {
@@ -342,7 +268,7 @@ agent gemini_sanitize(node: unknown) -> unknown with pure {
 
 agent gemini_function_declaration(meta: reflection.agent_metadata) -> unknown {
   // `gemini_sanitize` strips the JSON-Schema keywords Gemini rejects; the survivor is a document value
-  // dropped straight into the tree, so any remaining `$`-key stays a key.
+  // dropped straight into the tree.
   {
     name = meta.name,
     description = meta.description,
@@ -350,15 +276,12 @@ agent gemini_function_declaration(meta: reflection.agent_metadata) -> unknown {
   }
 }
 
-@"The tool-independent request base: contents (freshest element inlining its files) plus the system
-instruction. Kept a `record` so each caller extends it — `gemini_request_body` with tools,
+@"The tool-independent request base: contents (the newest file-bearing element inlining its files) plus
+the system instruction. Kept a `record` so each caller extends it — `gemini_request_body` with tools,
 `gemini_infer_object` with the structured-output generationConfig."
 agent gemini_base_body(client: connection, history: array[types.message]) -> record[unknown] {
-  // Only the newest FILE-BEARING element inlines its files' content; older files shrink to handle notes,
-  // and the model re-reads any of them with `view_file`. The boundary comes from `ai.inline_from_index`,
-  // keyed to files rather than to position — the split this replaced was `count - 1`, which slid one step
-  // forward on every step and rewrote the previous element's rendering, so a tool loop re-sent a changed
-  // prefix every time and Gemini's implicit prefix cache could never read it.
+  // Only the newest file-bearing element inlines its files' content; older files shrink to handle notes,
+  // and the model re-reads any of them with `view_file`.
   let count = array.length(target = history)
   let boundary = ai.inline_from_index(history = history)
   let older = for (let message in array.slice(target = history, start = 0, end = boundary)) {
@@ -370,7 +293,7 @@ agent gemini_base_body(client: connection, history: array[types.message]) -> rec
   let contents = array.concat(left = older, right = freshest)
   let base: record[unknown] = { contents = contents }
   // `null` is the absence, and the only absence: an empty string is an instruction that says nothing,
-  // which is a thing a caller may legitimately send and no longer a way to opt out.
+  // which a caller may legitimately send.
   let with_system = match (client.system) {
     case null -> base
     case standing -> record.set(target = base, key = "systemInstruction", value = {
@@ -380,14 +303,14 @@ agent gemini_base_body(client: connection, history: array[types.message]) -> rec
   gemini_with_generation_config(client = client, body = with_system)
 }
 
-@"Attach the OPTIONAL generation knobs to a request body: `maxOutputTokens` (the per-step output cap)
-and `thinkingConfig.thinkingBudget` (bounds the thought tokens before the answer — an unbounded
-thinking model on a heavy task can burn the whole output budget on thought and truncate to an empty
-answer). A `null` knob sends nothing, so the default wire behaviour is unchanged."
+@"Attach the optional generation knobs to a request body: `maxOutputTokens` (the per-step output cap) and
+`thinkingConfig.thinkingBudget` (which bounds the thought tokens before the answer, so a heavy task cannot
+burn the whole output budget on thought). A `null` knob sends nothing."
 agent gemini_with_generation_config(client: connection, body: record[unknown]) -> record[unknown] {
-  let with_max = match (client.max_output_tokens) {
-    case null -> record.empty()
-    case cap -> record.set(target = record.empty(), key = "maxOutputTokens", value = cap)
+  // `({})` and not `{}`: a brace straight after a match arrow reads as a block.
+  let with_max: record[unknown] = match (client.max_output_tokens) {
+    case null -> ({})
+    case cap -> record.set(target = {}, key = "maxOutputTokens", value = cap)
   }
   let config = match (client.thinking_budget) {
     case null -> with_max
@@ -402,10 +325,9 @@ agent gemini_with_generation_config(client: connection, body: record[unknown]) -
 
 agent gemini_request_body(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> unknown {
   let with_system = gemini_base_body(client = client, history = history)
-  // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
-  // slot contract base64s each `file` leaf — the inlineData `data` slots placed directly above — in
-  // place at the send boundary, so the bytes never land on the value plane. A tool schema's literal
-  // `$`-keys ride verbatim because they come from `meta.input`, already a document value spliced in as-is.
+  // The request body as a raw value tree: `post_json` serialises it, and `http.json`'s slot contract
+  // base64s each `file` leaf in place at the send boundary. A tool schema's literal `$`-keys ride verbatim
+  // from `meta.input`.
   if (array.length(target = tool_metas) == 0) {
     with_system
   } else {
@@ -442,20 +364,14 @@ agent gemini_tool_call(part: unknown) -> types.tool_call {
   )
 }
 
-@"THIS provider's own step failure: `generateContent` finished a step WITHOUT an answer — no function
-call and no reply text — with a finish reason other than a normal stop (an output-token truncation that
-ate the whole answer, a safety block). @finish_reason@ is the wire's own token (\"MAX_TOKENS\",
-\"SAFETY\", …).
-
-It lives HERE and not in `ai` because it is not a fact about model steps: it is a fact about what this
-API reports and how. It reaches an app as the `detail` of an `ai.provider_error`, which is the arm the
-neutral error surface keeps for exactly this — so an app that wants to dispatch on the finish reason
-matches this datum out of the detail, and one that does not still sees a message and a transience
-verdict."
+@"This provider's own step failure: `generateContent` finished a step without an answer — no function call
+and no reply text — with a finish reason other than a normal stop (an output-token truncation that ate the
+answer, a safety block). @finish_reason@ is the wire's own token. It reaches an app as the `detail` of an
+`ai.provider_error`, which is the arm the neutral error surface keeps for exactly this."
 data empty_reply(@"The wire-reported finish reason, e.g. \"MAX_TOKENS\"." finish_reason: string)
 
-@"An `empty_reply` as the neutral `ai.step_error` the seam carries. NOT transient, deliberately: the
-same context replays into the same truncation, so a retry would burn the budget on a certainty."
+@"An `empty_reply` as the neutral `ai.step_error` the seam carries. Not transient: the same context
+replays into the same truncation."
 agent empty_reply_error(@"The wire-reported finish reason." finish_reason: string) -> ai.step_error {
   ai.provider_error(
     source = "ai.gemini",
@@ -489,9 +405,8 @@ agent gemini_parse_step(parsed: unknown) -> types.step {
     }
   } then (_parts) { accumulator }
   if (array.length(target = calls) == 0) {
-    // Only the ANSWER parts become the reply: joining every part wholesale leaked the model's thought
-    // summaries (and their mid-word fragments) straight into the Discord reply — observed. A part
-    // with no string `text` (an image part, a bare signature carrier) contributes nothing either.
+    // Only the answer parts become the reply: a thought summary is not user-facing text, and a part with
+    // no string `text` contributes nothing.
     let texts = for (let part in parts, var accumulator: array[string] = []) {
       if (gemini_is_thought(part = part)) {
         next with { accumulator = accumulator }
@@ -508,10 +423,9 @@ agent gemini_parse_step(parsed: unknown) -> types.step {
     } then (_parts) { accumulator }
     let joined = string.join(parts = texts, separator = "")
     let finish = gemini_finish_reason(parsed = parsed)
-    // An EMPTY final with an abnormal finish is not an answer — the thought parts (stripped above)
-    // or a truncation ate it. Surface it as a real failure instead of a silent empty string. A
-    // NORMAL stop with empty text stays a legitimate quiet reply (`step_final("")`) — a resident
-    // loop's watchers answer exactly that when there is nothing to report.
+    // An empty final with an abnormal finish is not an answer — the thought parts or a truncation ate it.
+    // A normal stop with empty text stays a legitimate quiet reply (`step_final("")`), which is what a
+    // watcher answers when there is nothing to report.
     if (joined == "" && finish != "STOP" && finish != "") {
       prelude.throw(error = empty_reply_error(finish_reason = finish))
     } else {
@@ -522,9 +436,8 @@ agent gemini_parse_step(parsed: unknown) -> types.step {
   }
 }
 
-@"The step's token accounting off Gemini's `usageMetadata`: the prompt count is the whole context
-the step read, and thought tokens count as output alongside the answer's (an absent field reads as
-0, so a response without the block still yields a usable measurement)."
+@"The step's token accounting off Gemini's `usageMetadata`: the prompt count is the whole context the step
+read, and thought tokens count as output alongside the answer's. An absent field reads as 0."
 agent gemini_usage(parsed: unknown) -> types.usage {
   let counts = json.field(target = parsed, key = "usageMetadata")
   types.usage(
@@ -534,17 +447,15 @@ agent gemini_usage(parsed: unknown) -> types.usage {
   )
 }
 
-@"One Gemini model step over the history + tool schemas (the body built as a value tree and the reply
-parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined `file` in the body
-base64s at that send boundary via the `http.json` slot contract)."
+@"One Gemini model step over the history + tool schemas: the body is built as a value tree and the reply
+parsed by `post_json` in Katari, so only the POST leaves the runtime and each inlined `file` base64s at
+that send boundary."
 agent gemini_infer_step(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> types.step_result {
   let body = gemini_request_body(client = client, history = history, tool_metas = tool_metas)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
-  // `ai.post_step` serialises the value tree as application/json (each inlined `file` leaf read from
-  // the blob store and base64'd only at the send boundary), parses the reply back to a document value,
-  // and CLASSIFIES a non-2xx into the shared vocabulary (`http.auth_error` / `http.api_error`, both
-  // carrying the status) so no raw `status_error` reaches `ai.step_error`.
-  let response = ai.post_step(
+  // `http.post_json` serialises the value tree, parses the reply back to a document value, and classifies
+  // a non-2xx itself — so what it throws is already an arm of `ai.step_error`.
+  let response = http.post_json(
     url = url,
     body = body,
     headers = { "x-goog-api-key" = credentials.resolve(source = client.source) },
@@ -554,15 +465,16 @@ agent gemini_infer_step(client: connection, history: array[types.message], tool_
 }
 
 @"One Gemini structured-output step: the tool-less request base plus a `generationConfig` pinning the
-reply to JSON conforming to @schema@ — sanitized exactly like a tool schema (`responseSchema` speaks
-the same OpenAPI subset the function declarations do). The reply text parses back to the decoded
-object; a non-JSON or empty reply throws `json.parse_error` (∈ `ai.step_error`)."
+reply to JSON conforming to @schema@, sanitized exactly like a tool schema (`responseSchema` speaks the
+same OpenAPI subset). The reply text parses back to the decoded object; a non-JSON or empty reply throws
+`json.parse_error`."
 agent gemini_infer_object(client: connection, history: array[types.message], schema: unknown) -> types.object_result {
-  // The structured-output fields JOIN the base's generationConfig (the optional knobs) rather than
-  // replacing it — a plain `record.set` here would silently drop max_output_tokens / thinking_budget.
+  // The structured-output fields join the base's generationConfig rather than replacing it, so the
+  // optional knobs survive.
   let base = gemini_base_body(client = client, history = history)
-  let base_config = match (record.get(target = base, key = "generationConfig")) {
-    case null -> record.empty()
+  // `({})` and not `{}`: a brace straight after a match arrow reads as a block.
+  let base_config: record[unknown] = match (record.get(target = base, key = "generationConfig")) {
+    case null -> ({})
     case existing -> json.entries(target = existing)
   }
   let structured_config = record.set(
@@ -572,14 +484,14 @@ agent gemini_infer_object(client: connection, history: array[types.message], sch
   )
   let body = record.set(target = base, key = "generationConfig", value = structured_config)
   let url = f"https://generativelanguage.googleapis.com/v1beta/models/${client.model}:generateContent"
-  let response = ai.post_step(
+  let response = http.post_json(
     url = url,
     body = body,
     headers = { "x-goog-api-key" = credentials.resolve(source = client.source) },
     context = "gemini.infer_object",
   )
-  // With no tools declared a functionCall part cannot occur, so the parse is always `step_final`;
-  // the guard keeps the match total without inventing a value.
+  // With no tools declared a functionCall part cannot occur, so the parse is always `step_final`; the
+  // guard keeps the match total without inventing a value.
   let text = match (gemini_parse_step(parsed = response)) {
     case types.step_final(text => text) -> text
     case types.step_call(calls => _) -> prelude.throw(error = json.parse_error(message = "gemini: a tool call in a structured-output reply"))

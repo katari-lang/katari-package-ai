@@ -1,27 +1,15 @@
-// Anthropic provider: serves the `ai.infer_step` request over the Messages API. Where OpenAI ships
-// tool arguments as a JSON string, Anthropic keeps them as parsed JSON inside `tool_use` content
-// blocks, keyed by a block id (which is what this provider puts in `types.call_ref` — the agnostic
-// vocabulary's one opaque per-call token) that the next user
-// turn echoes back as `tool_result` blocks — one message for the whole batch. Files inline by CONTENT TYPE
-// (`anthropic_file_blocks` dispatches over `ai.file_kind`): an image as an `image` block, a PDF as a
-// `document` block, a textual file as text, and anything the API has no block for as a note that says so —
-// in a turn's content and inside a tool_result's content alike, since both positions take the same blocks.
-// Only the newest FILE-BEARING element inlines its content (`ai.inline_from_index`); older files show their
-// handle note and the model re-reads one with `view_file`. The request body posts as an `http.json` value
-// tree with `http.fetch`, so each inlined file's `data` slot base64s at the send boundary, never on the
-// value plane.
-// Same agnostic vocabulary, different shaping — and the same one-line integration:
-// `use anthropic.provider(source = ...)`. Unlike the other two providers this one also has to ASK for
-// prompt caching, by marking `cache_control` breakpoints on the request it builds — see the
-// prompt-caching section below.
+// Anthropic provider: serves `ai.infer_step` and `ai.infer_object` over the Messages API. Tool arguments
+// are parsed JSON inside `tool_use` content blocks keyed by a block id (this provider's
+// `types.call_ref`), which the next user turn echoes back as `tool_result` blocks — one message for the
+// whole batch. Files inline by content type (`anthropic_file_blocks` over `ai.file_kind`), and this is
+// the one provider that asks for prompt caching by marking `cache_control` breakpoints.
 
 import ai
 import ai.types
 import ai.wire_names
 
-@"An Anthropic connection: the model id, the API key, an optional system prompt, and the
-output-token cap the Messages API requires on every request. Provider handler state — built once per
-`use anthropic.provider(...)`."
+@"An Anthropic connection: the model id, the API key, an optional system prompt, and the output-token cap
+the Messages API requires on every request. Built once per `use anthropic.provider(...)`."
 data connection(
   @"The Claude model id." model: string,
   @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
@@ -31,13 +19,9 @@ data connection(
   @"The first backoff delay (ms), doubled per retry." retry_base_milliseconds: number,
 )
 
-@"The `max_tokens` this provider actually SENDS: the caller's @client.max_output_tokens@, or 4096 when
-it is `null`. The knob is optional across all three providers because a per-step output cap is an
-optional idea; this API is the one that makes the FIELD mandatory — a request without `max_tokens` is a
-400 — so `null` cannot mean 'send nothing' here and means 'send this provider's stand-in' instead. 4096
-is that stand-in: it is what this module has always defaulted to, it is comfortably above a chat reply
-and a tool-call batch, and a program that wants long output states a number rather than discovering a
-truncation."
+@"The `max_tokens` this provider sends: the caller's @client.max_output_tokens@, or 4096 when it is
+`null`. The Messages API makes the field mandatory, so `null` means this provider's stand-in rather than
+'send nothing'; a program that wants long output states a number."
 agent anthropic_max_tokens(@"The provider connection." client: connection) -> integer {
   match (client.max_output_tokens) {
     case null -> 4096
@@ -47,95 +31,48 @@ agent anthropic_max_tokens(@"The provider connection." client: connection) -> in
 
 @"Serve `ai.infer_step` over Anthropic for the extent of the continuation:
 `use anthropic.provider(source = credentials.env(key = \"ANTHROPIC_API_KEY\"))`.
-A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` OUTCOME, never
-thrown — but a TRANSIENT one (a 429 rate limit, a 5xx, a dropped connection) is first retried with
-exponential backoff (up to @retry_attempts@ attempts from @retry_base_milliseconds@); only a fatal error
-or an exhausted budget surfaces, as a value the loop handles at its own perform site rather than a throw.
-Prompt caching is ON and needs no argument: every step marks two `cache_control` breakpoints — one at
-the end of the tools+@system@ prefix, one at the end of the conversation — so a tool loop re-reads
-what it already sent at a tenth of the price. Caching is per-PROVIDER machinery (Gemini's is implicit,
-OpenAI's automatic); Anthropic's is the one that must be asked for. See the prompt-caching section for
-what silently undoes it."
+A step's provider failure (`ai.step_error`) is handed back as an `ai.inference_failed` outcome; a
+transient one (a 429, a 5xx, a dropped connection) is first retried with exponential backoff, up to
+@retry_attempts@ attempts from @retry_base_milliseconds@. Prompt caching is on and needs no argument:
+every step marks two `cache_control` breakpoints, one at the end of the tools+@system@ prefix and one at
+the end of the conversation, so a tool loop re-reads what it already sent at a tenth of the price. The
+prompt-caching section of this module says what silently undoes it."
 agent provider[R, effect E](
-  @"The Claude model id. Defaults to `claude-sonnet-5` — the balanced tier of the series, which is what
-a default should be: a program that has not chosen gets the model that is right for most turns, and one
-with an opinion passes it." model: string ?= "claude-sonnet-5",
+  @"The Claude model id. Defaults to `claude-sonnet-5`, the balanced tier of the series — a program that
+has not chosen gets the model that is right for most turns." model: string ?= "claude-sonnet-5",
   @"Where the API key lives (env key or oauth name); resolved at each request, so a rotation lands mid-run." source: credentials.source,
-  @"An optional system prompt, sent as the top-level `system` field; `null` (the default) sends none. \"\" is NOT the way to say none — the API rejects an empty text block." system: string | null ?= null,
-  @"The per-step output cap. `null` (the default) sends 4096: the Messages API REQUIRES the field on every request, so `null` cannot mean 'send none' here and means this provider's stand-in instead (see `anthropic_max_tokens`)." max_output_tokens: integer | null ?= null,
+  @"An optional system prompt, sent as the top-level `system` field; `null` (the default) sends none. \"\" is not the way to say none — the API rejects an empty text block." system: string | null ?= null,
+  @"The per-step output cap. `null` (the default) sends 4096, since the Messages API requires the field on every request (see `anthropic_max_tokens`)." max_output_tokens: integer | null ?= null,
   @"How many times a transient step (a 429 / 5xx / dropped connection) is attempted before its error becomes an `inference_failed` outcome." retry_attempts: integer ?= 6,
   @"The first backoff delay in milliseconds, doubled per retry (capped at one minute)." retry_base_milliseconds: number ?= 2000.0,
   @"The computation to run with `ai.infer_step` / `ai.infer_object` served." continuation: agent (value: null) -> R with {...E, ai.infer_step, ai.infer_object},
 ) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler (var client = connection(model = model, source = source, system = system, max_output_tokens = max_output_tokens, retry_attempts = retry_attempts, retry_base_milliseconds = retry_base_milliseconds)) {
+  // The connection is a value and not handler state: nothing ever writes it back. The handler is
+  // `parallel`, so several AIs' model calls stay concurrent instead of queueing at one FIFO.
+  let client = connection(model = model, source = source, system = system, max_output_tokens = max_output_tokens, retry_attempts = retry_attempts, retry_base_milliseconds = retry_base_milliseconds)
+  use parallel handler {
     request ai.infer_step(history: array[types.message], tool_metas: array[reflection.agent_metadata]) {
-      // The retry LOOP is `ai.with_retries` — one copy for every provider and both seams. What stays
-      // here is the one thing a provider owns: the attempt, wrapped in a thunk because the loop takes an
-      // agent and these three arguments cannot ride a partial application of one.
-      let connected = client
-      agent once(value: null) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-        anthropic_step_attempt(client = connected, history = history, tool_metas = tool_metas)
+      // The retry loop and the catching are both `ai.with_retries`; what stays here is the call, wrapped
+      // in a thunk because these arguments cannot ride a partial application of one.
+      agent once(value: null) -> types.step_result with io | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+        anthropic_infer_step(client = client, history = history, tool_metas = tool_metas)
       }
-      next ai.with_retries[types.step_result](attempts = connected.retry_attempts, base_milliseconds = connected.retry_base_milliseconds, attempt = once)
+      next ai.with_retries[types.step_result](attempts = client.retry_attempts, base_milliseconds = client.retry_base_milliseconds, attempt = once)
     }
     request ai.infer_object(history: array[types.message], schema: unknown) {
-      let connected = client
-      agent once(value: null) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-        anthropic_object_attempt(client = connected, history = history, schema = schema)
+      agent once(value: null) -> types.object_result with io | prelude.throw[ai.step_error | env.missing_secret | oauth.server_error] {
+        anthropic_infer_object(client = client, history = history, schema = schema)
       }
-      next ai.with_retries[types.object_result](attempts = connected.retry_attempts, base_milliseconds = connected.retry_base_milliseconds, attempt = once)
+      next ai.with_retries[types.object_result](attempts = client.retry_attempts, base_milliseconds = client.retry_base_milliseconds, attempt = once)
     }
   }
   continuation(value = null)
 }
 
-@"ONE Anthropic step attempt, catching any `step_error` into an `ai.attempt` verdict so the provider's
-retry loop can classify it — the catching handler lives here, at the agent top, so the loop never nests one."
-agent anthropic_step_attempt(client: connection, history: array[types.message], tool_metas: array[reflection.agent_metadata]) -> ai.attempt[types.step_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler {
-    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
-      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
-      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
-      // rethrows it toward the root, where the app's supervisor decides. Each arm rebuilds its own value
-      // because `match` does not narrow a union: the residual `rest` still has the whole row's type, so
-      // there is no arm that could hand the caught error on without naming it.
-      match (error) {
-        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
-        case http.auth_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.auth_error(status = status, context = context, message = message)) }
-        case http.api_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.api_error(status = status, context = context, message = message)) }
-        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  ai.attempt_ok(result = anthropic_infer_step(client = client, history = history, tool_metas = tool_metas))
-}
-
-@"ONE Anthropic structured-output attempt, the `anthropic_step_attempt` twin for `infer_object`."
-agent anthropic_object_attempt(client: connection, history: array[types.message], schema: unknown) -> ai.attempt[types.object_result] with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  use handler {
-    request prelude.throw(error: ai.step_error | env.missing_secret | oauth.server_error) -> never {
-      // A STEP failure folds into the verdict for the retry loop; a credential-resolution failure is
-      // not a step the provider can retry (a missing secret, a dead oauth credential) — the residual
-      // rethrows it toward the root, where the app's supervisor decides.
-      match (error) {
-        case http.fetch_error(message => message) -> { break ai.attempt_err(error = http.fetch_error(message = message)) }
-        case http.auth_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.auth_error(status = status, context = context, message = message)) }
-        case http.api_error(status => status, context => context, message => message) -> { break ai.attempt_err(error = http.api_error(status = status, context = context, message = message)) }
-        case json.parse_error(message => message) -> { break ai.attempt_err(error = json.parse_error(message = message)) }
-        case ai.provider_error(source => source, message => message, transient => transient, detail => detail) -> { break ai.attempt_err(error = ai.provider_error(source = source, message = message, transient = transient, detail = detail)) }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  ai.attempt_ok(result = anthropic_infer_object(client = client, history = history, schema = schema))
-}
-
 // ── request body ─────────────────────────────────────────────────────────────
 
-@"Map the agnostic role sum onto the Messages API's own token: the model's side speaks as
-\"assistant\" here."
+@"Map the agnostic role sum onto the Messages API's own token: the model's side speaks as \"assistant\"
+here."
 agent anthropic_role(@"Who spoke the turn." role: types.role) -> string {
   match (role) {
     case types.model_role(_) -> "assistant"
@@ -149,9 +86,8 @@ agent anthropic_text_block(@"The block's text." text: string) -> unknown {
 }
 
 @"An image content block: a base64 `source` whose `media_type` is the file's recorded type and whose
-`data` slot holds the file VALUE placed DIRECTLY into the tree. `http.json` materialises that slot —
-reading the bytes and base64-ing them in place — only at the send boundary, so the image content never
-rides the value plane, the durable call record or the trace."
+`data` slot holds the file value placed directly into the tree. `http.json` materialises that slot at the
+send boundary, so the image content never rides the value plane, the durable call record or the trace."
 agent anthropic_image_block(
   @"The image file to inline." attachment: file,
   @"Its recorded content type, which the API takes as the block's `media_type`." media_type: string,
@@ -166,11 +102,9 @@ agent anthropic_image_block(
   }
 }
 
-@"A PDF content block — the SAME mechanism one arm over: `{ \"type\": \"document\", \"source\": {
-\"type\": \"base64\", \"media_type\": \"application/pdf\", \"data\": … } }`, with the file value in the
-`data` slot so its bytes base64 at the send boundary exactly like an image's. The Messages API reads a
-document's pages as text AND as images, which is why a PDF must take this block rather than degrade to a
-note: the model genuinely reads it."
+@"A PDF content block — the same mechanism one arm over, with the file value in the `data` slot so its
+bytes base64 at the send boundary exactly like an image's. The Messages API reads a document's pages as
+text and as images, which is why a PDF takes this block rather than degrading to a note."
 agent anthropic_document_block(
   @"The PDF file to inline." attachment: file,
   @"Its recorded content type — `application/pdf`, the only media type this block accepts." media_type: string,
@@ -185,11 +119,9 @@ agent anthropic_document_block(
   }
 }
 
-@"Whether the Messages API's image block accepts @media_type@. The documented set is exactly four —
-\"Claude supports JPEG, PNG, GIF, and WebP images (`image/jpeg`, `image/png`, `image/gif`,
-`image/webp`)\" — and any other image type is a 400 on the whole request. `image/*` is a wide family: a
-scanned fax arrives as `image/tiff` and a diagram as `image/svg+xml`, both now routinely, so the family
-alone cannot decide this arm."
+@"Whether the Messages API's image block accepts @media_type@. The documented set is exactly four — jpeg,
+png, gif and webp — and any other image type is a 400 on the whole request, while `image/*` is a wide
+family: a scanned fax arrives as `image/tiff` and a diagram as `image/svg+xml`."
 agent anthropic_image_media_type(@"The file's normalized content type." media_type: string) -> boolean {
   match (media_type) {
     case "image/jpeg" -> true
@@ -200,10 +132,9 @@ agent anthropic_image_media_type(@"The file's normalized content type." media_ty
   }
 }
 
-@"An image file's blocks: the handle note and the `image` block when the API accepts the media type, and the
-unreadable note when it does not. A type outside the accepted four must NOT be shipped hopefully — the 400
-it earns fails the whole step, and a step that fails takes the turn with it, whereas the note costs the
-model one honest sentence and the conversation continues."
+@"An image file's blocks: the handle note and the `image` block when the API accepts the media type, and
+the unreadable note when it does not. A type outside the accepted four earns a 400 that fails the whole
+step, where the note costs the model one honest sentence and the conversation continues."
 agent anthropic_image_blocks(
   @"The image file." attachment: file,
   @"Its normalized content type." media_type: string,
@@ -218,23 +149,18 @@ agent anthropic_image_blocks(
   }
 }
 
-@"ONE file as the content blocks it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
-the Messages API accepts. An image (of an accepted media type — see `anthropic_image_blocks`) and a PDF
-inline as their own block, each preceded by its handle note so the model keeps the replay affordance; a
-textual file inlines as text (nothing on this wire carries it better); audio and video have no Messages API
-block at all, so they and every opaque type become the note that states the content is unreadable rather
-than a bare handle the model would guess from. The document arm needs no media-type guard of its own:
-`ai.classify_file` reaches it only for exactly `application/pdf`, which is the only type the block takes.
-The SAME set of block types is legal in a turn's content and inside a tool_result's content, so one serves both
-positions — a file the user attached and a file a tool handed back reach the model identically."
+@"One file as the content blocks it becomes — the per-file dispatch over `ai.file_kind`, one arm per shape
+the Messages API accepts. An image and a PDF inline as their own block, each preceded by its handle note
+so the model keeps the replay affordance; a textual file inlines as text; audio, video and every
+opaque type become the note stating the content is unreadable. The document arm needs no media-type guard, since
+`ai.classify_file` reaches it only for `application/pdf`. The same block types are legal in a turn's
+content and inside a tool_result's content, so one dispatch serves both positions."
 agent anthropic_file_blocks(
   @"One file, attached to a turn or returned by a tool." attachment: file,
   @"Whether this element is inside the inline window (`ai.inline_from_index`)." inline: boolean,
 ) -> array[unknown] {
-  // OUTSIDE the window the handle note rides alone, whatever the type: every step re-sends the whole
-  // conversation, so content that inlines forever is uploaded on every step (see ai's inline-window
-  // section). The model re-reads an older file with `view_file`, which answers the readability question
-  // authoritatively at the moment it asks — the arrival step already stated it once.
+  // Outside the window the handle note rides alone, whatever the type: every step re-sends the whole
+  // conversation, and the model re-reads an older file with `view_file`.
   if (!inline) {
     [anthropic_text_block(text = ai.file_handle_note(attachment = attachment))]
   } else {
@@ -261,9 +187,8 @@ agent anthropic_file_blocks(
 }
 
 @"A turn's content: the plain string when the turn carries no file, and otherwise the turn's text block
-followed by each file's blocks (`anthropic_file_blocks`). A file-less turn keeps the string shape both
-because it says the same thing in fewer bytes and because those bytes are the prompt-cache prefix — a
-turn whose rendering never changes keeps reading its cached span."
+followed by each file's blocks. A file-less turn keeps the string shape — it says the same thing in fewer
+bytes, and those bytes are prompt-cache prefix."
 agent anthropic_turn_content(
   @"The turn's text." text: string,
   @"The turn's files." files: array[file],
@@ -275,9 +200,8 @@ agent anthropic_turn_content(
   if (array.length(target = file_blocks) == 0) {
     text
   } else {
-    // An EMPTY text block is rejected by the API, and a turn that is only attachments (an image posted
-    // with no caption) has empty text — so the text block rides only when there is text to put in it.
-    // Each file's blocks carry their own note, so nothing is lost when the heading is absent.
+    // An empty text block is rejected by the API, so the text block rides only when there is text to put
+    // in it; each file's blocks carry their own note.
     let heading: array[unknown] = if (text == "") { [] } else { [anthropic_text_block(text = text)] }
     array.concat(left = heading, right = file_blocks)
   }
@@ -285,50 +209,18 @@ agent anthropic_turn_content(
 
 // ── prompt caching ───────────────────────────────────────────────────────────
 //
-// Anthropic's cache is a PREFIX match over the rendered request, and the render order is
-// tools -> system -> messages: a `cache_control` breakpoint on a content block caches everything up
-// to and including that block, and a later request whose bytes agree that far reads the span at a
-// tenth of the price instead of paying for it again. One byte earlier in the prefix changes and
-// every breakpoint after it misses. TWO breakpoints carry the whole shape (the API allows four):
-//
-//   1. THE END OF THE PROMPT PREFIX — the system block, or the last tool when no system prompt was
-//      set. Tools render FIRST, so marking the system block caches the tool declarations with it,
-//      and that is where the mass is: a resident's thirty tools ship their derived schemas and their
-//      docs on every one of a turn's steps, unchanged every time.
-//   2. THE END OF THE CONVERSATION — the last content block of the last message. A turn's tool loop
-//      re-sends a history that only GROWS, so each step reads the span the previous step wrote; it
-//      also keeps consecutive requests within the API's 20-block lookback, which a long batch of
-//      tool_use / tool_result blocks would otherwise outrun.
-//
-// It is ON with no way to turn it off because the break-even is TWO uses: a five-minute write costs
-// 1.25x and a read 0.1x, so a prefix that is seen twice has already paid for itself (1.35x < 2x) and
-// every further step of a tool loop is nearly free. A prefix under the model's minimum (1024 tokens
-// on Sonnet, 4096 on Haiku) simply is not cached — no write, so no surcharge for marking it.
-//
-// Caching is per-PROVIDER machinery: Gemini and OpenAI cache implicitly / automatically off the same
-// prefix and take no breakpoint at all, so this provider is the only one that marks anything.
-//
-// The inline window is built not to undo (2): it is keyed to FILE-BEARING elements, not to position, so a
-// step that appends a tool call or a tool result leaves every earlier rendered byte identical. A positional
-// window would degrade the previously inlined element on every step and rewrite the prefix each time.
-//
-// WHAT SILENTLY UNDOES (2): anything that changes at the FRONT of the messages every step. This is why
-// `ai.with_context` inserts its freshly computed note JUST BEFORE THE NEWEST USER TURN rather than at
-// the front, which is where it used to put it: an ambient note is BY DEFINITION the part that changes
-// (a clock reading, a memory index that just gained an entry), and one changed character at message 0
-// invalidated the whole conversation on every step — breakpoint (2) still WROTE, so the messages cost
-// 1.25x and never 0.1x, and a turn carrying the time paid full price at every step of its tool loop.
-// Injected where it is now, the changing bytes sit at the END of the stable region: the newest user
-// turn is what triggered this model turn and a tool loop only APPENDS after it, so everything from
-// message 0 up to the injection is byte-identical across the steps of a turn. What remains is the LAST
-// user turn onward, which is small and would be re-read anyway. Byte-stability across turns is still
-// worth having for that tail (quantize a clock reading rather than restating the millisecond), but it
-// is no longer the difference between a cached conversation and an uncached one. The tools+system half
-// is unaffected either way.
+// The cache is a prefix match over the rendered request, and the render order is tools -> system ->
+// messages: a `cache_control` breakpoint caches everything up to and including its block, and a later
+// request whose bytes agree that far reads the span at a tenth of the price. Two breakpoints carry the
+// whole shape (the API allows four) — the end of the prompt prefix (the system block, or the last tool
+// when there is no system prompt) and the end of the conversation, which also keeps consecutive requests
+// inside the API's 20-block lookback. Both read only while the bytes before them stay identical, which is
+// what the file-keyed inline window and `ai.with_context`'s injection point preserve. It is on with no
+// argument: a write costs 1.25x and a read 0.1x, so the break-even is two uses, and a prefix under the
+// model's minimum (1024 tokens on Sonnet, 4096 on Haiku) is simply not cached.
 
-@"@block@ carrying a cache breakpoint: the same content block with `cache_control` added, the
-five-minute (default) TTL. A block that is not a record rides unchanged — the wire has no slot to
-mark on it."
+@"@block@ carrying a cache breakpoint: the same content block with `cache_control` added, at the default
+five-minute TTL. A block that is not a record rides unchanged — the wire has no slot to mark on it."
 agent anthropic_cached_block(@"The content block to mark." block: unknown) -> unknown {
   match (block) {
     case record(fields) -> record.set(target = fields, key = "cache_control", value = { "type" = "ephemeral" })
@@ -336,9 +228,8 @@ agent anthropic_cached_block(@"The content block to mark." block: unknown) -> un
   }
 }
 
-@"@blocks@ with the breakpoint on its LAST element, and an empty array unchanged. The tail rides as a
-ONE-ELEMENT SLICE so the rewrite is total by construction — there is no index that could be out of
-bounds and no absent-element case to invent a value for."
+@"@blocks@ with the breakpoint on its last element, and an empty array unchanged. The tail rides as a
+one-element slice, so the rewrite is total by construction."
 agent anthropic_cached_last(@"The blocks whose end carries the breakpoint." blocks: array[unknown]) -> array[unknown] {
   let last_index = array.length(target = blocks) - 1
   let tail: array[unknown] = for (let block in array.slice(target = blocks, start = last_index, end = last_index + 1)) {
@@ -347,16 +238,15 @@ agent anthropic_cached_last(@"The blocks whose end carries the breakpoint." bloc
   array.concat(left = array.slice(target = blocks, start = 0, end = last_index), right = tail)
 }
 
-@"The `system` field as a BLOCK ARRAY carrying the prefix breakpoint. The Messages API takes a bare
-string or a block array there, and only a block can be marked — so the system prompt ships as one
-text block, and the tool declarations rendered before it cache along with it."
+@"The `system` field as a block array carrying the prefix breakpoint. The Messages API takes a bare string
+or a block array there and only a block can be marked, so the system prompt ships as one text block and
+the tool declarations rendered before it cache along with it."
 agent anthropic_system_blocks(@"The system prompt; never the empty one, which sends no field at all." system: string) -> unknown {
   [anthropic_cached_block(block = anthropic_text_block(text = system))]
 }
 
-@"A message's content with the breakpoint on its last block. A turn with no attachment carries its
-content as a plain STRING, which has no block to mark: it becomes the one-element block array that says
-exactly the same thing."
+@"A message's content with the breakpoint on its last block. A turn with no attachment carries its content
+as a plain string, which becomes the one-element block array that says exactly the same thing."
 agent anthropic_cached_content(@"The message's content — a string or an array of blocks." content: unknown) -> unknown {
   match (content) {
     case array(blocks) -> anthropic_cached_last(blocks = blocks)
@@ -380,10 +270,9 @@ agent anthropic_cached_messages(@"The rendered messages." messages: array[unknow
 }
 
 agent anthropic_call_block(@"One tool call of the model's batch." call: types.tool_call, @"The step's wire-name map." map: wire_names.name_map) -> unknown {
-  // Replay the model's tool_use verbatim: its block id + name + the original input. The name rides as
-  // the WIRE name — the API validates the replayed history's tool_use name the same as the request's
-  // tool declarations, so the qualified name would 400 here too (the opaque block id stays as-is). The
-  // input is the model's args document dropped straight into the value tree, so its keys survive as-is.
+  // Replay the model's tool_use verbatim: its block id, name and the original input. The name rides as
+  // the wire name, because the API validates a replayed tool_use name like a tool declaration; the input
+  // is the model's args document dropped straight into the value tree.
   {
     "type" = "tool_use",
     id = call.ref.token,
@@ -392,16 +281,11 @@ agent anthropic_call_block(@"One tool call of the model's batch." call: types.to
   }
 }
 
-@"One tool's output, keyed back to its call — with the result's FILES inlined INSIDE the tool_result's own
-content array, through the same `anthropic_file_blocks` dispatch the turn path uses. The Messages API
-documents that a tool_result's content blocks \"can use the `text`, `image`, `document`, or `search_result`
-types\", which is exactly the set that dispatch produces, so a file re-read with `ai.view_file` reaches the
-model here instead of being dropped (it was dropped for as long as this provider existed).
-INSIDE rather than beside the tool_result, for two documented reasons: a user message carrying tool results
-may only append TEXT after them (\"the tool_result blocks must come FIRST in the content array. Any text
-must come AFTER all tool results\"), so an image or document block beside them is not licensed; and the
-API's own guidance is to keep tool content — which comes from outside the app — inside the tool_result
-block rather than in a plain user text block, because that is what marks it untrusted."
+@"One tool's output, keyed back to its call — with the result's files inlined inside the tool_result's own
+content array, through the same `anthropic_file_blocks` dispatch the turn path uses. The API documents a
+tool_result's content as taking `text`, `image`, `document` or `search_result` blocks, and inside rather
+than beside is what it licenses: a user message carrying tool results may only append text after them, and
+keeping tool content inside the block is what marks it untrusted."
 agent anthropic_result_block(
   @"One tool's output, keyed back to its call." result: types.tool_result,
   @"Whether this result batch is inside the inline window." inline: boolean,
@@ -410,15 +294,14 @@ agent anthropic_result_block(
     next anthropic_file_blocks(attachment = attachment, inline = inline)
   })
   if (array.length(target = file_blocks) == 0) {
-    // A result with no file keeps the STRING content: it says the same thing in fewer bytes, and those
-    // bytes are prompt-cache prefix that a later step re-reads only if they do not change.
+    // A result with no file keeps the string content: fewer bytes, and those bytes are cache prefix.
     {
       "type" = "tool_result",
       tool_use_id = result.ref.token,
       content = result.text,
     }
   } else {
-    // An EMPTY text block is rejected by the API, so the result's own text rides only when it has some.
+    // An empty text block is rejected by the API, so the result's own text rides only when it has some.
     let text_blocks: array[unknown] = if (result.text == "") { [] } else { [anthropic_text_block(text = result.text)] }
     {
       "type" = "tool_result",
@@ -468,10 +351,9 @@ agent anthropic_tool(@"One tool's derived schema." meta: reflection.agent_metada
   }
 }
 
-@"The history rendered as Messages API messages, with the inline window applied: the elements before
-`ai.inline_from_index` show their files as handle notes and the newest file-bearing element inlines its
-content. Both request bodies render through this, so a step and a structured step re-send the same bytes for
-the same conversation — which is also what lets the prompt-cache prefix match across them."
+@"The history rendered as Messages API messages, with the inline window applied. Both request bodies
+render through this, so a step and a structured step re-send the same bytes for the same conversation,
+which is also what lets the prompt-cache prefix match across them."
 agent anthropic_messages(
   @"The conversation so far." history: array[types.message],
   @"The step's wire-name map." map: wire_names.name_map,
@@ -493,14 +375,11 @@ agent anthropic_request_body(
   @"The step's wire-name map." map: wire_names.name_map,
 ) -> unknown {
   let rendered = anthropic_messages(history = history, map = map)
-  // The conversation breakpoint: the last block of the last message, so the NEXT step of this turn
-  // reads the history this one sent instead of paying for it again (see the prompt-caching section).
+  // The conversation breakpoint, so the next step of this turn reads the history this one sent.
   let messages = anthropic_cached_messages(messages = rendered)
-  // Thinking stays OFF, explicitly: newer Claude models run adaptive thinking when the field is
-  // omitted, and a thinking block must then be replayed VERBATIM (signature included) on the next
-  // call turn — the agnostic vocabulary has no slot for one (Gemini's per-call thoughtSignature fits
-  // tool_call.opaque; a standalone content block does not), and dropping it fails the follow-up
-  // request.
+  // Thinking stays off explicitly: newer Claude models run adaptive thinking when the field is omitted,
+  // and a thinking block must then be replayed verbatim on the next call turn — the agnostic vocabulary
+  // has no slot for a standalone content block, and dropping it fails the follow-up request.
   let thinking = { "type" = "disabled" }
   let base: record[unknown] = {
     model = client.model,
@@ -508,8 +387,8 @@ agent anthropic_request_body(
     messages = messages,
     thinking = thinking,
   }
-  // The prompt prefix ENDS at the system block when there is a system prompt, and at the tools when
-  // there is not — so exactly one of the two carries the prefix breakpoint (below).
+  // The prompt prefix ends at the system block when there is one, and at the tools when there is not, so
+  // exactly one of the two carries the prefix breakpoint.
   let with_system = match (client.system) {
     case null -> base
     case standing -> record.set(target = base, key = "system", value = anthropic_system_blocks(system = standing))
@@ -518,40 +397,36 @@ agent anthropic_request_body(
     case null -> true
     case _ -> false
   }
-  // The newest user turn's opaque author tag becomes the abuse-attribution metadata — the field is
-  // omitted entirely for an unattributed step (a monitor tick, a loop-synthesized close), keeping
-  // the wire unchanged when no author flows.
+  // The newest user turn's opaque author tag becomes the abuse-attribution metadata; the field is omitted
+  // entirely for an unattributed step, keeping the wire unchanged when no author flows.
   let with_metadata = match (ai.attribution(history = history)) {
     case null -> with_system
     case author -> record.set(target = with_system, key = "metadata", value = { user_id = author })
   }
-  // The request body as a RAW value tree, built DIRECTLY: `post_json` serialises it, and `http.json`'s
-  // slot contract base64s each `file` leaf — the image / document `data` slots placed directly above — in
-  // place at the send boundary, so the bytes never land on the value plane. A tool schema's literal `$ref` /
-  // `$defs` keys ride verbatim because `meta.input` is already a document value spliced in as-is.
+  // The request body as a raw value tree: `post_json` serialises it, and `http.json`'s slot contract
+  // base64s each `file` leaf in place at the send boundary. A tool schema's literal `$ref` / `$defs` keys
+  // ride verbatim, since `meta.input` is already a document value.
   if (array.length(target = tool_metas) == 0) {
     with_metadata
   } else {
     let tools = for (let meta in tool_metas) { next anthropic_tool(meta = meta, map = map) }
-    // With no system block to carry it, the prefix breakpoint rides the LAST TOOL: the declarations
-    // are the bulk of a resident's prefix, and leaving them unmarked would cache nothing at all.
+    // With no system block to carry it, the prefix breakpoint rides the last tool: the declarations are
+    // the bulk of a resident's prefix.
     let declared = if (prefix_on_tools) { anthropic_cached_last(blocks = tools) } else { tools }
     record.set(target = with_metadata, key = "tools", value = declared)
   }
 }
 
-@"The structured-output request body: @schema@ as the input schema of ONE synthetic tool with
-`tool_choice` pinned to it (see `anthropic_infer_object`). It takes the same prefix breakpoint as a
-step — the schema tool is usually the bulk of the prefix, and a repeated extraction re-sends it
-verbatim — but NO conversation breakpoint: an object step states its own context and is not re-sent
-with a growing history, so marking its messages would pay a cache write nothing ever reads."
+@"The structured-output request body: @schema@ as the input schema of one synthetic tool with
+`tool_choice` pinned to it. It takes the same prefix breakpoint as a step, but no conversation breakpoint
+— an object step states its own context and is not re-sent with a growing history, so marking its messages
+would pay a cache write nothing ever reads."
 agent anthropic_object_body(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The JSON Schema the reply must conform to." schema: unknown,
 ) -> unknown {
-  // The name map is empty — a replayed call turn in @history@ rides under its real name via the
-  // fallback, fine for the rare structured step over a tool transcript.
+  // The name map is empty: a replayed call turn in @history@ rides under its real name via the fallback.
   let map = wire_names.build_name_map(tool_metas = [])
   let messages = anthropic_messages(history = history, map = map)
   let prefix_on_tools = match (client.system) {
@@ -613,11 +488,9 @@ agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"T
     }
   } then (_blocks) { acc }
   if (array.length(target = calls) == 0) {
-    // The content array decides the step, not stop_reason: a "tool_use" stop always ships tool_use
-    // blocks, and every other stop ("end_turn", or the degenerate "max_tokens" / "refusal" whose
-    // text is partial or empty) reads out as the step's final text. Branching on stop_reason could
-    // manufacture an EMPTY call batch, which the loop must never see. Only `text` blocks join the
-    // reply — any other block kind carries no user-facing text.
+    // The content array decides the step, not stop_reason: a tool_use stop always ships tool_use blocks,
+    // and every other stop reads out as the step's final text, so no empty call batch can be
+    // manufactured. Only `text` blocks join the reply.
     let texts = for (let block in blocks, var acc: array[string] = []) {
       if (anthropic_block_kind(block = block) == "text") {
         next with { acc = array.append(target = acc, value = json.text(target = json.field(target = block, key = "text"))) }
@@ -632,10 +505,9 @@ agent anthropic_parse_step(@"The parsed response document." parsed: unknown, @"T
 }
 
 @"The step's token accounting off the response's `usage`. The context a step read splits across
-`input_tokens` and the cache counters (`cache_read_input_tokens` / `cache_creation_input_tokens`),
-so the occupancy is their sum; an absent field reads as 0. The split is a LIVE one — the provider
-marks cache breakpoints (see the prompt-caching section), so a warm step reports most of its context
-under `cache_read_input_tokens`, which is also how a run trace shows the cache is working."
+`input_tokens` and the cache counters (`cache_read_input_tokens` / `cache_creation_input_tokens`), so the
+occupancy is their sum and an absent field reads as 0. A warm step therefore reports most of its context
+under `cache_read_input_tokens`, which is how a run trace shows the cache working."
 agent anthropic_usage(@"The parsed response document." parsed: unknown) -> types.usage {
   let counts = json.field(target = parsed, key = "usage")
   types.usage(
@@ -646,23 +518,21 @@ agent anthropic_usage(@"The parsed response document." parsed: unknown) -> types
   )
 }
 
-@"One Anthropic model step over the history + tool schemas (the body built as a value tree and the
-reply parsed by `post_json` in Katari; only the POST leaves the runtime, and each inlined `file` in the
-body base64s at that send boundary via the `http.json` slot contract)."
+@"One Anthropic model step over the history + tool schemas: the body is built as a value tree and the
+reply parsed by `post_json` in Katari, so only the POST leaves the runtime and each inlined `file` base64s
+at that send boundary."
 agent anthropic_infer_step(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The tools' derived schemas." tool_metas: array[reflection.agent_metadata],
 ) -> types.step_result {
-  // One wire-name map per step, rebuilt deterministically from the tools — so the request's tool names
-  // and the response's reversal agree without any durable state (see ai's wire-tool-names section).
+  // One wire-name map per step, rebuilt deterministically from the tools, so the request's tool names and
+  // the response's reversal agree without durable state.
   let map = wire_names.build_name_map(tool_metas = tool_metas)
   let body = anthropic_request_body(client = client, history = history, tool_metas = tool_metas, map = map)
-  // `ai.post_step` serialises the value tree as application/json (each inlined `file` leaf read from the
-  // blob store and base64'd only at the send boundary), parses the reply back to a document value, and
-  // CLASSIFIES a non-2xx into the shared vocabulary (`http.auth_error` / `http.api_error`, both carrying
-  // the status) so no raw `status_error` reaches `ai.step_error`.
-  let response = ai.post_step(
+  // `http.post_json` serialises the value tree, parses the reply back to a document value, and classifies
+  // a non-2xx itself — so what it throws is already an arm of `ai.step_error`.
+  let response = http.post_json(
     url = "https://api.anthropic.com/v1/messages",
     body = body,
     headers = {
@@ -674,17 +544,16 @@ agent anthropic_infer_step(
   types.step_result(step = anthropic_parse_step(parsed = response, map = map), usage = anthropic_usage(parsed = response))
 }
 
-@"One Anthropic structured-output step, as a FORCED tool call: @schema@ rides as the input schema of
-one synthetic tool and `tool_choice` pins the model to it (the body is `anthropic_object_body`), so
-the decoded object arrives already parsed as the tool_use block's `input` — no special API surface,
-every Claude model. A reply with no tool_use block (a refusal) throws `json.parse_error`
-(∈ `ai.step_error`)."
+@"One Anthropic structured-output step, as a forced tool call: @schema@ rides as the input schema of one
+synthetic tool and `tool_choice` pins the model to it, so the decoded object arrives already parsed as the
+tool_use block's `input` — no special API surface, every Claude model. A reply with no tool_use block
+throws `json.parse_error`."
 agent anthropic_infer_object(
   @"The provider connection." client: connection,
   @"The conversation so far." history: array[types.message],
   @"The JSON Schema the reply must conform to." schema: unknown,
 ) -> types.object_result {
-  let response = ai.post_step(
+  let response = http.post_json(
     url = "https://api.anthropic.com/v1/messages",
     body = anthropic_object_body(client = client, history = history, schema = schema),
     headers = {
