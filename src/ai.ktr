@@ -935,6 +935,25 @@ agent shed_attachments(@"The message to shed." message: types.message) -> types.
   }
 }
 
+@"One resident state with every attachment shed — the persistence form of `serve_observations`'s var. A
+stored turn keeps no `file` (a file's bytes would be pinned in the project library forever, and a resume
+wants the text either way), so what a re-run reads back is the conversation and the held arrivals as text.
+Internal to `serve_observations`."
+agent shed_state(state: resident_state) -> resident_state {
+  resident_state(
+    conversation = for (let message in state.conversation) {
+      next shed_attachments(message = message)
+    },
+    used_tokens = state.used_tokens,
+    held = backlog(
+      messages = for (let message in state.held.messages) {
+        next shed_attachments(message = message)
+      },
+      dropped = state.held.dropped,
+    ),
+  )
+}
+
 @"The shed decision, made once from the outage classification: a refused call's messages lose their
 attachments, a passing failure's messages keep every one. `needs_operator` is exactly the family that
 repeats deterministically, and an attachment is the one part of a request whose acceptability an app
@@ -1164,14 +1183,26 @@ with undelivered text is told so in its own conversation." deliver_to: (agent (r
   @"The compaction policy — one `compaction(...)` datum; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
   @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline — see `take_turn`." tool_budget_milliseconds: number | null ?= null,
   @"Tool names exempt from the deadline race (human-latency tools) — see `take_turn`." unbounded_tool_names: array[string] ?= [],
+  @"Where the conversation is kept in the store, so a `supervise` re-run resumes the thread rather than
+starting it over (a runtime restart keeps it either way). `null` (the default) keeps nothing across a
+re-run. The key is workspace-relative; a caller serving several AIs in one place gives each a distinct one.
+Attachments are shed before the write, so what resumes is the text — a `file` a turn saw does not survive
+the re-run, exactly as it does not survive a compaction." conversation_key: string | null ?= null,
   @"The resident body: forks its sources and typically never returns (`region.watch`)." continuation: agent (value: null) -> R with {...E, observation},
 ) -> R {
   let effective_policy = match (policy) {
     case null -> default_compaction()
     case given -> given
   }
+  // The state read back at start — a fresh one when there is no key or none is stored yet. Both the
+  // conversation and the held arrivals resume, so an outage that tripped the supervisor does not lose the
+  // arrivals nobody had answered.
+  let initial_state = match (conversation_key) {
+    case null -> fresh_resident()
+    case key -> store.get_or[resident_state](key = key, fallback = fresh_resident())
+  }
   // `announced` is the transition test: a notice fires when it flips, and not per turn.
-  use handler (var state: resident_state = fresh_resident(), var announced: boolean = false) {
+  use handler (var state: resident_state = initial_state, var announced: boolean = false) {
     request observation(source: string, content: string, hop: integer, files: array[file], author: string | null) {
       let advanced = advance_resident[E](
         state = state,
@@ -1187,6 +1218,13 @@ with undelivered text is told so in its own conversation." deliver_to: (agent (r
         unbounded_tool_names = unbounded_tool_names,
         policy = effective_policy,
       )
+      // The state is written back after every observation — a turn that advanced the conversation, and a
+      // `filed` that only grew the backlog alike — so a re-run resumes from the last arrival served rather
+      // than from empty. Attachments are shed first: a resume wants the text, not files pinned forever.
+      let _remembered = match (conversation_key) {
+        case null -> null
+        case key -> store.set(key = key, value = shed_state(state = advanced.state))
+      }
       match (advanced.outcome) {
         case step_failed(error => error) -> {
           // The outage notice rides the same channel a reply does, so an agent with no channel has
@@ -1319,6 +1357,14 @@ route, which is what AIs sharing a place want." workspace: string | null ?= null
   @"The compaction policy; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
   @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline." tool_budget_milliseconds: number | null ?= null,
   @"Tool names exempt from the deadline race (human-latency tools)." unbounded_tool_names: array[string] ?= [],
+  @"Keep this AI's conversation in its store, so a `supervise` re-run resumes the thread rather than
+starting it over (a runtime restart keeps it either way). `false` (the default) leaves the conversation in
+run state alone — the right choice when a re-run is meant to be fresh, as it is for a program whose durable
+knowledge lives in the store and whose conversation is ephemeral working memory (and a re-run provoked by
+the conversation itself must not resume it, or it re-drives the same crash). The key is
+`conversation/<name>`, resolved in this AI's workspace, so two AIs never collide even sharing one place;
+attachments are shed before the write, so what resumes is the text, not the files. A dismissed AI's key is
+cleared, so re-using its name does not resurrect its thread." persist_conversation: boolean ?= false,
 ) -> never {
   // The note this AI injects at every step, or nothing at all; `with_context` skips an empty note.
   agent standing_note(value: null) -> string with {...E, prelude.throw[unknown], infer_step} {
@@ -1327,6 +1373,9 @@ route, which is what AIs sharing a place want." workspace: string | null ?= null
       case derive -> derive(value = null)
     }
   }
+  // The conversation's durable home: a fixed key under this AI's workspace, disambiguated by name so two
+  // AIs sharing one place never collide. `null` when persistence is off.
+  let conversation_key = if (persist_conversation) { f"conversation/${name}" } else { null }
   // The AI's whole body as one agent, because the workspace decision below has to wrap it: `use` binds
   // the rest of its own block, so an install that happens only sometimes has to be a call whose argument
   // is the body.
@@ -1346,6 +1395,7 @@ route, which is what AIs sharing a place want." workspace: string | null ?= null
       policy = policy,
       tool_budget_milliseconds = tool_budget_milliseconds,
       unbounded_tool_names = unbounded_tool_names,
+      conversation_key = conversation_key,
     )
     // The mailbox's white hole: every mail fiber's `observation` surfaces here, inside the install above,
     // and is served as one more turn of this AI's conversation.
@@ -1449,6 +1499,9 @@ request spawn[effect E](
   @"The compaction policy; `null` (the default) is `default_compaction`." policy: compaction | null ?= null,
   @"The per-tool-call budget in milliseconds, or `null` (the default) for no deadline." tool_budget_milliseconds: number | null ?= null,
   @"Tool names exempt from the deadline race (human-latency tools)." unbounded_tool_names: array[string] ?= [],
+  @"Keep this AI's conversation in the store, so a `supervise` re-run resumes its thread rather than
+starting it over; `false` (the default) keeps nothing across a re-run — see `resident` for when to turn it
+on." persist_conversation: boolean ?= false,
 ) -> spawn_outcome
 
 @"Post one report to one AI: look @to@ up in the route's table and fork a delivery fiber into its mailbox,
@@ -1470,8 +1523,10 @@ request mail(
 ) -> mail_outcome
 
 @"DISMISS ONE AI: cancel its fiber and its sources, and free the name. Answers `dismissed(id)`, or
-`unknown_resident(name)` when this route forked no such AI. A dismissed AI's conversation goes with
-it — there is no state to resume, because a resident's conversation lives in its fiber."
+`unknown_resident(name)` when this route forked no such AI. A dismissed AI is gone for good: its
+conversation goes with it — a persisted one has its store key cleared too, so re-using the name later
+starts a fresh thread rather than waking the old one. (A crash is different: the key survives it, which is
+how a re-hire resumes.)"
 request dismiss(@"The AI to dismiss, by name." name: string) -> dismiss_outcome
 
 @"One AI the route has hired, as its table holds it: the resident's own fiber id, and the ids of the
@@ -1481,6 +1536,8 @@ is how `dismiss` tells the two apart. Internal to `route`."
 data enrolment(
   @"The resident fiber's runtime-minted id." id: string,
   @"The ids of the source fibers forked beside it." sources: array[string],
+  @"The workspace it was spawned under, kept so `dismiss` can reach its persisted conversation key." workspace: string | null,
+  @"Whether it persists its conversation, so `dismiss` clears the key only when there is one." persist_conversation: boolean,
 )
 
 @"Open the route for the extent of @continuation@ — the `let root = use ai.route()` line. It opens the
@@ -1535,7 +1592,7 @@ agent route[effect E lacks spawn | mail | dismiss | register | time.race_settled
   agent stop_sources(table: record[enrolment], name: string) -> null {
     let _outcomes = match (record.get(target = table, key = name)) {
       case null -> []
-      case enrolment(id => _, sources => sources) -> {
+      case enrolment(id => _, sources => sources, workspace => _, persist_conversation => _) -> {
         for (let source_id in sources) { next region.cancel_by_id(nursery = root, id = source_id) }
       }
     }
@@ -1546,7 +1603,7 @@ agent route[effect E lacks spawn | mail | dismiss | register | time.race_settled
   agent resident_named(table: record[enrolment], id: string) -> string | null {
     for (let [name, entry] in record.entries(target = table), var found: string | null = null) {
       match (entry) {
-        case enrolment(id => running, sources => _) -> {
+        case enrolment(id => running, sources => _, workspace => _, persist_conversation => _) -> {
           if (running == id) {
             next with { found = name }
           } else {
@@ -1574,9 +1631,10 @@ agent route[effect E lacks spawn | mail | dismiss | register | time.race_settled
       policy: compaction | null,
       tool_budget_milliseconds: number | null,
       unbounded_tool_names: array[string],
+      persist_conversation: boolean,
     ) {
       match (record.get(target = enrolled, key = name)) {
-        case enrolment(id => running, sources => _) -> {
+        case enrolment(id => running, sources => _, workspace => _, persist_conversation => _) -> {
           next already_running(id = running) with { boxes = boxes, enrolled = enrolled, waiting = waiting }
         }
         case _ -> {
@@ -1595,13 +1653,14 @@ agent route[effect E lacks spawn | mail | dismiss | register | time.race_settled
               policy = policy,
               tool_budget_milliseconds = tool_budget_milliseconds,
               unbounded_tool_names = unbounded_tool_names,
+              persist_conversation = persist_conversation,
             },
             name = name,
           )
           let id = region.fiber_id(handle = child)
           next spawned(id = id) with {
             boxes = boxes,
-            enrolled = record.set(target = enrolled, key = name, value = enrolment(id = id, sources = [])),
+            enrolled = record.set(target = enrolled, key = name, value = enrolment(id = id, sources = [], workspace = workspace, persist_conversation = persist_conversation)),
             waiting = record.set(target = waiting, key = name, value = sources),
           }
         }
@@ -1616,7 +1675,7 @@ agent route[effect E lacks spawn | mail | dismiss | register | time.race_settled
       // A resident the program forked has no enrolment; it still gets a mailbox entry, which is the whole
       // of what `mail` needs. Only `dismiss` tells the two apart.
       let filed = match (record.get(target = enrolled, key = name)) {
-        case enrolment(id => id, sources => _) -> record.set(target = enrolled, key = name, value = enrolment(id = id, sources = started))
+        case enrolment(id => id, sources => _, workspace => workspace, persist_conversation => persist_conversation) -> record.set(target = enrolled, key = name, value = enrolment(id = id, sources = started, workspace = workspace, persist_conversation = persist_conversation))
         case _ -> enrolled
       }
       next null with {
@@ -1659,9 +1718,21 @@ agent route[effect E lacks spawn | mail | dismiss | register | time.race_settled
     }
     request dismiss(name: string) {
       match (record.get(target = enrolled, key = name)) {
-        case enrolment(id => id, sources => _) -> {
+        case enrolment(id => id, sources => _, workspace => workspace, persist_conversation => persist_conversation) -> {
           stop_sources(table = enrolled, name = name)
           let _stopped = region.cancel_by_id(nursery = root, id = id)
+          // A dismissed AI is gone for good, so its persisted conversation goes too — otherwise re-using
+          // the name would wake a fresh AI inside the old thread. The key is the resident's
+          // `conversation/<name>` seen from here, so the workspace it ran under is prefixed back on. (A
+          // crash is NOT a dismissal: its key survives, which is what lets a re-hire resume the thread.)
+          let _cleared = if (persist_conversation) {
+            store.delete(key = match (workspace) {
+              case null -> f"conversation/${name}"
+              case path -> f"${path}/conversation/${name}"
+            })
+          } else {
+            null
+          }
           next dismissed(id = id) with {
             boxes = record.remove(target = boxes, key = name),
             enrolled = record.remove(target = enrolled, key = name),
