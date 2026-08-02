@@ -122,11 +122,11 @@ parsing the injected turn's label.
 
 The conversation lives in a handler var — durable run state, so it survives a runtime restart mid-thread.
 A `supervise` re-run is different: it rebuilds the block from the top, so the var resets and only the store
-carries over. `persist_conversation` (off by default) writes the conversation and its held backlog to
-`conversation/<name>` in the AI's workspace after each turn, so a re-run resumes the thread instead of
-starting fresh. Leave it off when a re-run is meant to be fresh — a program whose durable knowledge is
-already in the store, or one where resuming a conversation that provoked the crash would only re-drive it.
-`dismiss` clears the key; a crash keeps it, which is what lets a re-hire resume.
+carries over. `persist_conversation` (off by default) has the route keep the conversation and its held
+backlog in a cell of its own, `conversations/<name>`, apart from the AI's tool workspace; a re-run resumes
+the thread instead of starting fresh. Leave it off when a re-run is meant to be fresh — a program whose
+durable knowledge is already in the store, or one where resuming a conversation that provoked the crash
+would only re-drive it. `dismiss` clears the cell; a crash keeps it, which is what lets a re-hire resume.
 
 ## Attached files
 
